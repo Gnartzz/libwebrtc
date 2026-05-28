@@ -93,11 +93,13 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
     return capture_state_;
   }
 
-  if (fps >= 60) {
-    capture_delay_ = uint32_t(1000.0 / 60.0);
-  } else {
-    capture_delay_ = uint32_t(1000.0 / fps);
-  }
+  // Poll the desktop capturer at roughly 2× the requested rate. The
+  // underlying capturer returns ERROR_TEMPORARY when no new frame is ready,
+  // so over-polling is cheap but ensures we never miss a vsync edge — the
+  // previous "delay == interval" scheduling combined with the capturer's
+  // own ~16ms vsync wait effectively halved the framerate (60→30).
+  uint32_t interval_ms = uint32_t(1000.0 / fps);
+  capture_delay_ = interval_ms > 4 ? interval_ms / 2 : 1;
 
   if (source_id_ != -1) {
     if (!capturer_->SelectSource(source_id_)) {
