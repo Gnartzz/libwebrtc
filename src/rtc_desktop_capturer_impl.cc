@@ -207,7 +207,37 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
 #endif
                           width, height, libyuv::kRotate0, libyuv::FOURCC_ARGB);
 
-    OnFrame(webrtc::VideoFrame(i420_buffer_, 0, webrtc::TimeMillis(),
+    // Optional max-resolution clamp (preserves aspect ratio). Required on
+    // Windows where the native DesktopCapturer always emits at monitor
+    // resolution and runtime scaleResolutionDownBy on RTPSender is not
+    // honored for desktop sources. Downscale here via libyuv before the
+    // frame reaches the encoder.
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> out_buffer = i420_buffer_;
+    if (max_width_ > 0 && max_height_ > 0 &&
+        (i420_buffer_->width() > static_cast<int>(max_width_) ||
+         i420_buffer_->height() > static_cast<int>(max_height_))) {
+      double sx = static_cast<double>(max_width_) / i420_buffer_->width();
+      double sy = static_cast<double>(max_height_) / i420_buffer_->height();
+      double scale = sx < sy ? sx : sy;
+      int dst_w = static_cast<int>(i420_buffer_->width() * scale) & ~1;
+      int dst_h = static_cast<int>(i420_buffer_->height() * scale) & ~1;
+      if (!scaled_buffer_ || scaled_buffer_->width() != dst_w ||
+          scaled_buffer_->height() != dst_h) {
+        scaled_buffer_ = webrtc::I420Buffer::Create(dst_w, dst_h);
+      }
+      libyuv::I420Scale(
+          i420_buffer_->DataY(), i420_buffer_->StrideY(),
+          i420_buffer_->DataU(), i420_buffer_->StrideU(),
+          i420_buffer_->DataV(), i420_buffer_->StrideV(),
+          i420_buffer_->width(), i420_buffer_->height(),
+          scaled_buffer_->MutableDataY(), scaled_buffer_->StrideY(),
+          scaled_buffer_->MutableDataU(), scaled_buffer_->StrideU(),
+          scaled_buffer_->MutableDataV(), scaled_buffer_->StrideV(),
+          dst_w, dst_h, libyuv::kFilterBilinear);
+      out_buffer = scaled_buffer_;
+    }
+
+    OnFrame(webrtc::VideoFrame(out_buffer, 0, webrtc::TimeMillis(),
                                webrtc::kVideoRotation_0));
   }
 #ifdef WEBRTC_WIN

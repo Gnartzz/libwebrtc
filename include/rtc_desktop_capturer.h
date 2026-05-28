@@ -87,6 +87,17 @@ class RTCDesktopCapturer : public RefCountInterface {
   virtual scoped_refptr<MediaSource> source() = 0;
 
   /**
+   * @brief Limits the encoded frame size by downscaling captured frames before
+   *        they enter the encoder pipeline. Aspect ratio is preserved. Set to
+   *        0/0 to disable. Workaround for Windows DesktopCapturer always
+   *        emitting frames at native monitor resolution.
+   */
+  virtual void SetMaxResolution(uint32_t max_width, uint32_t max_height) {
+    (void)max_width;
+    (void)max_height;
+  }
+
+  /**
    * @brief Destroys the RTCDesktopCapturer object.
    */
   virtual ~RTCDesktopCapturer() {}

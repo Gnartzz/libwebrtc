@@ -58,6 +58,11 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
 
   scoped_refptr<MediaSource> source() override { return source_; }
 
+  void SetMaxResolution(uint32_t max_width, uint32_t max_height) override {
+    max_width_ = max_width;
+    max_height_ = max_height;
+  }
+
  protected:
   virtual void OnCaptureResult(
       webrtc::DesktopCapturer::Result result,
@@ -82,6 +87,9 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   uint32_t y_ = 0;
   uint32_t w_ = 0;
   uint32_t h_ = 0;
+  uint32_t max_width_ = 0;
+  uint32_t max_height_ = 0;
+  webrtc::scoped_refptr<webrtc::I420Buffer> scaled_buffer_;
 };
 
 }  // namespace libwebrtc
