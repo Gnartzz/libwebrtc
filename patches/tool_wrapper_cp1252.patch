@@ -1,0 +1,42 @@
+HoneyCord patch for Chromium's build/toolchain/win/tool_wrapper.py
+=================================================================
+
+Problem: on a German Windows host, link.exe emits cp1252-encoded status
+lines like "Bibliothek "./libwebrtc.dll.lib" und Objekt ... werden
+erstellt." The default tool_wrapper.py decodes link.exe output as strict
+UTF-8 and raises UnicodeDecodeError, aborting the link AFTER the .dll
+was already created -- so ninja reports failure on a successful build.
+
+Fix: try utf-8 first, fall back to cp1252, then 'replace' as a last
+resort. Also swallow the German "Bibliothek ..." status line the same
+way we swallow the English "Creating library ..." line.
+
+This patch is NOT in the libwebrtc fork because tool_wrapper.py lives in
+the Chromium-build subtree pulled in by gclient, not in webrtc itself.
+Apply by hand to <webrtc-src>/build/toolchain/win/tool_wrapper.py before
+running gn gen / ninja.
+
+--- a/build/toolchain/win/tool_wrapper.py
++++ b/build/toolchain/win/tool_wrapper.py
+@@ -140,11 +140,22 @@ class WinTool(object):
+     # Read output one line at a time as it shows up to avoid OOM failures when
+     # GBs of output is produced.
+     for line in link.stdout:
+-      line = line.decode('utf8')
++      # HoneyCord patch: link.exe on a German Windows emits cp1252 strings
++      # ("Bibliothek ... werden erstellt."). Strict utf8 throws — fall back
++      # to cp1252, then 'replace' so we never abort the link over a glyph.
++      try:
++        line = line.decode('utf8')
++      except UnicodeDecodeError:
++        try:
++          line = line.decode('cp1252')
++        except UnicodeDecodeError:
++          line = line.decode('utf8', errors='replace')
+       if (not line.startswith('   Creating library ')
+           and not line.startswith('Generating code')
+-          and not line.startswith('Finished generating code')):
++          and not line.startswith('Finished generating code')
++          and not line.startswith('   Bibliothek ')):
+         print(line.rstrip())
+     return link.wait()
