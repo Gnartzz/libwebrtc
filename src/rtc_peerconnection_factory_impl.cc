@@ -20,6 +20,9 @@
 #include "src/win/msdkvideodecoderfactory.h"
 #include "src/win/msdkvideoencoderfactory.h"
 #endif
+#if defined(USE_NVENC)
+#include "src/win/hwenc/honeycord_video_encoder_factory.h"
+#endif
 #if defined(WEBRTC_IOS)
 #include "engine/sdk/objc/Framework/Classes/videotoolboxvideocodecfactory.h"
 #endif
@@ -85,6 +88,9 @@ bool RTCPeerConnectionFactoryImpl::Initialize() {
         webrtc::CreateBuiltinAudioDecoderFactory(),
 #if defined(USE_INTEL_MEDIA_SDK)
         CreateIntelVideoEncoderFactory(), CreateIntelVideoDecoderFactory(),
+#elif defined(USE_NVENC)
+        std::make_unique<HoneycordVideoEncoderFactory>(),
+        webrtc::CreateBuiltinVideoDecoderFactory(),
 #else
         webrtc::CreateBuiltinVideoEncoderFactory(),
         webrtc::CreateBuiltinVideoDecoderFactory(),

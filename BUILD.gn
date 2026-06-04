@@ -2,6 +2,8 @@ import("../webrtc.gni")
 
 declare_args() {
   libwebrtc_intel_media_sdk = false
+  libwebrtc_nvenc = true
+  libwebrtc_amf = true   # HoneyCord: stub-encoder for bisect of 0xc0000005
   libwebrtc_desktop_capture = true
 }
 
@@ -29,6 +31,109 @@ config("external_config") {
   include_dirs = [ "include" ]
   if (is_win) {
     defines = [ "LIB_WEBRTC_API_DLL" ]
+  }
+}
+
+if (is_win) {
+  # NVENC source_set — same compile flags as the main library EXCEPT
+  # exceptions are turned on. NvEncoder.cpp + Momo's encoder both depend
+  # on try/catch + throw; without this the build fails with "cannot use
+  # 'try' with exceptions disabled" under Chromium's default config.
+  source_set("libwebrtc_nvenc") {
+    sources = [
+      "src/win/hwenc/nvenc/nvcodec_video_encoder.cpp",
+      "src/win/hwenc/nvenc/nvcodec_video_encoder.h",
+      "src/win/hwenc/nvenc/sora_compat.h",
+      "src/win/hwenc/nvenc/nv_codec_sdk/NvEncoder.cpp",
+      "src/win/hwenc/nvenc/nv_codec_sdk/NvEncoder.h",
+      "src/win/hwenc/nvenc/nv_codec_sdk/NvEncoderD3D11.cpp",
+      "src/win/hwenc/nvenc/nv_codec_sdk/NvEncoderD3D11.h",
+      "src/win/hwenc/nvenc/nv_codec_sdk/nvEncodeAPI.h",
+    ]
+    include_dirs = [
+      "include",
+      "src/win/hwenc/nvenc",
+      "src/win/hwenc/nvenc/nv_codec_sdk",
+    ]
+    configs -= [ "//build/config/compiler:no_exceptions" ]
+    configs += [ "//build/config/compiler:exceptions" ]
+    deps = [
+      "../api/video:video_frame",
+      "../api/video_codecs:video_codecs_api",
+      "../common_video",
+      "../media:rtc_internal_video_codecs",
+      "../modules/video_coding:video_codec_interface",
+      "../rtc_base:logging",
+      "//third_party/libyuv",
+    ]
+  }
+
+  # AMD AMF source_set — like NVENC, AMF's C++ helpers use try/catch in a
+  # few places, so we keep exceptions enabled for this module. amfrt64.dll
+  # is loaded at runtime from the AMD driver — no link-time dependency.
+  source_set("libwebrtc_amf") {
+    sources = [
+      "src/win/hwenc/amf/amf_h264_encoder.cc",
+      "src/win/hwenc/amf/amf_h264_encoder.h",
+      "src/win/hwenc/amf/amf_sdk/common/AMFFactory.cpp",
+      "src/win/hwenc/amf/amf_sdk/common/AMFFactory.h",
+      "src/win/hwenc/amf/amf_sdk/common/Thread.cpp",
+      "src/win/hwenc/amf/amf_sdk/common/Thread.h",
+      "src/win/hwenc/amf/amf_sdk/common/TraceAdapter.cpp",
+      "src/win/hwenc/amf/amf_sdk/common/TraceAdapter.h",
+      "src/win/hwenc/amf/amf_sdk/common/AMFSTL.cpp",
+      "src/win/hwenc/amf/amf_sdk/common/AMFSTL.h",
+      "src/win/hwenc/amf/amf_sdk/common/Windows/ThreadWindows.cpp",
+    ]
+    include_dirs = [
+      "include",
+      "src/win/hwenc/amf",
+      "src/win/hwenc/amf/amf_sdk",
+    ]
+    configs -= [ "//build/config/compiler:no_exceptions" ]
+    configs += [ "//build/config/compiler:exceptions" ]
+    deps = [
+      "../api/video:video_frame",
+      "../api/video_codecs:video_codecs_api",
+      "../common_video",
+      "../media:rtc_internal_video_codecs",
+      "../modules/video_coding:video_codec_interface",
+      "../rtc_base:logging",
+      "//third_party/libyuv",
+    ]
+  }
+
+  # Multi-vendor encoder factory. Lives in the main library (no exceptions
+  # needed here) but transitively depends on libwebrtc_nvenc + libwebrtc_amf
+  # for the per-vendor encoder classes.
+  source_set("libwebrtc_hwenc_factory") {
+    sources = [
+      "src/win/hwenc/honeycord_video_encoder_factory.cc",
+      "src/win/hwenc/honeycord_video_encoder_factory.h",
+    ]
+    include_dirs = [
+      "include",
+      "src/win/hwenc",
+      "src/win/hwenc/nvenc",
+      "src/win/hwenc/nvenc/nv_codec_sdk",
+      "src/win/hwenc/amf",
+      "src/win/hwenc/amf/amf_sdk",
+    ]
+    defines = [ "USE_NVENC" ]
+    if (libwebrtc_amf) {
+      defines += [ "USE_AMF" ]
+    }
+    deps = [
+      ":libwebrtc_nvenc",
+      "../api/environment",
+      "../api/video_codecs:builtin_video_encoder_factory",
+      "../api/video_codecs:video_codecs_api",
+      "../rtc_base:logging",
+      "//third_party/abseil-cpp/absl/strings",
+    ]
+    if (libwebrtc_amf) {
+      deps += [ ":libwebrtc_amf" ]
+    }
   }
 }
 
@@ -209,6 +314,22 @@ rtc_shared_library("libwebrtc") {
     ]
   }
 
+  # NVIDIA NVENC (HoneyCord). Adapted from Shiguredo Momo / sora-cpp-sdk
+  # (Apache-2.0) + vendored NVIDIA NvEncoder C++ wrappers (BSD-3).
+  # nvEncodeAPI64.dll is loaded at runtime from the NVIDIA driver — no
+  # link-time NVENC import library is needed. The NVENC sources live in a
+  # source_set so we can flip exceptions ON (NvEncoder/Momo both rely on
+  # try/catch + throw, which Chromium's default no_exceptions config bans).
+  # The `deps += [":libwebrtc_nvenc"]` is added below, after `deps` is
+  # initialized — GN doesn't allow `+=` before the first assignment.
+  if (is_win && libwebrtc_nvenc) {
+    defines += [ "USE_NVENC" ]
+    libs += [
+      "d3d11.lib",
+      "dxgi.lib",
+    ]
+  }
+
   if (is_win && is_clang) {
     cflags = [
       "-Wno-microsoft-extra-qualification",
@@ -244,6 +365,14 @@ rtc_shared_library("libwebrtc") {
     "//third_party/boringssl:boringssl",
     "//third_party/libyuv",
   ]
+
+  if (is_win && libwebrtc_nvenc) {
+    deps += [
+      ":libwebrtc_hwenc_factory",
+      ":libwebrtc_nvenc",
+    ]
+    include_dirs += [ "src/win/hwenc" ]
+  }
 
   # screen capture device
   if (libwebrtc_desktop_capture) {

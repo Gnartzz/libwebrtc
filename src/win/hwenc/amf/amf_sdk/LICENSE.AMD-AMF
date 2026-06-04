@@ -1,0 +1,4 @@
+﻿AMD AMF SDK headers + common helpers reproduced under MIT License.
+Source: https://github.com/GPUOpen-LibrariesAndSDKs/AMF
+Vendored subset: core/*.h, components/{Component,VideoEncoderVCE,PreAnalysis}.h,
+                  common/{AMFFactory,Thread,TraceAdapter,AMFSTL,...}.{h,cpp}.

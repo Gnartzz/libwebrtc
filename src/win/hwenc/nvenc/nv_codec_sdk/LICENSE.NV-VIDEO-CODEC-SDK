@@ -1,0 +1,4 @@
+﻿NVIDIA Video Codec SDK headers (nvEncodeAPI.h) and the NvEncoder/NvEncoderD3D11
+C++ wrapper classes are reproduced here under the terms of the
+NVIDIA Video Codec SDK License Agreement (BSD-3-Clause for the sample wrappers).
+Source: https://github.com/NVIDIA/video-sdk-samples
