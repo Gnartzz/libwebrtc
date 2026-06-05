@@ -28,6 +28,11 @@ constexpr uint32_t kVendorIdAmd = 0x1002;
 constexpr uint32_t kVendorIdIntel = 0x8086;
 
 #if defined(USE_NVENC) || defined(USE_AMF)
+// Iterate every DXGI adapter, skip software ones, and prefer NVIDIA over
+// AMD over anything else. EnumAdapters(0) is unreliable on hybrid systems
+// (Optimus / iGPU-plus-dGPU) and on machines where Windows enumerates the
+// "Microsoft Basic Render Driver" as adapter[0]. Returns 0 if no real
+// hardware adapter is present.
 uint32_t DetectPrimaryGpuVendor() {
   using Microsoft::WRL::ComPtr;
   ComPtr<IDXGIFactory1> factory;
@@ -35,20 +40,31 @@ uint32_t DetectPrimaryGpuVendor() {
                                 reinterpret_cast<void**>(factory.GetAddressOf())))) {
     return 0;
   }
-  ComPtr<IDXGIAdapter1> adapter;
-  if (FAILED(factory->EnumAdapters1(0, adapter.GetAddressOf()))) {
-    return 0;
+  uint32_t nvidia_vendor = 0;
+  uint32_t amd_vendor = 0;
+  uint32_t fallback_vendor = 0;
+  for (UINT i = 0;; ++i) {
+    ComPtr<IDXGIAdapter1> a;
+    if (FAILED(factory->EnumAdapters1(i, a.GetAddressOf()))) break;
+    DXGI_ADAPTER_DESC1 d{};
+    if (FAILED(a->GetDesc1(&d))) continue;
+    char name[128];
+    size_t converted = 0;
+    wcstombs_s(&converted, name, d.Description, sizeof(name));
+    RTC_LOG(LS_INFO) << "HoneycordVideoEncoderFactory: adapter[" << i << "] '"
+                     << name << "' vendor=0x" << std::hex << d.VendorId
+                     << " flags=0x" << d.Flags;
+    if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+    if (d.VendorId == 0x10DE && !nvidia_vendor) nvidia_vendor = d.VendorId;
+    else if (d.VendorId == 0x1002 && !amd_vendor) amd_vendor = d.VendorId;
+    else if (!fallback_vendor) fallback_vendor = d.VendorId;
   }
-  DXGI_ADAPTER_DESC1 desc{};
-  if (FAILED(adapter->GetDesc1(&desc))) {
-    return 0;
-  }
-  char name[128];
-  size_t converted = 0;
-  wcstombs_s(&converted, name, desc.Description, sizeof(name));
-  RTC_LOG(LS_INFO) << "HoneycordVideoEncoderFactory: primary GPU \"" << name
-                   << "\" vendor=0x" << std::hex << desc.VendorId;
-  return desc.VendorId;
+  uint32_t picked = nvidia_vendor ? nvidia_vendor
+                  : amd_vendor    ? amd_vendor
+                  : fallback_vendor;
+  RTC_LOG(LS_INFO) << "HoneycordVideoEncoderFactory: picked vendor=0x"
+                   << std::hex << picked;
+  return picked;
 }
 #endif
 

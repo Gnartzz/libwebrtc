@@ -18,6 +18,9 @@
 #ifdef _WIN32
 #include <d3d11.h>
 #include <wrl.h>
+#include <shlobj.h>
+#include <cstdio>
+#include <cstdarg>
 #endif
 
 // WebRTC
@@ -73,6 +76,39 @@ namespace sora {
 
 const int kLowH264QpThreshold = 34;
 const int kHighH264QpThreshold = 40;
+
+#ifdef _WIN32
+// HoneyCord diagnostic logger — RTC_LOG on Windows doesn't reach our
+// app_log.dart (which is macOS-only), so we ALSO append the probe trace
+// to %LOCALAPPDATA%\HoneyCord\nvenc-probe.log. User can pull that file
+// after a failed start to see exactly where IsSupported / CreateEncoder
+// died.
+static void NvProbeLog(const char* fmt, ...) {
+  wchar_t localAppData[MAX_PATH] = {0};
+  if (FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
+    return;
+  }
+  wchar_t dir[MAX_PATH] = {0};
+  swprintf_s(dir, MAX_PATH, L"%s\\HoneyCord", localAppData);
+  CreateDirectoryW(dir, NULL);  // ignore EEXIST
+  wchar_t file[MAX_PATH] = {0};
+  swprintf_s(file, MAX_PATH, L"%s\\nvenc-probe.log", dir);
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, file, L"a") != 0 || !f) return;
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond,
+          st.wMilliseconds);
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fputc('\n', f);
+  fclose(f);
+}
+#else
+static void NvProbeLog(const char* /*fmt*/, ...) {}
+#endif
 
 struct nal_entry {
   size_t offset;
@@ -178,24 +214,51 @@ NvCodecVideoEncoderImpl::NvCodecVideoEncoderImpl(
     CudaVideoCodec codec)
     : cuda_context_(cuda_context), codec_(codec), bitrate_adjuster_(0.5, 0.95) {
 #ifdef _WIN32
+  // HoneyCord: enumerate adapters and pick the NVIDIA one explicitly. Used
+  // to be EnumAdapters(0) which breaks on hybrid systems (Optimus / iGPU +
+  // dGPU) AND on machines where Windows lists a "Microsoft Basic Display
+  // Adapter" as adapter[0] (no NVENC there). Also: use return-on-error
+  // instead of RTC_CHECK so a failed init doesn't tear down the whole DLL.
   ComPtr<IDXGIFactory1> idxgi_factory;
-  RTC_CHECK(!FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),
-                                       (void**)idxgi_factory.GetAddressOf())));
+  HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1),
+                                   (void**)idxgi_factory.GetAddressOf());
+  if (FAILED(hr)) {
+    NvProbeLog("Impl ctor: CreateDXGIFactory1 failed hr=0x%08lx", (long)hr);
+    return;
+  }
+  ComPtr<IDXGIAdapter1> idxgi_adapter1;
+  for (UINT i = 0;; ++i) {
+    ComPtr<IDXGIAdapter1> a;
+    if (FAILED(idxgi_factory->EnumAdapters1(i, a.GetAddressOf()))) break;
+    DXGI_ADAPTER_DESC1 d{};
+    a->GetDesc1(&d);
+    if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+    if (d.VendorId == 0x10DE) { idxgi_adapter1 = a; break; }
+  }
+  if (!idxgi_adapter1) {
+    NvProbeLog("Impl ctor: no NVIDIA adapter found, encoder will be unusable");
+    return;
+  }
   ComPtr<IDXGIAdapter> idxgi_adapter;
-  RTC_CHECK(
-      !FAILED(idxgi_factory->EnumAdapters(0, idxgi_adapter.GetAddressOf())));
-  RTC_CHECK(!FAILED(D3D11CreateDevice(
-      idxgi_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, NULL, 0,
-      D3D11_SDK_VERSION, id3d11_device_.GetAddressOf(), NULL,
-      id3d11_context_.GetAddressOf())));
+  idxgi_adapter1.As(&idxgi_adapter);
 
-  // 以下デバイス名を取得するだけの処理
+  hr = D3D11CreateDevice(idxgi_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
+                          NULL, 0, D3D11_SDK_VERSION,
+                          id3d11_device_.GetAddressOf(), NULL,
+                          id3d11_context_.GetAddressOf());
+  if (FAILED(hr)) {
+    NvProbeLog("Impl ctor: D3D11CreateDevice failed hr=0x%08lx", (long)hr);
+    id3d11_device_.Reset();
+    return;
+  }
+
   DXGI_ADAPTER_DESC adapter_desc;
   idxgi_adapter->GetDesc(&adapter_desc);
   char szDesc[80];
   size_t result = 0;
   wcstombs_s(&result, szDesc, adapter_desc.Description, sizeof(szDesc));
-  RTC_LOG(LS_INFO) << __FUNCTION__ << "GPU in use: " << szDesc;
+  RTC_LOG(LS_INFO) << "NvCodec Impl ctor: GPU in use: " << szDesc;
+  NvProbeLog("Impl ctor: GPU in use: %s", szDesc);
 #endif
 #ifdef __linux__
   cuda_.reset(new NvCodecVideoEncoderCuda(cuda_context_));
@@ -525,8 +588,12 @@ void NvCodecVideoEncoderImpl::SetRates(
 webrtc::VideoEncoder::EncoderInfo NvCodecVideoEncoderImpl::GetEncoderInfo()
     const {
   webrtc::VideoEncoder::EncoderInfo info;
-  info.supports_native_handle = true;
+  // We do CPU-side I420->NV12 conversion via libyuv before pushing into the
+  // D3D11 staging texture — no native (GPU-resident) handle path. Reporting
+  // true here misleads WebRTC about our capabilities.
+  info.supports_native_handle = false;
   info.implementation_name = "NvCodec";
+  info.is_hardware_accelerated = true;
   info.scaling_settings = webrtc::VideoEncoder::ScalingSettings(
       kLowH264QpThreshold, kHighH264QpThreshold);
   return info;
@@ -534,6 +601,13 @@ webrtc::VideoEncoder::EncoderInfo NvCodecVideoEncoderImpl::GetEncoderInfo()
 
 int32_t NvCodecVideoEncoderImpl::InitNvEnc() {
 #ifdef _WIN32
+  // If the constructor couldn't set up D3D11 (no NVIDIA adapter, driver
+  // gone), id3d11_device_ is null and any further use crashes. Bail out
+  // cleanly so WebRTC falls back to the next encoder in the chain.
+  if (!id3d11_device_) {
+    NvProbeLog("InitNvEnc: id3d11_device_ is null, aborting");
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
   nv_encoder_ = CreateEncoder(
       codec_, width_, height_, framerate_, target_bitrate_bps_,
       max_bitrate_bps_, id3d11_device_.Get(), id3d11_texture_.GetAddressOf());
@@ -607,13 +681,30 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
   id3d11_device->CreateTexture2D(&desc, NULL, out_id3d11_texture);
 
   // Driver が古いとかに気づくのはココ
+  // HoneyCord diagnostic: this is the call that loads nvEncodeAPI64.dll and
+  // initialises the NVENC session. If the installed driver is too old or
+  // the ABI between our vendored NvEncoder.cpp and the real nvEncodeAPI.h
+  // doesn't match, NVENCException fires here.
+  NvProbeLog("CreateEncoder: new NvEncoderD3D11(%dx%d, NV12)", width, height);
   try {
     encoder.reset(
         new NvEncoderD3D11(id3d11_device, width, height, nvenc_format));
   } catch (const NVENCException& e) {
-    RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
+    RTC_LOG(LS_ERROR) << "NvCodec::CreateEncoder: NvEncoderD3D11 ctor threw: "
+                      << e.what();
+    NvProbeLog("NvEncoderD3D11 ctor THREW NVENCException: %s", e.what());
+    return nullptr;
+  } catch (const std::exception& e) {
+    RTC_LOG(LS_ERROR) << "NvCodec::CreateEncoder: NvEncoderD3D11 ctor std::ex: "
+                      << e.what();
+    NvProbeLog("NvEncoderD3D11 ctor THREW std::ex: %s", e.what());
+    return nullptr;
+  } catch (...) {
+    RTC_LOG(LS_ERROR) << "NvCodec::CreateEncoder: NvEncoderD3D11 ctor unknown ex";
+    NvProbeLog("NvEncoderD3D11 ctor THREW unknown");
     return nullptr;
   }
+  NvProbeLog("NvEncoderD3D11 ctor ok");
 #endif
 
 #ifdef __linux__
@@ -634,6 +725,8 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
     // P3/LOW_LATENCY_HQ preset families below; the encode-config tweaks
     // (gopLength = INFINITE, frameIntervalP = 1, no B-frames via disableBadapt)
     // give us the real-time profile we need.
+    NvProbeLog("calling CreateDefaultEncoderParams (codec=%d, preset=P3)",
+               (int)codec);
     if (codec == CudaVideoCodec::H264) {
       encoder->CreateDefaultEncoderParams(
           &initialize_params, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID);
@@ -644,6 +737,7 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
       encoder->CreateDefaultEncoderParams(
           &initialize_params, NV_ENC_CODEC_AV1_GUID, NV_ENC_PRESET_P2_GUID);
     }
+    NvProbeLog("CreateDefaultEncoderParams ok");
 
     //initialize_params.enablePTD = 1;
     initialize_params.frameRateDen = 1;
@@ -655,14 +749,21 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
     encode_config.rcParams.maxBitRate = max_bitrate_bps;
 
     encode_config.rcParams.disableBadapt = 1;
+    // VBV buffer = 1 second of target bitrate. The original code computed
+    // averageBitRate * den / num which equals one FRAME worth of bits — way
+    // too small for real CBR, makes the rate controller swing wildly. One
+    // second is the canonical NVENC low-latency setting.
     encode_config.rcParams.vbvBufferSize =
-        encode_config.rcParams.averageBitRate * initialize_params.frameRateDen /
-        initialize_params.frameRateNum;
+        encode_config.rcParams.averageBitRate;
     encode_config.rcParams.vbvInitialDelay =
         encode_config.rcParams.vbvBufferSize;
     encode_config.gopLength = NVENC_INFINITE_GOPLENGTH;
     encode_config.frameIntervalP = 1;
     encode_config.rcParams.enableAQ = 1;
+    // AQ strength is 1..15; 0 means disabled by spec. Mid-range (8) is the
+    // OBS-style default — visibly better grain handling without sacrificing
+    // throughput on the encoder block.
+    encode_config.rcParams.aqStrength = 8;
 
     if (codec == CudaVideoCodec::H264) {
       //encode_config.encodeCodecConfig.h264Config.outputAUD = 1;
@@ -686,25 +787,38 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
       encode_config.encodeCodecConfig.av1Config.repeatSeqHdr = 1;
     }
 
+    NvProbeLog("calling encoder->CreateEncoder() (initialize_params_ver=0x%08x, config_ver=0x%08x)",
+               (unsigned)NV_ENC_INITIALIZE_PARAMS_VER, (unsigned)NV_ENC_CONFIG_VER);
     encoder->CreateEncoder(&initialize_params);
-
-    RTC_LOG(LS_INFO) << __FUNCTION__ << " framerate:" << framerate
-                     << " bitrate_bps:" << target_bitrate_bps
-                     << " maxBitRate:" << encode_config.rcParams.maxBitRate;
+    NvProbeLog("encoder->CreateEncoder() OK framerate=%d bitrate=%d maxBitRate=%d",
+               framerate, target_bitrate_bps,
+               (int)encode_config.rcParams.maxBitRate);
   } catch (const NVENCException& e) {
-    RTC_LOG(LS_ERROR) << __FUNCTION__ << ": " << e.what();
+    RTC_LOG(LS_ERROR) << "NvCodec::CreateEncoder: NVENCException: " << e.what();
+    NvProbeLog("CreateEncoder/Params THREW NVENCException: %s", e.what());
+    return nullptr;
+  } catch (const std::exception& e) {
+    RTC_LOG(LS_ERROR) << "NvCodec::CreateEncoder: std::exception: " << e.what();
+    NvProbeLog("CreateEncoder/Params THREW std::ex: %s", e.what());
+    return nullptr;
+  } catch (...) {
+    RTC_LOG(LS_ERROR) << "NvCodec::CreateEncoder: unknown exception";
+    NvProbeLog("CreateEncoder/Params THREW unknown");
     return nullptr;
   }
 
   return encoder;
 }
 
+// HoneyCord diagnostic build: dense logging through the NVENC probe so we
+// can pinpoint exactly which step fails on a given GPU/driver/version combo
+// from `%LOCALAPPDATA%\HoneyCord\last.log`.
 bool NvCodecVideoEncoder::IsSupported(std::shared_ptr<CudaContext> cuda_context,
                                       CudaVideoCodec codec) {
+  RTC_LOG(LS_INFO) << "NvCodec::IsSupported: ENTER codec=" << (int)codec;
+  NvProbeLog("=== NvCodec::IsSupported ENTER codec=%d ===", (int)codec);
   try {
-    /* NvEncoder::TryLoadNvEncApi(); */ // not available in our SDK; CreateEncoder below tests availability
 
-    // Linux の場合、cuda と nvcuvid のロードも必要なのでチェックする
 #ifdef __linux__
     if (cuda_context == nullptr) {
       return false;
@@ -716,7 +830,6 @@ bool NvCodecVideoEncoder::IsSupported(std::shared_ptr<CudaContext> cuda_context,
     if (!dyn::DynModule::Instance().IsLoadable(dyn::NVCUVID_SO)) {
       return false;
     }
-    // 関数が存在するかチェックする
     if (dyn::DynModule::Instance().GetFunc(dyn::CUDA_SO, "cuDeviceGetName") ==
         nullptr) {
       return false;
@@ -727,21 +840,67 @@ bool NvCodecVideoEncoder::IsSupported(std::shared_ptr<CudaContext> cuda_context,
     }
 #endif
 
-    // 実際にエンコーダを作れるかを確認する
 #ifdef _WIN32
+    // -------- DXGI: enumerate every adapter so we see what Windows hands
+    //          us, not just adapter[0]. Confirms whether the box is a
+    //          single-NVIDIA desktop or a hybrid system.
     ComPtr<IDXGIFactory1> idxgi_factory;
-    RTC_CHECK(!FAILED(CreateDXGIFactory1(
-        __uuidof(IDXGIFactory1), (void**)idxgi_factory.GetAddressOf())));
+    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1),
+                                     (void**)idxgi_factory.GetAddressOf());
+    if (FAILED(hr)) {
+      RTC_LOG(LS_ERROR) << "NvCodec::IsSupported: CreateDXGIFactory1 failed hr=0x"
+                        << std::hex << hr;
+      NvProbeLog("CreateDXGIFactory1 FAILED hr=0x%08lx", (long)hr);
+      return false;
+    }
+    NvProbeLog("DXGI factory ok");
+
+    int nvidia_idx = -1;
+    for (UINT i = 0;; ++i) {
+      ComPtr<IDXGIAdapter1> a;
+      if (FAILED(idxgi_factory->EnumAdapters1(i, a.GetAddressOf()))) break;
+      DXGI_ADAPTER_DESC1 d{};
+      a->GetDesc1(&d);
+      char name[128];
+      size_t n = 0;
+      wcstombs_s(&n, name, d.Description, sizeof(name));
+      RTC_LOG(LS_INFO) << "NvCodec::IsSupported: adapter[" << i << "] '" << name
+                       << "' vendor=0x" << std::hex << d.VendorId
+                       << " dev=0x" << d.DeviceId
+                       << " flags=0x" << d.Flags;
+      NvProbeLog("adapter[%u] '%s' vendor=0x%04x dev=0x%04x flags=0x%lx (0=hw,2=remote,4=software)",
+                 i, name, d.VendorId, d.DeviceId, (long)d.Flags);
+      if (d.VendorId == 0x10DE && nvidia_idx < 0) nvidia_idx = (int)i;
+    }
+    if (nvidia_idx < 0) {
+      RTC_LOG(LS_WARNING) << "NvCodec::IsSupported: no NVIDIA adapter found";
+      NvProbeLog("NO NVIDIA ADAPTER FOUND (vendor 0x10DE missing)");
+      return false;
+    }
+    NvProbeLog("picking NVIDIA adapter idx=%d", nvidia_idx);
+
     ComPtr<IDXGIAdapter> idxgi_adapter;
-    RTC_CHECK(
-        !FAILED(idxgi_factory->EnumAdapters(0, idxgi_adapter.GetAddressOf())));
+    hr = idxgi_factory->EnumAdapters(nvidia_idx, idxgi_adapter.GetAddressOf());
+    if (FAILED(hr)) {
+      RTC_LOG(LS_ERROR) << "NvCodec::IsSupported: EnumAdapters(" << nvidia_idx
+                        << ") failed hr=0x" << std::hex << hr;
+      return false;
+    }
+
     Microsoft::WRL::ComPtr<ID3D11Device> id3d11_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> id3d11_context;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> id3d11_texture;
-    RTC_CHECK(!FAILED(D3D11CreateDevice(
-        idxgi_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, NULL, 0,
-        D3D11_SDK_VERSION, id3d11_device.GetAddressOf(), NULL,
-        id3d11_context.GetAddressOf())));
+    hr = D3D11CreateDevice(idxgi_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                            0, NULL, 0, D3D11_SDK_VERSION,
+                            id3d11_device.GetAddressOf(), NULL,
+                            id3d11_context.GetAddressOf());
+    if (FAILED(hr)) {
+      RTC_LOG(LS_ERROR) << "NvCodec::IsSupported: D3D11CreateDevice failed hr=0x"
+                        << std::hex << hr;
+      NvProbeLog("D3D11CreateDevice FAILED hr=0x%08lx", (long)hr);
+      return false;
+    }
+    NvProbeLog("D3D11 device ok, calling CreateEncoder probe (640x480)");
 
     auto encoder = NvCodecVideoEncoderImpl::CreateEncoder(
         codec, 640, 480, 30, 100 * 1000, 500 * 1000, id3d11_device.Get(),
@@ -754,12 +913,24 @@ bool NvCodecVideoEncoder::IsSupported(std::shared_ptr<CudaContext> cuda_context,
         codec, 640, 480, 30, 100 * 1000, 500 * 1000, cuda.get(), true);
 #endif
     if (encoder == nullptr) {
+      RTC_LOG(LS_WARNING) << "NvCodec::IsSupported: CreateEncoder returned nullptr";
+      NvProbeLog("CreateEncoder returned nullptr -> probe FAIL");
       return false;
     }
 
+    NvProbeLog("=== NvCodec::IsSupported SUCCESS ===");
     return true;
   } catch (const NVENCException& e) {
-    RTC_LOG(LS_ERROR) << __FUNCTION__ << ": " << e.what();
+    RTC_LOG(LS_ERROR) << "NvCodec::IsSupported: NVENCException: " << e.what();
+    NvProbeLog("CAUGHT NVENCException: %s", e.what());
+    return false;
+  } catch (const std::exception& e) {
+    RTC_LOG(LS_ERROR) << "NvCodec::IsSupported: std::exception: " << e.what();
+    NvProbeLog("CAUGHT std::exception: %s", e.what());
+    return false;
+  } catch (...) {
+    RTC_LOG(LS_ERROR) << "NvCodec::IsSupported: unknown exception";
+    NvProbeLog("CAUGHT unknown exception");
     return false;
   }
 }
