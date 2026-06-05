@@ -16,16 +16,52 @@
 
 #include "rtc_desktop_capturer_impl.h"
 
+#include <cstdarg>
+#include <cstdio>
+#ifdef WEBRTC_WIN
+#include <windows.h>
+#endif
+
 #include "api/sequence_checker.h"
 #include "rtc_base/checks.h"
+#include "rtc_base/logging.h"
 #include "third_party/libyuv/include/libyuv.h"
 #ifdef WEBRTC_WIN
 #include "modules/desktop_capture/win/window_capture_utils.h"
+#include "modules/desktop_capture/win/screen_capturer_win_directx.h"
 #endif
 
 namespace libwebrtc {
 
 enum { kCaptureDelay = 33, kCaptureMessageId = 1000 };
+
+// honeycord diagnostics: append to the same file NvProbeLog uses
+// (%LOCALAPPDATA%\HoneyCord\nvenc-probe.log) — RTC_LOG does not reach that
+// file in release builds, and that's the file the user already pulls.
+static int g_hc_src_w = 0, g_hc_src_h = 0, g_hc_dst_w = 0, g_hc_dst_h = 0;
+static int g_hc_conv_ms = 0;
+#ifdef WEBRTC_WIN
+static void HcCapLog(const char* fmt, ...) {
+  wchar_t dir[MAX_PATH];
+  if (!GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH)) return;
+  wchar_t path[MAX_PATH];
+  swprintf_s(path, MAX_PATH, L"%s\\HoneyCord\\nvenc-probe.log", dir);
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, path, L"a") != 0 || !f) return;
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond,
+          st.wMilliseconds);
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fprintf(f, "\n");
+  fclose(f);
+}
+#else
+static void HcCapLog(const char*, ...) {}
+#endif
 
 RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
     DesktopType type, webrtc::DesktopCapturer::SourceId source_id,
@@ -62,6 +98,11 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
           webrtc::DesktopCapturer::CreateWindowCapturer(options_), options_);
     }
   });
+#ifdef WEBRTC_WIN
+  HcCapLog("capturer init: type=%d directx_supported=%d showCursor=%d",
+           (int)type, (int)webrtc::ScreenCapturerWinDirectx::IsSupported(),
+           (int)showCursor);
+#endif
 }
 
 RTCDesktopCapturerImpl::~RTCDesktopCapturerImpl() {
@@ -196,6 +237,7 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
       i420_buffer_ = webrtc::I420Buffer::Create(width, height);
     }
 
+    int64_t hc_tc = webrtc::TimeMillis();
     libyuv::ConvertToI420(frame->data(), 0, i420_buffer_->MutableDataY(),
                           i420_buffer_->StrideY(), i420_buffer_->MutableDataU(),
                           i420_buffer_->StrideU(), i420_buffer_->MutableDataV(),
@@ -237,6 +279,12 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
       out_buffer = scaled_buffer_;
     }
 
+    g_hc_conv_ms = static_cast<int>(webrtc::TimeMillis() - hc_tc);
+    g_hc_src_w = i420_buffer_->width();
+    g_hc_src_h = i420_buffer_->height();
+    g_hc_dst_w = out_buffer->width();
+    g_hc_dst_h = out_buffer->height();
+
     OnFrame(webrtc::VideoFrame(out_buffer, 0, webrtc::TimeMillis(),
                                webrtc::kVideoRotation_0));
   }
@@ -249,10 +297,29 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
 void RTCDesktopCapturerImpl::CaptureFrame() {
   RTC_DCHECK_RUN_ON(thread_.get());
   if (capture_state_ == CS_RUNNING) {
+    // honeycord: schedule the NEXT grab at a steady cadence measured from the
+    // START of this one. The old code added capture_delay_ AFTER the
+    // synchronous grab + ARGB->I420 convert + scale had finished, so the real
+    // period was (delay + processing). At 1080p the convert/scale roughly
+    // matches the delay, which halved the effective rate (33ms delay -> ~66ms
+    // -> 15fps). Subtract the elapsed work so we hit capture_delay_, not
+    // delay+work.
+    int64_t t0 = webrtc::TimeMillis();
     capturer_->CaptureFrame();
+    int64_t elapsed = webrtc::TimeMillis() - t0;
+    int64_t next_ms = static_cast<int64_t>(capture_delay_) - elapsed;
+    if (next_ms < 0) next_ms = 0;
+    static int s_cap_dbg = 0;
+    if ((s_cap_dbg++ % 120) == 0) {
+      HcCapLog("cap loop: total=%lldms grab=%lldms convert+scale=%dms "
+               "src=%dx%d out=%dx%d delay=%ums next=%lldms",
+               (long long)elapsed, (long long)(elapsed - g_hc_conv_ms),
+               g_hc_conv_ms, g_hc_src_w, g_hc_src_h, g_hc_dst_w, g_hc_dst_h,
+               capture_delay_, (long long)next_ms);
+    }
     thread_->PostDelayedHighPrecisionTask(
         [this]() { CaptureFrame(); },
-        webrtc::TimeDelta::Millis(capture_delay_));
+        webrtc::TimeDelta::Millis(next_ms));
   }
 }
 

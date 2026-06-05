@@ -271,7 +271,25 @@ void NvEncoder::CreateEncoder(const NV_ENC_INITIALIZE_PARAMS* pEncoderParams)
     }
     m_initializeParams.encodeConfig = &m_encodeConfig;
 
-    NVENC_API_CALL(m_nvenc.nvEncInitializeEncoder(m_hEncoder, &m_initializeParams));
+    // HoneyCord: extract the driver's last-error string when
+    // nvEncInitializeEncoder fails. Plain NVENC_API_CALL only carries the
+    // bare numeric status; the human-readable reason
+    // ("Invalid VBV buffer size", "AQ not supported with async", ...) lives
+    // behind nvEncGetLastErrorString().
+    {
+      NVENCSTATUS s = m_nvenc.nvEncInitializeEncoder(m_hEncoder, &m_initializeParams);
+      if (s != NV_ENC_SUCCESS) {
+        const char* detail =
+            m_nvenc.nvEncGetLastErrorString
+                ? m_nvenc.nvEncGetLastErrorString(m_hEncoder)
+                : "(nvEncGetLastErrorString not in function list)";
+        std::ostringstream e;
+        e << "nvEncInitializeEncoder returned status " << s
+          << "; driver detail: " << (detail ? detail : "(null)");
+        throw NVENCException::makeNVENCException(e.str(), s, __FUNCTION__,
+                                                  __FILE__, __LINE__);
+      }
+    }
 
     m_bEncoderInitialized = true;
     m_nWidth = m_initializeParams.encodeWidth;
@@ -506,7 +524,23 @@ void NvEncoder::GetEncodedPacket(std::vector<NV_ENC_OUTPUT_PTR> &vOutputBuffer, 
 
 bool NvEncoder::Reconfigure(const NV_ENC_RECONFIGURE_PARAMS *pReconfigureParams)
 {
-    NVENC_API_CALL(m_nvenc.nvEncReconfigureEncoder(m_hEncoder, const_cast<NV_ENC_RECONFIGURE_PARAMS*>(pReconfigureParams)));
+    // HoneyCord: surface the driver's human-readable reason (same as
+    // CreateEncoder) instead of the bare numeric status, so the wrapper's
+    // "Reconfigure FAILED" log shows WHY it returns error 8.
+    {
+        NVENCSTATUS s = m_nvenc.nvEncReconfigureEncoder(m_hEncoder, const_cast<NV_ENC_RECONFIGURE_PARAMS*>(pReconfigureParams));
+        if (s != NV_ENC_SUCCESS) {
+            const char* detail =
+                m_nvenc.nvEncGetLastErrorString
+                    ? m_nvenc.nvEncGetLastErrorString(m_hEncoder)
+                    : "(nvEncGetLastErrorString not in function list)";
+            std::ostringstream e;
+            e << "nvEncReconfigureEncoder returned status " << s
+              << "; driver detail: " << (detail ? detail : "(null)");
+            throw NVENCException::makeNVENCException(e.str(), s, __FUNCTION__,
+                                                      __FILE__, __LINE__);
+        }
+    }
 
     memcpy(&m_initializeParams, &(pReconfigureParams->reInitEncodeParams), sizeof(m_initializeParams));
     if (pReconfigureParams->reInitEncodeParams.encodeConfig)
@@ -627,6 +661,14 @@ void NvEncoder::UnregisterResources()
 void NvEncoder::WaitForCompletionEvent(int iEvent)
 {
 #if defined(_WIN32)
+    // HoneyCord: in SYNCHRONOUS mode (enableEncodeAsync=0) the driver never
+    // signals these async completion events, so the wait below always ran into
+    // its 20s timeout -> every frame's output was delayed 20 seconds and
+    // WebRTC treated the stream as dead. In sync mode nvEncEncodePicture has
+    // already produced the bitstream by the time we get here, so there is
+    // nothing to wait for.
+    if (!m_initializeParams.enableEncodeAsync)
+        return;
 #ifdef DEBUG
     WaitForSingleObject(m_vpCompletionEvent[iEvent], INFINITE);
 #else

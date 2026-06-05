@@ -272,9 +272,17 @@ int32_t NvCodecVideoEncoderImpl::InitEncode(
     int32_t number_of_cores,
     size_t max_payload_size) {
   RTC_DCHECK(codec_settings);
+  NvProbeLog("InitEncode entry: w=%u h=%u maxFR=%u startBR=%u maxBR=%u mode=%d",
+             codec_settings ? codec_settings->width : 0,
+             codec_settings ? codec_settings->height : 0,
+             codec_settings ? codec_settings->maxFramerate : 0,
+             codec_settings ? codec_settings->startBitrate : 0,
+             codec_settings ? codec_settings->maxBitrate : 0,
+             codec_settings ? (int)codec_settings->mode : -1);
 
   int32_t release_ret = Release();
   if (release_ret != WEBRTC_VIDEO_CODEC_OK) {
+    NvProbeLog("InitEncode: Release returned %d, aborting", release_ret);
     return release_ret;
   }
 
@@ -300,13 +308,16 @@ int32_t NvCodecVideoEncoderImpl::InitEncode(
     scalability_mode_ = *scalability_mode;
   }
 
-  return InitNvEnc();
+  int32_t init_ret = InitNvEnc();
+  NvProbeLog("InitEncode: InitNvEnc returned %d", init_ret);
+  return init_ret;
 }
 
 int32_t NvCodecVideoEncoderImpl::RegisterEncodeCompleteCallback(
     webrtc::EncodedImageCallback* callback) {
   std::lock_guard<std::mutex> lock(mutex_);
   callback_ = callback;
+  NvProbeLog("RegisterEncodeCompleteCallback: callback=%p", (void*)callback);
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -317,11 +328,22 @@ int32_t NvCodecVideoEncoderImpl::Release() {
 int32_t NvCodecVideoEncoderImpl::Encode(
     const webrtc::VideoFrame& frame,
     const std::vector<webrtc::VideoFrameType>* frame_types) {
-  //RTC_LOG(LS_ERROR) << __FUNCTION__ << " Start";
+  // Log every 60th entry to confirm Encode is even being called.
+  static int s_encode_entry_counter = 0;
+  if ((s_encode_entry_counter++ % 60) == 0) {
+    NvProbeLog("Encode entry #%d: nv_encoder=%p callback=%p w=%u h=%u "
+               "buffer_type=%d frame_types=%s",
+               s_encode_entry_counter, (void*)nv_encoder_.get(),
+               (void*)callback_, width_, height_,
+               (int)frame.video_frame_buffer()->type(),
+               frame_types ? "yes" : "null");
+  }
   if (!nv_encoder_) {
+    NvProbeLog("Encode: nv_encoder is NULL -> UNINITIALIZED");
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
   }
   if (!callback_) {
+    NvProbeLog("Encode: callback_ is NULL -> UNINITIALIZED (callback was never registered)");
     RTC_LOG(LS_WARNING)
         << "InitEncode() has been called, but a callback function "
         << "has not been set with RegisterEncodeCompleteCallback()";
@@ -359,31 +381,57 @@ int32_t NvCodecVideoEncoderImpl::Encode(
     encode_config.rcParams.averageBitRate =
         bitrate_adjuster_.GetAdjustedBitrateBps();
     encode_config.rcParams.maxBitRate = max_bitrate_bps_;
+    // VBV buffer = 1 second of target bitrate. MUST match the create path
+    // (CreateEncoder above). The old "* 1 / framerate_" formula computed one
+    // FRAME worth of bits, which nvEncReconfigureEncoder rejects as
+    // "Invalid VBV buffer size" (err=8) — that aborted every Encode() below
+    // so no frames were ever sent.
     encode_config.rcParams.vbvBufferSize =
-        encode_config.rcParams.averageBitRate * 1 / framerate_;
+        encode_config.rcParams.averageBitRate;
     encode_config.rcParams.vbvInitialDelay =
         encode_config.rcParams.vbvBufferSize;
+    // Clear up-front: even if Reconfigure fails we must NOT retry it on every
+    // frame (that produced the 13k-line error flood) and must NOT abort the
+    // encode — the encoder is still valid at its current config.
+    reconfigure_needed_ = false;
     try {
-      //RTC_LOG(LS_ERROR) << __FUNCTION__ << " Reconfigure";
       nv_encoder_->Reconfigure(&reconfigure_params);
     } catch (const NVENCException& e) {
-      RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
-      return WEBRTC_VIDEO_CODEC_ERROR;
+      RTC_LOG(LS_ERROR) << __FUNCTION__
+                        << " Reconfigure failed (non-fatal): " << e.what();
+      NvProbeLog("Encode: Reconfigure FAILED (non-fatal, keep encoding): %s",
+                 e.what());
+      // fall through and encode the frame at the existing config
     }
-
-    reconfigure_needed_ = false;
   }
 
+  static int s_path_dbg_counter = 0;
+  const bool dbg_path = (s_path_dbg_counter++ % 60) == 0;
+
   if (frame_types != nullptr) {
+    int ft0 = (int)(*frame_types)[0];
+    if (dbg_path) {
+      NvProbeLog("Encode path: frame_types[0]=%d size=%zu (0=Empty 3=Key 4=Delta)",
+                 ft0, frame_types->size());
+    }
     // We only support a single stream.
     RTC_DCHECK_EQ(frame_types->size(), static_cast<size_t>(1));
     // Skip frame?
     if ((*frame_types)[0] == webrtc::VideoFrameType::kEmptyFrame) {
+      // Log every empty-frame skip — if WebRTC sends a steady stream of
+      // these the encoder produces no output and the resolution ladder
+      // collapses, which is the symptom we're chasing.
+      static int s_empty_counter = 0;
+      if ((s_empty_counter++ % 60) == 0) {
+        NvProbeLog("Encode: kEmptyFrame #%d -> return OK no encode", s_empty_counter);
+      }
       return WEBRTC_VIDEO_CODEC_OK;
     }
     // Force key frame?
     send_key_frame =
         (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
+  } else if (dbg_path) {
+    NvProbeLog("Encode path: frame_types=null");
   }
 
   NV_ENC_PIC_PARAMS pic_params = {NV_ENC_PIC_PARAMS_VER};
@@ -398,10 +446,39 @@ int32_t NvCodecVideoEncoderImpl::Encode(
   v_packet_.clear();
 
 #ifdef _WIN32
+  if (!id3d11_texture_) {
+    static int s_no_tex_counter = 0;
+    if ((s_no_tex_counter++ % 60) == 0) {
+      NvProbeLog("Encode path: id3d11_texture_ is NULL #%d -> ERROR",
+                 s_no_tex_counter);
+    }
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
   const NvEncInputFrame* input_frame = nv_encoder_->GetNextInputFrame();
-  D3D11_MAPPED_SUBRESOURCE map;
-  id3d11_context_->Map(id3d11_texture_.Get(), D3D11CalcSubresource(0, 0, 1),
-                       D3D11_MAP_WRITE, 0, &map);
+  if (!input_frame) {
+    static int s_no_in_counter = 0;
+    if ((s_no_in_counter++ % 60) == 0) {
+      NvProbeLog("Encode path: GetNextInputFrame returned NULL #%d -> ERROR",
+                 s_no_in_counter);
+    }
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+  D3D11_MAPPED_SUBRESOURCE map = {};
+  HRESULT map_hr = id3d11_context_->Map(
+      id3d11_texture_.Get(), D3D11CalcSubresource(0, 0, 1),
+      D3D11_MAP_WRITE, 0, &map);
+  if (FAILED(map_hr) || map.pData == nullptr) {
+    static int s_map_fail_counter = 0;
+    if ((s_map_fail_counter++ % 60) == 0) {
+      NvProbeLog("Encode path: D3D11 Map FAILED hr=0x%08lx pData=%p #%d -> ERROR",
+                 (long)map_hr, map.pData, s_map_fail_counter);
+    }
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+  if (dbg_path) {
+    NvProbeLog("Encode path: pre-EncodeFrame OK (map.pData=%p rowPitch=%u)",
+               map.pData, (unsigned)map.RowPitch);
+  }
   if (frame.video_frame_buffer()->type() ==
       webrtc::VideoFrameBuffer::Type::kNV12) {
     webrtc::NV12BufferInterface* frame_buffer =
@@ -458,12 +535,49 @@ int32_t NvCodecVideoEncoderImpl::Encode(
   // re-wrap into the local NvEncOutputFrame struct so the iteration below
   // (Momo's original idiom) keeps working.
   std::vector<std::vector<uint8_t>> raw_packets;
+#ifdef _WIN32
+  LARGE_INTEGER enc_t0, enc_t1, enc_freq;
+  QueryPerformanceFrequency(&enc_freq);
+  QueryPerformanceCounter(&enc_t0);
+#endif
   try {
     nv_encoder_->EncodeFrame(raw_packets, &pic_params);
   } catch (const NVENCException& e) {
     RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
+    NvProbeLog("Encode: EncodeFrame THREW: %s", e.what());
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
+#ifdef _WIN32
+  QueryPerformanceCounter(&enc_t1);
+  double enc_ms = (double)(enc_t1.QuadPart - enc_t0.QuadPart) * 1000.0 /
+                   (double)enc_freq.QuadPart;
+  // Light-weight running counter — log every 60 encodes (~1s @ 60fps)
+  // so we don't drown the file. Always log if 0 packets came back —
+  // that's the smoking gun for "encoder accepts frames but never
+  // emits output", which WebRTC reads as "encoder is dead" and
+  // ladders the resolution down.
+  static int enc_counter = 0;
+  static int empty_in_a_row = 0;
+  if (raw_packets.empty()) {
+    ++empty_in_a_row;
+    if (empty_in_a_row <= 5 || (empty_in_a_row % 30) == 0) {
+      NvProbeLog("Encode: 0 packets returned (#%d in a row) enc_ms=%.2f",
+                 empty_in_a_row, enc_ms);
+    }
+  } else {
+    if (empty_in_a_row > 0) {
+      NvProbeLog("Encode: first output after %d empty (enc_ms=%.2f)",
+                 empty_in_a_row, enc_ms);
+      empty_in_a_row = 0;
+    }
+    if ((enc_counter++ % 60) == 0) {
+      size_t bytes = 0;
+      for (auto& p : raw_packets) bytes += p.size();
+      NvProbeLog("Encode #%d: %zu packets, %zu bytes, %.2f ms",
+                 enc_counter, raw_packets.size(), bytes, enc_ms);
+    }
+  }
+#endif
   v_packet_.clear();
   v_packet_.reserve(raw_packets.size());
   for (auto& raw : raw_packets) {
@@ -739,12 +853,50 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
     }
     NvProbeLog("CreateDefaultEncoderParams ok");
 
+    // NVENC SDK 10+ split tuning out of the preset: P1-P7 are generic
+    // presets, the actual real-time vs HQ vs lossless decision is the
+    // tuningInfo. CreateDefaultEncoderParams in the vendored NvEncoder.cpp
+    // is the 3-arg version and never touches this field — it stays at
+    // NV_ENC_TUNING_INFO_UNDEFINED (value 0), which the driver rejects
+    // with "Unsupported color format" (mapped from INVALID_PARAM).
+    //
+    // LOW_LATENCY is the realtime profile: no B-frames, predictable
+    // GOP timing — matches our frameIntervalP=1 + gopLength=INFINITE
+    // setup. ULTRA_LOW_LATENCY is even more aggressive but trades
+    // visible quality at our bitrates; HIGH_QUALITY would internally
+    // re-enable B-frames on P3+, which conflicts with frameIntervalP=1.
+    initialize_params.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
+
+    // Force SYNCHRONOUS encode. CreateDefaultEncoderParams sets
+    // enableEncodeAsync=1 on Windows by default. With async, NvEncoder.cpp's
+    // EncodeFrame uses WaitForSingleObject(completionEvent, INFINITE) — and
+    // WebRTC's encoder pump silently stalls on that wait because the event
+    // is fired on the wrong thread under our pipeline. Symptom: encoder
+    // initialises fine, but NO output makes it back to OnEncodedImage,
+    // WebRTC sees 0 bytes/sec and starts dropping resolution one step at a
+    // time hoping to recover. Sync mode makes EncodeFrame block normally
+    // and return packets through nvEncLockBitstream + ProcessOutput — a
+    // model that fits our single-call Encode() exactly.
+    initialize_params.enableEncodeAsync = 0;
+
     //initialize_params.enablePTD = 1;
     initialize_params.frameRateDen = 1;
     initialize_params.frameRateNum = framerate;
     initialize_params.maxEncodeWidth = width;
     initialize_params.maxEncodeHeight = height;
 
+    // CreateDefaultEncoderParams leaves rateControlMode = CONSTQP. We're
+    // setting averageBitRate / maxBitRate / vbvBufferSize / enableAQ /
+    // aqStrength below — all of which are CBR/VBR parameters NVENC rejects
+    // (NV_ENC_ERR_UNSUPPORTED_PARAM, err=8) when the mode is still CONSTQP.
+    //
+    // We use VBR (not CBR): the BitrateAdjuster + WebRTC's SetRates() feed
+    // averageBitRate dynamically with the network-estimated rate while
+    // maxBitRate stays at the user-chosen ceiling. Plain CBR rejects this
+    // avg-different-from-max combination outright; VBR accepts it and lets
+    // the encoder consume burst-capacity up to maxBitRate when the source
+    // has motion, then idle back down on static frames.
+    encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
     encode_config.rcParams.averageBitRate = target_bitrate_bps;
     encode_config.rcParams.maxBitRate = max_bitrate_bps;
 
@@ -759,6 +911,13 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
         encode_config.rcParams.vbvBufferSize;
     encode_config.gopLength = NVENC_INFINITE_GOPLENGTH;
     encode_config.frameIntervalP = 1;
+    // NVENC forbids changing frameFieldMode via Reconfigure ("Reconfiguration
+    // of frame field mode not supported", err 8). The preset leaves this at
+    // UNDEFINED(0) while the driver actually runs progressive FRAME mode, so
+    // GetInitializeParams() round-trips 0 and every SetRates() reconfigure was
+    // rejected — the encoder could never raise its bitrate in place and stayed
+    // pinned near the low start bitrate. Pin it explicitly so it matches.
+    encode_config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
     encode_config.rcParams.enableAQ = 1;
     // AQ strength is 1..15; 0 means disabled by spec. Mid-range (8) is the
     // OBS-style default — visibly better grain handling without sacrificing
@@ -766,9 +925,17 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
     encode_config.rcParams.aqStrength = 8;
 
     if (codec == CudaVideoCodec::H264) {
-      //encode_config.encodeCodecConfig.h264Config.outputAUD = 1;
-      //encode_config.encodeCodecConfig.h264Config.level = NV_ENC_LEVEL_H264_31;
-      //encode_config.encodeCodecConfig.h264Config.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
+      // NV12 is YUV 4:2:0. NV_ENC_CONFIG_H264::chromaFormatIDC must be 1
+      // for that. The legacy nvEncGetEncodePresetConfig() (used by our
+      // vendored NvEncoder.cpp) doesn't populate this field correctly for
+      // the P-presets, leaving chromaFormatIDC at 0. That makes the driver
+      // throw "Unsupported color format" out of nvEncInitializeEncoder.
+      encode_config.encodeCodecConfig.h264Config.chromaFormatIDC = 1;
+      // AUTOSELECT lets the driver pick the right H.264 profile for
+      // 4:2:0 + our other settings (typically Main or High). Explicit so
+      // we don't inherit a leftover/uninitialised GUID from the preset
+      // config blob.
+      encode_config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
       encode_config.encodeCodecConfig.h264Config.idrPeriod =
           NVENC_INFINITE_GOPLENGTH;
       encode_config.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
@@ -787,6 +954,23 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
       encode_config.encodeCodecConfig.av1Config.repeatSeqHdr = 1;
     }
 
+    NvProbeLog("CreateEncoder params: rc=%d tuning=%d avgBR=%u maxBR=%u vbv=%u "
+               "aq=%d/%d gop=%u frameInt=%u idr=%u w=%u h=%u fps=%u/%u async=%d",
+               (int)encode_config.rcParams.rateControlMode,
+               (int)initialize_params.tuningInfo,
+               encode_config.rcParams.averageBitRate,
+               encode_config.rcParams.maxBitRate,
+               encode_config.rcParams.vbvBufferSize,
+               (int)encode_config.rcParams.enableAQ,
+               (int)encode_config.rcParams.aqStrength,
+               (unsigned)encode_config.gopLength,
+               (unsigned)encode_config.frameIntervalP,
+               (unsigned)encode_config.encodeCodecConfig.h264Config.idrPeriod,
+               initialize_params.encodeWidth,
+               initialize_params.encodeHeight,
+               initialize_params.frameRateNum,
+               initialize_params.frameRateDen,
+               (int)initialize_params.enableEncodeAsync);
     NvProbeLog("calling encoder->CreateEncoder() (initialize_params_ver=0x%08x, config_ver=0x%08x)",
                (unsigned)NV_ENC_INITIALIZE_PARAMS_VER, (unsigned)NV_ENC_CONFIG_VER);
     encoder->CreateEncoder(&initialize_params);
