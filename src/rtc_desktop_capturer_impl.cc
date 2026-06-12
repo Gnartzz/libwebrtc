@@ -29,6 +29,10 @@
 #ifdef WEBRTC_WIN
 #include "modules/desktop_capture/win/window_capture_utils.h"
 #include "modules/desktop_capture/win/screen_capturer_win_directx.h"
+#include <dxgi1_2.h>
+#include <d3d11_4.h>
+#include <d3dcompiler.h>
+#include "win/honeycord_d3d11_frame.h"
 #endif
 
 namespace libwebrtc {
@@ -107,6 +111,9 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
 
 RTCDesktopCapturerImpl::~RTCDesktopCapturerImpl() {
   thread_->Stop();
+#ifdef _WIN32
+  ReleaseGpu();
+#endif
   capturer_.reset();
 }
 
@@ -140,7 +147,15 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
     capture_delay_ = uint32_t(1000.0 / fps);
   }
 
-  if (source_id_ != -1) {
+#ifdef _WIN32
+  // Zero-Copy-GPU-Pfad nur fuer Bildschirm (kScreen). InitGpu() faellt bei
+  // Monitor-an-iGPU / kein-NVIDIA sauber durch -> CPU-Capturer uebernimmt.
+  if (type_ == kScreen) {
+    thread_->BlockingCall([this] { gpu_mode_ = InitGpu(); });
+  }
+#endif
+
+  if (!gpu_mode_ && source_id_ != -1) {
     if (!capturer_->SelectSource(source_id_)) {
       capture_state_ = CS_FAILED;
       return capture_state_;
@@ -153,7 +168,9 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
     }
   }
 
-  thread_->BlockingCall([this] { capturer_->Start(this); });
+  if (!gpu_mode_) {
+    thread_->BlockingCall([this] { capturer_->Start(this); });
+  }
   capture_state_ = CS_RUNNING;
   thread_->PostTask([this] { CaptureFrame(); });
   if (observer_) {
@@ -294,9 +311,190 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
 #endif
 }
 
+#ifdef _WIN32
+// Fullscreen-Triangle-Shader: Bilinear-Downscale Desktop-SRV -> Pool-RTV.
+static const char* kHcShaderHLSL =
+    "Texture2D tex:register(t0); SamplerState smp:register(s0);"
+    "struct VO{float4 p:SV_POSITION;float2 uv:TEXCOORD0;};"
+    "VO VSMain(uint id:SV_VertexID){VO o;o.uv=float2((id<<1)&2,id&2);"
+    "o.p=float4(o.uv*float2(2,-2)+float2(-1,1),0,1);return o;}"
+    "float4 PSMain(VO i):SV_TARGET{return tex.Sample(smp,i.uv);}";
+
+bool RTCDesktopCapturerImpl::InitGpu() {
+  using Microsoft::WRL::ComPtr;
+  g_target_w_ = max_width_ ? max_width_ : 1920;
+  g_target_h_ = max_height_ ? max_height_ : 1080;
+  if (g_target_w_ > 4096) g_target_w_ = 1920;  // H.264-Grenze
+  if (g_target_h_ > 4096) g_target_h_ = 1080;
+
+  ComPtr<IDXGIFactory1> factory;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+  ComPtr<IDXGIAdapter1> adapter, nvidia;
+  for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
+    DXGI_ADAPTER_DESC1 d;
+    adapter->GetDesc1(&d);
+    if (d.VendorId == 0x10DE && !nvidia) nvidia = adapter;
+    adapter.Reset();
+  }
+  if (!nvidia) return false;
+  D3D_FEATURE_LEVEL fl;
+  if (FAILED(D3D11CreateDevice(nvidia.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+                               nullptr, 0, D3D11_SDK_VERSION, &g_dev_, &fl,
+                               &g_ctx_)))
+    return false;
+  // KRITISCH: Capture-Thread (Render) + Encoder-Thread (CopyResource) nutzen
+  // denselben Immediate-Context -> Multithread-Schutz an, sonst Race/Crash.
+  ComPtr<ID3D11Multithread> mt;
+  if (SUCCEEDED(g_ctx_.As(&mt))) mt->SetMultithreadProtected(TRUE);
+
+  // Desktop-Duplication am NVIDIA-Output 0. Scheitert, wenn der Monitor nicht an
+  // der NVIDIA haengt -> false -> Fallback auf den CPU-Capturer.
+  ComPtr<IDXGIOutput> out;
+  if (FAILED(nvidia->EnumOutputs(0, &out))) { ReleaseGpu(); return false; }
+  ComPtr<IDXGIOutput1> out1;
+  if (FAILED(out.As(&out1))) { ReleaseGpu(); return false; }
+  if (FAILED(out1->DuplicateOutput(g_dev_.Get(), &g_dup_))) {
+    ReleaseGpu();
+    return false;
+  }
+  DXGI_OUTDUPL_DESC dd;
+  g_dup_->GetDesc(&dd);
+  g_desk_w_ = dd.ModeDesc.Width;
+  g_desk_h_ = dd.ModeDesc.Height;
+
+  ComPtr<ID3DBlob> vsb, psb, err;
+  if (FAILED(D3DCompile(kHcShaderHLSL, strlen(kHcShaderHLSL), nullptr, nullptr,
+                        nullptr, "VSMain", "vs_5_0", 0, 0, &vsb, &err)) ||
+      FAILED(D3DCompile(kHcShaderHLSL, strlen(kHcShaderHLSL), nullptr, nullptr,
+                        nullptr, "PSMain", "ps_5_0", 0, 0, &psb, &err))) {
+    ReleaseGpu();
+    return false;
+  }
+  if (FAILED(g_dev_->CreateVertexShader(vsb->GetBufferPointer(),
+                                        vsb->GetBufferSize(), nullptr, &g_vs_)) ||
+      FAILED(g_dev_->CreatePixelShader(psb->GetBufferPointer(),
+                                       psb->GetBufferSize(), nullptr, &g_ps_))) {
+    ReleaseGpu();
+    return false;
+  }
+  D3D11_SAMPLER_DESC sd = {};
+  sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+  sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sd.MaxLOD = D3D11_FLOAT32_MAX;
+  if (FAILED(g_dev_->CreateSamplerState(&sd, &g_smp_))) { ReleaseGpu(); return false; }
+
+  D3D11_TEXTURE2D_DESC cd = {};
+  cd.Width = g_desk_w_; cd.Height = g_desk_h_; cd.MipLevels = 1; cd.ArraySize = 1;
+  cd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; cd.SampleDesc.Count = 1;
+  cd.Usage = D3D11_USAGE_DEFAULT; cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  if (FAILED(g_dev_->CreateTexture2D(&cd, nullptr, &g_cached_)) ||
+      FAILED(g_dev_->CreateShaderResourceView(g_cached_.Get(), nullptr, &g_srv_))) {
+    ReleaseGpu();
+    return false;
+  }
+  D3D11_TEXTURE2D_DESC od = {};
+  od.Width = g_target_w_; od.Height = g_target_h_; od.MipLevels = 1; od.ArraySize = 1;
+  od.Format = DXGI_FORMAT_B8G8R8A8_UNORM; od.SampleDesc.Count = 1;
+  od.Usage = D3D11_USAGE_DEFAULT; od.BindFlags = D3D11_BIND_RENDER_TARGET;
+  for (int i = 0; i < kGpuPool; ++i) {
+    if (FAILED(g_dev_->CreateTexture2D(&od, nullptr, &g_out_[i])) ||
+        FAILED(g_dev_->CreateRenderTargetView(g_out_[i].Get(), nullptr,
+                                              &g_rtv_[i]))) {
+      ReleaseGpu();
+      return false;
+    }
+  }
+  HcCapLog("InitGpu OK: Desktop %ux%u -> %ux%u (Zero-Copy GPU-Pfad aktiv)",
+           g_desk_w_, g_desk_h_, g_target_w_, g_target_h_);
+  return true;
+}
+
+void RTCDesktopCapturerImpl::ReleaseGpu() {
+  g_dup_.Reset();
+  for (auto& r : g_rtv_) r.Reset();
+  for (auto& t : g_out_) t.Reset();
+  g_srv_.Reset();
+  g_cached_.Reset();
+  g_smp_.Reset();
+  g_ps_.Reset();
+  g_vs_.Reset();
+  g_ctx_.Reset();
+  g_dev_.Reset();
+  g_have_frame_ = false;
+}
+
+void RTCDesktopCapturerImpl::GpuCaptureFrame() {
+  using Microsoft::WRL::ComPtr;
+  ComPtr<IDXGIResource> res;
+  DXGI_OUTDUPL_FRAME_INFO fi;
+  HRESULT a = g_dup_->AcquireNextFrame(15, &fi, &res);
+  if (a == S_OK) {
+    ComPtr<ID3D11Texture2D> desk;
+    if (SUCCEEDED(res.As(&desk)))
+      g_ctx_->CopyResource(g_cached_.Get(), desk.Get());
+    g_dup_->ReleaseFrame();
+    g_have_frame_ = true;
+  } else if (a == DXGI_ERROR_WAIT_TIMEOUT) {
+    if (!g_have_frame_) return;  // noch kein Frame -> nichts senden
+    // statisch: letzten (g_cached_) erneut downscalen + senden
+  } else if (a == DXGI_ERROR_ACCESS_LOST) {
+    // Modus-/Aufloesungswechsel -> GPU-Pfad fallenlassen (CPU uebernimmt).
+    ReleaseGpu();
+    gpu_mode_ = false;
+    return;
+  } else {
+    return;
+  }
+
+  // GPU-Downscale: g_cached_(SRV) -> Pool-Textur(RTV). Round-Robin, damit der
+  // Encoder-Thread die gerade gelesene Textur nicht ueberschrieben bekommt.
+  int idx = g_pool_idx_;
+  g_pool_idx_ = (g_pool_idx_ + 1) % kGpuPool;
+  ID3D11RenderTargetView* rtv = g_rtv_[idx].Get();
+  ID3D11ShaderResourceView* srv = g_srv_.Get();
+  ID3D11SamplerState* smp = g_smp_.Get();
+  D3D11_VIEWPORT vp = {0, 0, (FLOAT)g_target_w_, (FLOAT)g_target_h_, 0, 1};
+  g_ctx_->OMSetRenderTargets(1, &rtv, nullptr);
+  g_ctx_->RSSetViewports(1, &vp);
+  g_ctx_->VSSetShader(g_vs_.Get(), nullptr, 0);
+  g_ctx_->PSSetShader(g_ps_.Get(), nullptr, 0);
+  g_ctx_->PSSetShaderResources(0, 1, &srv);
+  g_ctx_->PSSetSamplers(0, 1, &smp);
+  g_ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  g_ctx_->IASetInputLayout(nullptr);
+  g_ctx_->Draw(3, 0);
+  ID3D11ShaderResourceView* nullsrv = nullptr;
+  g_ctx_->PSSetShaderResources(0, 1, &nullsrv);
+  g_ctx_->Flush();  // sicherstellen, dass der Render fertig ist, bevor der
+                    // Encoder-Thread aus der Pool-Textur kopiert.
+
+  auto buf = honeycord::D3D11FrameBuffer::Create(
+      g_dev_.Get(), g_out_[idx].Get(), (int)g_target_w_, (int)g_target_h_);
+  OnFrame(webrtc::VideoFrame(buf, 0, webrtc::TimeMillis(),
+                             webrtc::kVideoRotation_0));
+}
+#endif  // _WIN32
+
 void RTCDesktopCapturerImpl::CaptureFrame() {
   RTC_DCHECK_RUN_ON(thread_.get());
   if (capture_state_ == CS_RUNNING) {
+#ifdef _WIN32
+    if (gpu_mode_) {
+      int64_t gt0 = webrtc::TimeMillis();
+      GpuCaptureFrame();
+      int64_t gel = webrtc::TimeMillis() - gt0;
+      int64_t gn = static_cast<int64_t>(capture_delay_) - gel;
+      if (gn < 0) gn = 0;
+      static int s_gpu_dbg = 0;
+      if ((s_gpu_dbg++ % 120) == 0)
+        HcCapLog("gpu cap: total=%lldms next=%lldms %ux%u->%ux%u",
+                 (long long)gel, (long long)gn, g_desk_w_, g_desk_h_,
+                 g_target_w_, g_target_h_);
+      thread_->PostDelayedHighPrecisionTask(
+          [this]() { CaptureFrame(); }, webrtc::TimeDelta::Millis(gn));
+      return;
+    }
+#endif
     // honeycord: schedule the NEXT grab at a steady cadence measured from the
     // START of this one. The old code added capture_delay_ AFTER the
     // synchronous grab + ARGB->I420 convert + scale had finished, so the real

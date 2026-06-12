@@ -154,6 +154,9 @@ rtc_shared_library("libwebrtc") {
       "LIB_WEBRTC_API_EXPORTS",
       "WEBRTC_WIN",
     ]
+    # Zero-Copy-Capturer (rtc_desktop_capturer_impl) nutzt D3DCompile fuer den
+    # Shader-Downscale -> d3dcompiler.lib (d3d11/dxgi kommen aus dem nvenc-Block).
+    libs += [ "d3dcompiler.lib" ]
   }
 
   if (is_linux) {

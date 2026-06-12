@@ -29,6 +29,13 @@
 #include "src/internal/vcm_capturer.h"
 #include "src/internal/video_capturer.h"
 
+#ifdef _WIN32
+#include <d3d11.h>
+#include <d3d11_4.h>
+#include <wrl/client.h>
+#include <array>
+#endif
+
 namespace libwebrtc {
 
 class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
@@ -90,6 +97,30 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   uint32_t max_width_ = 0;
   uint32_t max_height_ = 0;
   webrtc::scoped_refptr<webrtc::I420Buffer> scaled_buffer_;
+  bool gpu_mode_ = false;  // Zero-Copy-GPU-Pfad aktiv (Screen+NVIDIA); sonst CPU
+
+#ifdef _WIN32
+  // Zero-Copy-GPU-Pfad: DXGI-dup + Shader-Downscale -> kNative D3D11-Textur,
+  // alles auf einem NVIDIA-Device. Aktiv, wenn InitGpu() erfolgreich (Screen +
+  // Monitor an NVIDIA); sonst Fallback auf den webrtc-CPU-Capturer oben.
+  bool InitGpu();
+  void ReleaseGpu();
+  void GpuCaptureFrame();
+  static constexpr int kGpuPool = 4;
+  Microsoft::WRL::ComPtr<ID3D11Device> g_dev_;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext> g_ctx_;
+  Microsoft::WRL::ComPtr<IDXGIOutputDuplication> g_dup_;
+  Microsoft::WRL::ComPtr<ID3D11VertexShader> g_vs_;
+  Microsoft::WRL::ComPtr<ID3D11PixelShader> g_ps_;
+  Microsoft::WRL::ComPtr<ID3D11SamplerState> g_smp_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> g_cached_;       // voller Desktop (SRV)
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> g_srv_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, kGpuPool> g_out_;   // Pool
+  std::array<Microsoft::WRL::ComPtr<ID3D11RenderTargetView>, kGpuPool> g_rtv_;
+  int g_pool_idx_ = 0;
+  bool g_have_frame_ = false;
+  uint32_t g_target_w_ = 0, g_target_h_ = 0, g_desk_w_ = 0, g_desk_h_ = 0;
+#endif
 };
 
 }  // namespace libwebrtc
