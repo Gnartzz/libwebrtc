@@ -9,7 +9,8 @@
 //
 // ToI420() ist der CPU-Fallback (Readback): wird im Zero-Copy-Pfad NIE gerufen,
 // existiert nur als Sicherheitsnetz, falls die webrtc-Pipeline doch mal
-// konvertieren will (Adaptation/Stats) — dann lieber langsam als Crash.
+// konvertieren will (Adaptation unter Last / Stats) — dann lieber langsam (ein
+// GPU->CPU-Readback) als ein nullptr-Crash.
 
 #ifndef HONEYCORD_D3D11_FRAME_H_
 #define HONEYCORD_D3D11_FRAME_H_
@@ -19,9 +20,11 @@
 #include <wrl/client.h>
 
 #include "api/scoped_refptr.h"
+#include "api/video/i420_buffer.h"
 #include "api/video/video_frame_buffer.h"
 #include "api/make_ref_counted.h"
 #include "rtc_base/logging.h"
+#include "third_party/libyuv/include/libyuv.h"
 
 namespace honeycord {
 
@@ -43,13 +46,57 @@ class D3D11FrameBuffer : public webrtc::VideoFrameBuffer {
   ID3D11Device* device() const { return device_.Get(); }
   ID3D11Texture2D* texture() const { return texture_.Get(); }
 
-  // CPU-Fallback (noch nicht implementiert — im Zero-Copy-Pfad nie gerufen).
-  // TODO Phase 2: echtes Readback (Map staging + libyuv ARGB->I420), damit
-  // Adaptation/Stats nicht crasht. Bis dahin: laut loggen + nullptr.
+  // CPU-Fallback (Readback). Wird im Zero-Copy-Pfad NIE gerufen; nur wenn die
+  // webrtc-Pipeline den Frame doch konvertieren muss (z.B. Resolution-Adaptation
+  // unter Bandbreiten-Last oder Stats). Strategie: BGRA-Textur in eine
+  // CPU-lesbare Staging-Textur kopieren, mappen, mit libyuv nach I420 wandeln.
+  // Der Immediate-Context steht unter Multithread-Schutz (im Capturer via
+  // SetMultithreadProtected(TRUE) gesetzt), daher ist CopyResource/Map auch vom
+  // Encoder-/Adaptation-Thread aus sicher.
   webrtc::scoped_refptr<webrtc::I420BufferInterface> ToI420() override {
-    RTC_LOG(LS_ERROR) << "honeycord::D3D11FrameBuffer::ToI420() gerufen — "
-                         "Zero-Copy-Pfad sollte das NIE; Pipeline konvertiert?";
-    return nullptr;
+    using Microsoft::WRL::ComPtr;
+    if (!device_ || !texture_) return nullptr;
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture_->GetDesc(&desc);
+
+    ComPtr<ID3D11DeviceContext> ctx;
+    device_->GetImmediateContext(&ctx);
+    if (!ctx) return nullptr;
+
+    D3D11_TEXTURE2D_DESC sd = desc;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(device_->CreateTexture2D(&sd, nullptr, &staging))) {
+      RTC_LOG(LS_ERROR) << "D3D11FrameBuffer::ToI420: CreateTexture2D(staging) "
+                           "fehlgeschlagen";
+      return nullptr;
+    }
+    ctx->CopyResource(staging.Get(), texture_.Get());
+
+    D3D11_MAPPED_SUBRESOURCE map = {};
+    if (FAILED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map))) {
+      RTC_LOG(LS_ERROR) << "D3D11FrameBuffer::ToI420: Map(staging) "
+                           "fehlgeschlagen";
+      return nullptr;
+    }
+
+    webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
+        webrtc::I420Buffer::Create(width_, height_);
+    // BGRA (DXGI_FORMAT_B8G8R8A8_UNORM) liegt im Speicher byteweise als
+    // B,G,R,A — in libyuv-Nomenklatur "ARGB" (little-endian) — also ARGBToI420.
+    libyuv::ARGBToI420(static_cast<const uint8_t*>(map.pData),
+                       static_cast<int>(map.RowPitch),
+                       i420->MutableDataY(), i420->StrideY(),
+                       i420->MutableDataU(), i420->StrideU(),
+                       i420->MutableDataV(), i420->StrideV(),
+                       width_, height_);
+
+    ctx->Unmap(staging.Get(), 0);
+    return i420;
   }
 
  private:
