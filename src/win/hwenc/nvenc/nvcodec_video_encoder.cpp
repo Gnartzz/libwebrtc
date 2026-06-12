@@ -58,6 +58,7 @@
 
 #ifdef _WIN32
 #include "nv_codec_sdk/NvEncoderD3D11.h"
+#include "../../honeycord_d3d11_frame.h"
 #endif
 
 #include "sora_compat.h"
@@ -190,6 +191,11 @@ class NvCodecVideoEncoderImpl : public NvCodecVideoEncoder {
   Microsoft::WRL::ComPtr<ID3D11Device> id3d11_device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> id3d11_context_;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> id3d11_texture_;
+  // Zero-Copy: eigener NVENC-Encoder (ARGB) auf dem Device des kNative-Frames.
+  std::unique_ptr<NvEncoder> nv_encoder_native_;
+  Microsoft::WRL::ComPtr<ID3D11Device> native_device_;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext> native_context_;
+  bool EnsureNativeEncoder(ID3D11Device* device);
 #endif
 #ifdef __linux__
   std::unique_ptr<NvCodecVideoEncoderCuda> cuda_;
@@ -325,6 +331,49 @@ int32_t NvCodecVideoEncoderImpl::Release() {
   return ReleaseNvEnc();
 }
 
+#ifdef _WIN32
+// Zero-Copy: lazy NVENC-Encoder (ARGB) auf dem D3D11-Device des Capturer-Frames
+// erzeugen, damit Capture-Textur und NVENC-Input dasselbe Device teilen ->
+// CopyResource ohne CPU (Spike: 0,64 ms/Frame). Neu erzeugen, wenn Device wechselt.
+bool NvCodecVideoEncoderImpl::EnsureNativeEncoder(ID3D11Device* device) {
+  if (nv_encoder_native_ && native_device_.Get() == device) return true;
+  nv_encoder_native_.reset();
+  native_device_ = device;
+  device->GetImmediateContext(native_context_.ReleaseAndGetAddressOf());
+  try {
+    auto enc = std::make_unique<NvEncoderD3D11>(device, width_, height_,
+                                                NV_ENC_BUFFER_FORMAT_ARGB);
+    NV_ENC_INITIALIZE_PARAMS ip = {NV_ENC_INITIALIZE_PARAMS_VER};
+    NV_ENC_CONFIG cfg = {NV_ENC_CONFIG_VER};
+    ip.encodeConfig = &cfg;
+    enc->CreateDefaultEncoderParams(&ip, NV_ENC_CODEC_H264_GUID,
+                                    NV_ENC_PRESET_P3_GUID);
+    ip.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
+    ip.enableEncodeAsync = 0;
+    ip.frameRateNum = 60;
+    ip.frameRateDen = 1;
+    cfg.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
+    cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
+    cfg.frameIntervalP = 1;
+    cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+    cfg.rcParams.averageBitRate = target_bitrate_bps_;
+    cfg.rcParams.maxBitRate = max_bitrate_bps_;
+    cfg.rcParams.vbvBufferSize = target_bitrate_bps_;
+    cfg.encodeCodecConfig.h264Config.chromaFormatIDC = 1;
+    cfg.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+    cfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
+    enc->CreateEncoder(&ip);
+    nv_encoder_native_ = std::move(enc);
+    NvProbeLog("EnsureNativeEncoder: NVENC(ARGB) auf Frame-Device ok %ux%u",
+               width_, height_);
+    return true;
+  } catch (const NVENCException& e) {
+    NvProbeLog("EnsureNativeEncoder THREW: %s", e.what());
+    return false;
+  }
+}
+#endif
+
 int32_t NvCodecVideoEncoderImpl::Encode(
     const webrtc::VideoFrame& frame,
     const std::vector<webrtc::VideoFrameType>* frame_types) {
@@ -369,7 +418,25 @@ int32_t NvCodecVideoEncoderImpl::Encode(
 
   bool send_key_frame = false;
 
-  if (reconfigure_needed_) {
+#ifdef _WIN32
+  // Zero-Copy: kNative-Frame (D3D11-Textur vom Capturer) -> eigener NVENC-
+  // Encoder auf dem Frame-Device. Sonst der normale CPU-I420-Pfad.
+  const bool is_native = frame.video_frame_buffer()->type() ==
+                         webrtc::VideoFrameBuffer::Type::kNative;
+  honeycord::D3D11FrameBuffer* nb = nullptr;
+  NvEncoder* active_enc = nv_encoder_.get();
+  if (is_native) {
+    nb = static_cast<honeycord::D3D11FrameBuffer*>(
+        frame.video_frame_buffer().get());
+    if (!EnsureNativeEncoder(nb->device())) return WEBRTC_VIDEO_CODEC_ERROR;
+    active_enc = nv_encoder_native_.get();
+  }
+#else
+  const bool is_native = false;
+  NvEncoder* active_enc = nv_encoder_.get();
+#endif
+
+  if (!is_native && reconfigure_needed_) {
     NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {
         NV_ENC_RECONFIGURE_PARAMS_VER};
     NV_ENC_CONFIG encode_config = {NV_ENC_CONFIG_VER};
@@ -446,6 +513,13 @@ int32_t NvCodecVideoEncoderImpl::Encode(
   v_packet_.clear();
 
 #ifdef _WIN32
+  if (is_native) {
+    // *** Zero-Copy: Capture-Textur -> NVENC-Input, reiner GPU-CopyResource ***
+    const NvEncInputFrame* in = active_enc->GetNextInputFrame();
+    if (!in) return WEBRTC_VIDEO_CODEC_ERROR;
+    native_context_->CopyResource(
+        reinterpret_cast<ID3D11Texture2D*>(in->inputPtr), nb->texture());
+  } else {
   if (!id3d11_texture_) {
     static int s_no_tex_counter = 0;
     if ((s_no_tex_counter++ % 60) == 0) {
@@ -503,6 +577,7 @@ int32_t NvCodecVideoEncoderImpl::Encode(
   ID3D11Texture2D* nv11_texture =
       reinterpret_cast<ID3D11Texture2D*>(input_frame->inputPtr);
   id3d11_context_->CopyResource(nv11_texture, id3d11_texture_.Get());
+  }  // else: CPU-I420/NV12-Pfad
 #endif
 #ifdef __linux__
 
@@ -541,7 +616,7 @@ int32_t NvCodecVideoEncoderImpl::Encode(
   QueryPerformanceCounter(&enc_t0);
 #endif
   try {
-    nv_encoder_->EncodeFrame(raw_packets, &pic_params);
+    active_enc->EncodeFrame(raw_packets, &pic_params);
   } catch (const NVENCException& e) {
     RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
     NvProbeLog("Encode: EncodeFrame THREW: %s", e.what());
