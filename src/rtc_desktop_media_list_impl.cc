@@ -39,7 +39,15 @@ RTCDesktopMediaListImpl::RTCDesktopMediaListImpl(DesktopType type,
   options_ = webrtc::DesktopCaptureOptions::CreateDefault();
   options_.set_detect_updated_region(true);
 #ifdef WEBRTC_WIN
-  options_.set_allow_directx_capturer(true);
+  // honeycord: BEWUSST GDI (kein DirectX) fuer die Quellen-Vorschaubilder.
+  // webrtc erlaubt nur EINE IDXGIOutputDuplication pro Monitor pro Prozess
+  // (siehe dxgi_duplicator_controller.h). Wuerde der Thumbnail-Picker den
+  // DXGI-Duplicator initialisieren, haelt webrtcs Singleton den Monitor-Output
+  // -> unser Zero-Copy-GPU-Pfad (RTCDesktopCapturerImpl::InitGpu) kann denselben
+  // Output dann nicht mehr duplizieren (DuplicateOutput -> E_INVALIDARG). Fuer
+  // 320x180-Standbilder reicht GDI vollkommen; so bleibt die eine erlaubte
+  // Duplication fuer den eigentlichen Bildschirm-Stream frei.
+  options_.set_allow_directx_capturer(false);
 #endif
 #ifdef WEBRTC_LINUX
   if (type == kScreen) {

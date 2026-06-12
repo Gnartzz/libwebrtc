@@ -30,6 +30,7 @@
 #include "modules/desktop_capture/win/window_capture_utils.h"
 #include "modules/desktop_capture/win/screen_capturer_win_directx.h"
 #include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include "win/honeycord_d3d11_frame.h"
@@ -88,24 +89,36 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
     options_.set_allow_pipewire(true);
   }
 #endif
+  show_cursor_ = showCursor;
   thread_->BlockingCall([this, type, showCursor] {
-    if (type == kScreen) {
-      if (showCursor) {
-        capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
-            webrtc::DesktopCapturer::CreateScreenCapturer(options_), options_);
-      } else {
-        capturer_ = webrtc::DesktopAndCursorComposer::CreateWithoutMouseCursorMonitor(
-                webrtc::DesktopCapturer::CreateScreenCapturer(options_));
-      }
-    } else {
+    if (type != kScreen) {
       capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
           webrtc::DesktopCapturer::CreateWindowCapturer(options_), options_);
+      return;
     }
+#ifdef _WIN32
+    // honeycord: Bildschirm-Capturer auf Windows LAZY erzeugen (erst in Start()
+    // nach InitGpu(), nur bei CPU-Fallback). CreateScreenCapturer(allow_directx)
+    // ruft intern ScreenCapturerWinDirectx::IsSupported() -> initialisiert
+    // webrtcs DxgiDuplicatorController, der ALLE Monitor-Outputs dupliziert und
+    // haelt. webrtc erlaubt nur EINE Duplication pro Monitor/Prozess, also
+    // wuerde unser Zero-Copy-InitGpu::DuplicateOutput sonst mit E_INVALIDARG
+    // (0x80070057) scheitern. Fenster sind davon nicht betroffen.
+    (void)showCursor;
+#else
+    if (showCursor) {
+      capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
+          webrtc::DesktopCapturer::CreateScreenCapturer(options_), options_);
+    } else {
+      capturer_ = webrtc::DesktopAndCursorComposer::CreateWithoutMouseCursorMonitor(
+              webrtc::DesktopCapturer::CreateScreenCapturer(options_));
+    }
+#endif
   });
 #ifdef WEBRTC_WIN
-  HcCapLog("capturer init: type=%d directx_supported=%d showCursor=%d",
-           (int)type, (int)webrtc::ScreenCapturerWinDirectx::IsSupported(),
-           (int)showCursor);
+  // KEIN ScreenCapturerWinDirectx::IsSupported() hier aufrufen -> initialisiert
+  // sonst den DxgiDuplicatorController und greift den Monitor-Output (s.o.).
+  HcCapLog("capturer init: type=%d showCursor=%d", (int)type, (int)showCursor);
 #endif
 }
 
@@ -152,6 +165,22 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
   // Monitor-an-iGPU / kein-NVIDIA sauber durch -> CPU-Capturer uebernimmt.
   if (type_ == kScreen) {
     thread_->BlockingCall([this] { gpu_mode_ = InitGpu(); });
+    if (!gpu_mode_ && !capturer_) {
+      // GPU-Pfad inaktiv -> jetzt erst den webrtc-Bildschirm-Capturer bauen
+      // (lazy, siehe Konstruktor). Ab hier darf DirectX/DxgiDuplicator
+      // initialisieren, da kein GPU-Pfad mehr um die eine erlaubte Monitor-
+      // Duplication konkurriert.
+      thread_->BlockingCall([this] {
+        if (show_cursor_) {
+          capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
+              webrtc::DesktopCapturer::CreateScreenCapturer(options_), options_);
+        } else {
+          capturer_ =
+              webrtc::DesktopAndCursorComposer::CreateWithoutMouseCursorMonitor(
+                  webrtc::DesktopCapturer::CreateScreenCapturer(options_));
+        }
+      });
+    }
   }
 #endif
 
@@ -326,22 +355,42 @@ bool RTCDesktopCapturerImpl::InitGpu() {
   g_target_h_ = max_height_ ? max_height_ : 1080;
   if (g_target_w_ > 4096) g_target_w_ = 1920;  // H.264-Grenze
   if (g_target_h_ > 4096) g_target_h_ = 1080;
+  HcCapLog("InitGpu Versuch: max=%ux%u -> target=%ux%u",
+           max_width_, max_height_, g_target_w_, g_target_h_);
 
+  HRESULT hr;
   ComPtr<IDXGIFactory1> factory;
-  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+  if (FAILED(hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+    HcCapLog("InitGpu FAIL @ CreateDXGIFactory1: hr=0x%08X", (unsigned)hr);
+    return false;
+  }
   ComPtr<IDXGIAdapter1> adapter, nvidia;
+  int adapter_count = 0;
   for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
     DXGI_ADAPTER_DESC1 d;
     adapter->GetDesc1(&d);
+    // Outputs dieses Adapters zaehlen -> zeigt, ob der Desktop-Output im
+    // honeycord-Prozess ueberhaupt an der NVIDIA haengt (Hybrid-Diagnose).
+    UINT nout = 0;
+    ComPtr<IDXGIOutput> o;
+    for (UINT k = 0; adapter->EnumOutputs(k, &o) == S_OK; ++k) { nout++; o.Reset(); }
+    HcCapLog("InitGpu adapter[%u]: vendor=0x%04X device=0x%04X flags=0x%X outputs=%u",
+             i, d.VendorId, d.DeviceId, (unsigned)d.Flags, nout);
     if (d.VendorId == 0x10DE && !nvidia) nvidia = adapter;
     adapter.Reset();
+    adapter_count++;
   }
-  if (!nvidia) return false;
-  D3D_FEATURE_LEVEL fl;
-  if (FAILED(D3D11CreateDevice(nvidia.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
-                               nullptr, 0, D3D11_SDK_VERSION, &g_dev_, &fl,
-                               &g_ctx_)))
+  if (!nvidia) {
+    HcCapLog("InitGpu FAIL @ kein-NVIDIA-Adapter (adapter_count=%d)", adapter_count);
     return false;
+  }
+  D3D_FEATURE_LEVEL fl;
+  if (FAILED(hr = D3D11CreateDevice(nvidia.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+                               nullptr, 0, D3D11_SDK_VERSION, &g_dev_, &fl,
+                               &g_ctx_))) {
+    HcCapLog("InitGpu FAIL @ D3D11CreateDevice(nvidia): hr=0x%08X", (unsigned)hr);
+    return false;
+  }
   // KRITISCH: Capture-Thread (Render) + Encoder-Thread (CopyResource) nutzen
   // denselben Immediate-Context -> Multithread-Schutz an, sonst Race/Crash.
   ComPtr<ID3D11Multithread> mt;
@@ -350,12 +399,46 @@ bool RTCDesktopCapturerImpl::InitGpu() {
   // Desktop-Duplication am NVIDIA-Output 0. Scheitert, wenn der Monitor nicht an
   // der NVIDIA haengt -> false -> Fallback auf den CPU-Capturer.
   ComPtr<IDXGIOutput> out;
-  if (FAILED(nvidia->EnumOutputs(0, &out))) { ReleaseGpu(); return false; }
-  ComPtr<IDXGIOutput1> out1;
-  if (FAILED(out.As(&out1))) { ReleaseGpu(); return false; }
-  if (FAILED(out1->DuplicateOutput(g_dev_.Get(), &g_dup_))) {
-    ReleaseGpu();
-    return false;
+  if (FAILED(hr = nvidia->EnumOutputs(0, &out))) {
+    HcCapLog("InitGpu FAIL @ EnumOutputs(0) nvidia: hr=0x%08X", (unsigned)hr);
+    ReleaseGpu(); return false;
+  }
+  // Hybrid-GPU (NVIDIA dGPU + AMD iGPU) + Per-Monitor-DPI-aware Prozess (Flutter
+  // ist das): das aeltere IDXGIOutput1::DuplicateOutput wirft hier E_INVALIDARG
+  // (0x80070057). IDXGIOutput5::DuplicateOutput1 mit expliziter Formatliste ist
+  // der dokumentierte, DPI-aware-/Hybrid-taugliche Weg -> zuerst versuchen, nur
+  // BGRA anbieten (damit der nachgelagerte BGRA-Cache + Shader stimmen; DXGI
+  // konvertiert noetigenfalls aus einem HDR-Desktop-Format). Fallback aufs alte
+  // API fuer Nicht-Hybrid-/Aeltere-Systeme.
+  ComPtr<IDXGIOutput5> out5;
+  if (SUCCEEDED(out.As(&out5))) {
+    const DXGI_FORMAT fmts[] = { DXGI_FORMAT_B8G8R8A8_UNORM };
+    hr = out5->DuplicateOutput1(g_dev_.Get(), 0,
+                                (UINT)(sizeof(fmts) / sizeof(fmts[0])), fmts,
+                                &g_dup_);
+    if (SUCCEEDED(hr)) {
+      HcCapLog("InitGpu: DuplicateOutput1 OK (Hybrid/DPI-Pfad)");
+    } else {
+      HcCapLog("InitGpu: DuplicateOutput1 hr=0x%08X -> Fallback auf DuplicateOutput",
+               (unsigned)hr);
+      g_dup_.Reset();
+    }
+  } else {
+    HcCapLog("InitGpu: kein IDXGIOutput5 -> DuplicateOutput");
+  }
+  if (!g_dup_) {
+    ComPtr<IDXGIOutput1> out1;
+    if (FAILED(hr = out.As(&out1))) {
+      HcCapLog("InitGpu FAIL @ IDXGIOutput1-QueryInterface: hr=0x%08X", (unsigned)hr);
+      ReleaseGpu(); return false;
+    }
+    if (FAILED(hr = out1->DuplicateOutput(g_dev_.Get(), &g_dup_))) {
+      HcCapLog("InitGpu FAIL @ DuplicateOutput (auch +1 ging nicht): hr=0x%08X "
+               "(80070057=E_INVALIDARG 887A0004=UNSUPPORTED "
+               "887A0022=NOT_CURRENTLY_AVAILABLE)", (unsigned)hr);
+      ReleaseGpu();
+      return false;
+    }
   }
   DXGI_OUTDUPL_DESC dd;
   g_dup_->GetDesc(&dd);
@@ -367,6 +450,7 @@ bool RTCDesktopCapturerImpl::InitGpu() {
                         nullptr, "VSMain", "vs_5_0", 0, 0, &vsb, &err)) ||
       FAILED(D3DCompile(kHcShaderHLSL, strlen(kHcShaderHLSL), nullptr, nullptr,
                         nullptr, "PSMain", "ps_5_0", 0, 0, &psb, &err))) {
+    HcCapLog("InitGpu FAIL @ D3DCompile (D3DCompiler_47.dll fehlt?)");
     ReleaseGpu();
     return false;
   }
@@ -374,6 +458,7 @@ bool RTCDesktopCapturerImpl::InitGpu() {
                                         vsb->GetBufferSize(), nullptr, &g_vs_)) ||
       FAILED(g_dev_->CreatePixelShader(psb->GetBufferPointer(),
                                        psb->GetBufferSize(), nullptr, &g_ps_))) {
+    HcCapLog("InitGpu FAIL @ Create*Shader");
     ReleaseGpu();
     return false;
   }
@@ -381,7 +466,10 @@ bool RTCDesktopCapturerImpl::InitGpu() {
   sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
   sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
   sd.MaxLOD = D3D11_FLOAT32_MAX;
-  if (FAILED(g_dev_->CreateSamplerState(&sd, &g_smp_))) { ReleaseGpu(); return false; }
+  if (FAILED(g_dev_->CreateSamplerState(&sd, &g_smp_))) {
+    HcCapLog("InitGpu FAIL @ CreateSamplerState");
+    ReleaseGpu(); return false;
+  }
 
   D3D11_TEXTURE2D_DESC cd = {};
   cd.Width = g_desk_w_; cd.Height = g_desk_h_; cd.MipLevels = 1; cd.ArraySize = 1;
@@ -389,6 +477,7 @@ bool RTCDesktopCapturerImpl::InitGpu() {
   cd.Usage = D3D11_USAGE_DEFAULT; cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
   if (FAILED(g_dev_->CreateTexture2D(&cd, nullptr, &g_cached_)) ||
       FAILED(g_dev_->CreateShaderResourceView(g_cached_.Get(), nullptr, &g_srv_))) {
+    HcCapLog("InitGpu FAIL @ Cached-Texture/SRV (%ux%u)", g_desk_w_, g_desk_h_);
     ReleaseGpu();
     return false;
   }
@@ -400,6 +489,7 @@ bool RTCDesktopCapturerImpl::InitGpu() {
     if (FAILED(g_dev_->CreateTexture2D(&od, nullptr, &g_out_[i])) ||
         FAILED(g_dev_->CreateRenderTargetView(g_out_[i].Get(), nullptr,
                                               &g_rtv_[i]))) {
+      HcCapLog("InitGpu FAIL @ Pool-Texture[%d] (%ux%u)", i, g_target_w_, g_target_h_);
       ReleaseGpu();
       return false;
     }

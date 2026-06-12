@@ -23,6 +23,20 @@ VideoCapturer::VideoCapturer() = default;
 VideoCapturer::~VideoCapturer() = default;
 
 void VideoCapturer::OnFrame(const VideoFrame& frame) {
+  // honeycord Zero-Copy: kNative-Frames (GPU-D3D11-Textur, vom Bildschirm-
+  // Capturer bereits per Shader auf Zielaufloesung herunterskaliert) NIEMALS
+  // durch den VideoAdapter-Scale-Pfad schicken. Der wuerde unten
+  // frame.video_frame_buffer()->ToI420() + ScaleFrom() aufrufen -> CPU-Readback
+  // (zerstoert Zero-Copy) bzw. Absturz in I420Buffer (ToI420 kann den GPU-Frame
+  // nicht liefern). Direkt an die Senken durchreichen; der NVENC-Encoder
+  // verarbeitet den nativen Frame (supports_native_handle=true). Die Bildrate
+  // steuert der Capturer selbst (capture_delay_).
+  if (frame.video_frame_buffer()->type() ==
+      webrtc::VideoFrameBuffer::Type::kNative) {
+    broadcaster_.OnFrame(frame);
+    return;
+  }
+
   int cropped_width = 0;
   int cropped_height = 0;
   int out_width = 0;

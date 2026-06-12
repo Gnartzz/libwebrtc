@@ -10,7 +10,25 @@ namespace libwebrtc {
 
 VideoFrameBufferImpl::VideoFrameBufferImpl(
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> frame_buffer)
-    : buffer_(frame_buffer) {}
+    : buffer_(frame_buffer) {
+  // honeycord Zero-Copy: Ein nativer (GPU/kNative) Buffer wird hier SOFORT per
+  // Readback nach I420 gewandelt. Sonst behandeln die Renderer-/Konvertierungs-
+  // pfade unten (GetI420(), ConvertToARGB -> I420Buffer::Rotate/ScaleFrom) den
+  // reinen GPU-Handle faelschlich als I420-Daten -> Access Violation (tritt bei
+  // der lokalen Vorschau des Zero-Copy-Bildschirm-Streams auf). Faellt der
+  // Readback aus, lieber ein leeres I420 als ein Crash.
+  if (buffer_ &&
+      buffer_->type() == webrtc::VideoFrameBuffer::Type::kNative) {
+    const int w = buffer_->width();
+    const int h = buffer_->height();
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 = buffer_->ToI420();
+    if (i420) {
+      buffer_ = i420;
+    } else {
+      buffer_ = webrtc::I420Buffer::Create(w, h);
+    }
+  }
+}
 
 VideoFrameBufferImpl::VideoFrameBufferImpl(
     webrtc::scoped_refptr<webrtc::I420Buffer> frame_buffer)

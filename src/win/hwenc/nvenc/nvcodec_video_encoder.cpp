@@ -777,10 +777,14 @@ void NvCodecVideoEncoderImpl::SetRates(
 webrtc::VideoEncoder::EncoderInfo NvCodecVideoEncoderImpl::GetEncoderInfo()
     const {
   webrtc::VideoEncoder::EncoderInfo info;
-  // We do CPU-side I420->NV12 conversion via libyuv before pushing into the
-  // D3D11 staging texture — no native (GPU-resident) handle path. Reporting
-  // true here misleads WebRTC about our capabilities.
-  info.supports_native_handle = false;
+  // Zero-Copy: Bei Bildschirm-Freigabe liefert unser Capturer kNative-Frames
+  // (D3D11-Textur in honeycord::D3D11FrameBuffer); Encode() verarbeitet die
+  // direkt per GPU-CopyResource in den NVENC-Input (EnsureNativeEncoder).
+  // I420/NV12 (Kamera, CPU-Fallback) wird ebenso verarbeitet. Daher TRUE ->
+  // webrtc reicht native Frames UNVERAENDERT an Encode() durch und ruft NICHT
+  // selbst ToI420()+I420Buffer::Rotate() darauf auf dem Encoder-Thread (das
+  // crashte vorher mit Access Violation in I420Buffer::Rotate).
+  info.supports_native_handle = true;
   info.implementation_name = "NvCodec";
   info.is_hardware_accelerated = true;
   info.scaling_settings = webrtc::VideoEncoder::ScalingSettings(

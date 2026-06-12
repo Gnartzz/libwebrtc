@@ -98,6 +98,8 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   uint32_t max_height_ = 0;
   webrtc::scoped_refptr<webrtc::I420Buffer> scaled_buffer_;
   bool gpu_mode_ = false;  // Zero-Copy-GPU-Pfad aktiv (Screen+NVIDIA); sonst CPU
+  bool show_cursor_ = true;  // fuer die LAZY-Erzeugung des Screen-Capturers in
+                             // Start() (Cursor-Variante), siehe .cc-Konstruktor
 
 #ifdef _WIN32
   // Zero-Copy-GPU-Pfad: DXGI-dup + Shader-Downscale -> kNative D3D11-Textur,
