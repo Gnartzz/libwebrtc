@@ -5,29 +5,43 @@
 #include "libyuv/convert_from.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
+#ifdef _WIN32
+#include "win/honeycord_d3d11_frame.h"
+#endif
 
 namespace libwebrtc {
 
 VideoFrameBufferImpl::VideoFrameBufferImpl(
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> frame_buffer)
     : buffer_(frame_buffer) {
-  // honeycord Zero-Copy: Ein nativer (GPU/kNative) Buffer wird hier SOFORT per
-  // Readback nach I420 gewandelt. Sonst behandeln die Renderer-/Konvertierungs-
-  // pfade unten (GetI420(), ConvertToARGB -> I420Buffer::Rotate/ScaleFrom) den
-  // reinen GPU-Handle faelschlich als I420-Daten -> Access Violation (tritt bei
-  // der lokalen Vorschau des Zero-Copy-Bildschirm-Streams auf). Faellt der
-  // Readback aus, lieber ein leeres I420 als ein Crash.
-  if (buffer_ &&
-      buffer_->type() == webrtc::VideoFrameBuffer::Type::kNative) {
-    const int w = buffer_->width();
-    const int h = buffer_->height();
-    webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 = buffer_->ToI420();
-    if (i420) {
-      buffer_ = i420;
-    } else {
-      buffer_ = webrtc::I420Buffer::Create(w, h);
+  // honeycord: nativen (GPU/kNative) Buffer NICHT mehr eager nach I420 wandeln.
+  // Der GPU-Vorschau-Renderer holt sich stattdessen native_shared_handle() und
+  // rendert direkt aus der GPU-Textur (kein CPU-Readback). CPU-Konsumenten
+  // (Data*/ConvertToARGB) loesen die Wandlung lazy in EnsureI420() aus.
+}
+
+// Lazy: native/NV12/etc. -> I420 (gecached). ToI420() liefert fuer I420-Buffer
+// sich selbst (billig), fuer kNative den GPU->CPU-Readback. nullptr-sicher.
+const webrtc::I420BufferInterface* VideoFrameBufferImpl::EnsureI420() const {
+  if (!i420_cache_ && buffer_) {
+    i420_cache_ = buffer_->ToI420();
+    if (!i420_cache_) {
+      i420_cache_ =
+          webrtc::I420Buffer::Create(buffer_->width(), buffer_->height());
     }
   }
+  return i420_cache_.get();
+}
+
+void* VideoFrameBufferImpl::native_shared_handle() const {
+#ifdef _WIN32
+  if (buffer_ &&
+      buffer_->type() == webrtc::VideoFrameBuffer::Type::kNative) {
+    return static_cast<honeycord::D3D11FrameBuffer*>(buffer_.get())
+        ->shared_handle();
+  }
+#endif
+  return nullptr;
 }
 
 VideoFrameBufferImpl::VideoFrameBufferImpl(
@@ -48,34 +62,42 @@ int VideoFrameBufferImpl::width() const { return buffer_->width(); }
 int VideoFrameBufferImpl::height() const { return buffer_->height(); }
 
 const uint8_t* VideoFrameBufferImpl::DataY() const {
-  return buffer_->GetI420()->DataY();
+  const webrtc::I420BufferInterface* i = EnsureI420();
+  return i ? i->DataY() : nullptr;
 }
 
 const uint8_t* VideoFrameBufferImpl::DataU() const {
-  return buffer_->GetI420()->DataU();
+  const webrtc::I420BufferInterface* i = EnsureI420();
+  return i ? i->DataU() : nullptr;
 }
 
 const uint8_t* VideoFrameBufferImpl::DataV() const {
-  return buffer_->GetI420()->DataV();
+  const webrtc::I420BufferInterface* i = EnsureI420();
+  return i ? i->DataV() : nullptr;
 }
 
 int VideoFrameBufferImpl::StrideY() const {
-  return buffer_->GetI420()->StrideY();
+  const webrtc::I420BufferInterface* i = EnsureI420();
+  return i ? i->StrideY() : 0;
 }
 
 int VideoFrameBufferImpl::StrideU() const {
-  return buffer_->GetI420()->StrideU();
+  const webrtc::I420BufferInterface* i = EnsureI420();
+  return i ? i->StrideU() : 0;
 }
 
 int VideoFrameBufferImpl::StrideV() const {
-  return buffer_->GetI420()->StrideV();
+  const webrtc::I420BufferInterface* i = EnsureI420();
+  return i ? i->StrideV() : 0;
 }
 
 int VideoFrameBufferImpl::ConvertToARGB(Type type, uint8_t* dst_buffer,
                                         int dst_stride, int dest_width,
                                         int dest_height) {
+  const webrtc::I420BufferInterface* src = EnsureI420();
+  if (!src) return 0;
   webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
-      webrtc::I420Buffer::Rotate(*buffer_.get(), rotation_);
+      webrtc::I420Buffer::Rotate(*src, rotation_);
 
   webrtc::scoped_refptr<webrtc::I420Buffer> dest =
       webrtc::I420Buffer::Create(dest_width, dest_height);

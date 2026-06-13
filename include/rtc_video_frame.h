@@ -47,6 +47,13 @@ class RTCVideoFrame : public RefCountInterface {
   virtual int ConvertToARGB(Type type, uint8_t* dst_argb, int dst_stride_argb,
                             int dest_width, int dest_height) = 0;
 
+  // Windows GPU-Zero-Copy-Vorschau: liefert das DXGI-Legacy-Shared-Handle der
+  // zugrundeliegenden GPU-Textur (honeycord D3D11FrameBuffer), wenn der Frame ein
+  // nativer GPU-Frame ist; sonst nullptr. Der flutter_webrtc-Renderer nutzt es
+  // fuer eine GpuSurfaceTexture statt eines CPU-Readbacks. Rueckgabe als void*,
+  // damit keine Windows-/D3D-Header in dieses oeffentliche Interface muessen.
+  virtual void* native_shared_handle() const { return nullptr; }
+
  protected:
   virtual ~RTCVideoFrame() {}
 };

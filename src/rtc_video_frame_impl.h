@@ -39,6 +39,8 @@ class VideoFrameBufferImpl : public RTCVideoFrame {
   int ConvertToARGB(Type type, uint8_t* dst_argb, int dst_stride_argb,
                     int dest_width, int dest_height) override;
 
+  void* native_shared_handle() const override;
+
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer() { return buffer_; }
 
   // System monotonic clock, same timebase as webrtc::TimeMicros().
@@ -52,7 +54,14 @@ class VideoFrameBufferImpl : public RTCVideoFrame {
   void set_rotation(webrtc::VideoRotation rotation) { rotation_ = rotation; }
 
  private:
+  // Lazy-Konvertierung: native/GPU-Frames (kNative) werden erst bei echtem
+  // CPU-Zugriff (Data*/Stride*/ConvertToARGB) per ToI420()-Readback gewandelt
+  // und gecached. Der GPU-Vorschau-Renderer greift stattdessen auf
+  // native_shared_handle() zu und loest diesen Readback nie aus.
+  const webrtc::I420BufferInterface* EnsureI420() const;
+
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer_;
+  mutable webrtc::scoped_refptr<webrtc::I420BufferInterface> i420_cache_;
   int64_t timestamp_us_ = 0;
   webrtc::VideoRotation rotation_ = webrtc::kVideoRotation_0;
 };

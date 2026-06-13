@@ -30,14 +30,20 @@ namespace honeycord {
 
 class D3D11FrameBuffer : public webrtc::VideoFrameBuffer {
  public:
-  static webrtc::scoped_refptr<D3D11FrameBuffer> Create(ID3D11Device* device,
-                                                        ID3D11Texture2D* texture,
-                                                        int width, int height) {
-    return webrtc::make_ref_counted<D3D11FrameBuffer>(device, texture, width, height);
+  static webrtc::scoped_refptr<D3D11FrameBuffer> Create(
+      ID3D11Device* device, ID3D11Texture2D* texture, int width, int height,
+      HANDLE shared_handle = nullptr) {
+    return webrtc::make_ref_counted<D3D11FrameBuffer>(device, texture, width,
+                                                      height, shared_handle);
   }
 
-  D3D11FrameBuffer(ID3D11Device* device, ID3D11Texture2D* texture, int w, int h)
-      : device_(device), texture_(texture), width_(w), height_(h) {}
+  D3D11FrameBuffer(ID3D11Device* device, ID3D11Texture2D* texture, int w, int h,
+                   HANDLE shared_handle = nullptr)
+      : device_(device),
+        texture_(texture),
+        width_(w),
+        height_(h),
+        shared_handle_(shared_handle) {}
 
   Type type() const override { return Type::kNative; }
   int width() const override { return width_; }
@@ -45,6 +51,15 @@ class D3D11FrameBuffer : public webrtc::VideoFrameBuffer {
 
   ID3D11Device* device() const { return device_.Get(); }
   ID3D11Texture2D* texture() const { return texture_.Get(); }
+
+  // DXGI-Legacy-Shared-Handle (IDXGIResource::GetSharedHandle) einer
+  // KEYED_MUTEX-Shared-Textur, in die der Capturer pro Frame das fertige
+  // BGRA-Bild kopiert. Fuer die GPU-Vorschau: der flutter_webrtc-Renderer gibt
+  // diesen Handle an Flutters GpuSurfaceTexture (ANGLE oeffnet ihn cross-device),
+  // statt den Frame per ToI420()-Readback auf die CPU zu holen. nullptr, wenn
+  // keine Shared-Textur verfuegbar (dann CPU-Fallback). Konstant ueber alle
+  // Frames einer Capture-Session.
+  HANDLE shared_handle() const { return shared_handle_; }
 
   // CPU-Fallback (Readback). Wird im Zero-Copy-Pfad NIE gerufen; nur wenn die
   // webrtc-Pipeline den Frame doch konvertieren muss (z.B. Resolution-Adaptation
@@ -104,6 +119,7 @@ class D3D11FrameBuffer : public webrtc::VideoFrameBuffer {
   Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_;
   const int width_;
   const int height_;
+  HANDLE shared_handle_ = nullptr;  // gehoert dem Capturer, nicht schliessen
 };
 
 }  // namespace honeycord

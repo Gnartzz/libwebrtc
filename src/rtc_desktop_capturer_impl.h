@@ -122,6 +122,12 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   int g_pool_idx_ = 0;
   bool g_have_frame_ = false;
   uint32_t g_target_w_ = 0, g_target_h_ = 0, g_desk_w_ = 0, g_desk_h_ = 0;
+  // GPU-Vorschau: eine KEYED_MUTEX-Shared-Textur, in die pro Frame das fertige
+  // BGRA-Bild kopiert wird; ihr Legacy-Shared-Handle geht an den Renderer
+  // (Flutter GpuSurfaceTexture). Optional — wenn die Erzeugung scheitert, laeuft
+  // der Sende-/Encode-Pfad unveraendert weiter (nur die Vorschau bleibt CPU).
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> g_shared_tex_;
+  HANDLE g_shared_handle_ = nullptr;
 #endif
 };
 

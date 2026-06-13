@@ -494,6 +494,39 @@ bool RTCDesktopCapturerImpl::InitGpu() {
       return false;
     }
   }
+  // GPU-Vorschau: zusaetzliche KEYED_MUTEX-Shared-Textur. Pro Frame kopieren wir
+  // das fertige BGRA hier rein; ihr Legacy-Shared-Handle (IDXGIResource::
+  // GetSharedHandle, wie von Flutters GpuSurfaceTexture erwartet) geht an den
+  // Renderer, der ihn auf ANGLEs Device oeffnet. NICHT fatal: scheitert das,
+  // bleibt nur die Vorschau auf dem CPU-Pfad, der Sende-/Encode-Pfad laeuft
+  // unveraendert.
+  {
+    D3D11_TEXTURE2D_DESC shd = {};
+    shd.Width = g_target_w_; shd.Height = g_target_h_;
+    shd.MipLevels = 1; shd.ArraySize = 1;
+    shd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; shd.SampleDesc.Count = 1;
+    shd.Usage = D3D11_USAGE_DEFAULT;
+    shd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    // Legacy-Shared (KEIN Keyed-Mutex!): Flutters ANGLE oeffnet das via
+    // EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE und fasst laut Engine-Quelle KEINEN
+    // Keyed-Mutex an. Eine KEYEDMUTEX-Textur ohne AcquireSync zu benutzen ist ein
+    // D3D-Device-Error -> korrumpiert ANGLEs (von der ganzen App geteilten)
+    // Kontext -> komplette UI kaputt (Versuch 1). Also plain SHARED + Flush.
+    shd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    ComPtr<IDXGIResource> shres;
+    if (SUCCEEDED(g_dev_->CreateTexture2D(&shd, nullptr, &g_shared_tex_)) &&
+        SUCCEEDED(g_shared_tex_.As(&shres)) &&
+        SUCCEEDED(shres->GetSharedHandle(&g_shared_handle_)) &&
+        g_shared_handle_) {
+      HcCapLog("InitGpu: Vorschau-Shared-Textur ok (SHARED, kein KeyedMutex) handle=%p",
+               g_shared_handle_);
+    } else {
+      g_shared_tex_.Reset();
+      g_shared_handle_ = nullptr;
+      HcCapLog("InitGpu: Vorschau-Shared-Textur FEHLGESCHLAGEN (Vorschau bleibt CPU)");
+    }
+  }
+
   HcCapLog("InitGpu OK: Desktop %ux%u -> %ux%u (Zero-Copy GPU-Pfad aktiv)",
            g_desk_w_, g_desk_h_, g_target_w_, g_target_h_);
   return true;
@@ -508,6 +541,10 @@ void RTCDesktopCapturerImpl::ReleaseGpu() {
   g_smp_.Reset();
   g_ps_.Reset();
   g_vs_.Reset();
+  // Vorschau-Shared-Textur. Das Legacy-Shared-Handle (GetSharedHandle) gehoert
+  // der Ressource und wird mit ihr frei -> NICHT CloseHandle (nur NT-Handles).
+  g_shared_tex_.Reset();
+  g_shared_handle_ = nullptr;
   g_ctx_.Reset();
   g_dev_.Reset();
   g_have_frame_ = false;
@@ -555,11 +592,22 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
   g_ctx_->Draw(3, 0);
   ID3D11ShaderResourceView* nullsrv = nullptr;
   g_ctx_->PSSetShaderResources(0, 1, &nullsrv);
+
+  // GPU-Vorschau: fertiges Bild zusaetzlich in die (Legacy-)Shared-Textur
+  // kopieren. KEIN Keyed-Mutex (ANGLE bedient keinen) -> nur CopyResource; der
+  // direkt folgende Flush stellt sicher, dass die Kopie fertig ist, bevor der
+  // Frame als verfuegbar markiert wird. Minimales Tearing-Risiko (ANGLE liest
+  // ggf. waehrend des naechsten Schreibens) ist akzeptabel; ggf. double-buffern.
+  if (g_shared_tex_) {
+    g_ctx_->CopyResource(g_shared_tex_.Get(), g_out_[idx].Get());
+  }
+
   g_ctx_->Flush();  // sicherstellen, dass der Render fertig ist, bevor der
                     // Encoder-Thread aus der Pool-Textur kopiert.
 
   auto buf = honeycord::D3D11FrameBuffer::Create(
-      g_dev_.Get(), g_out_[idx].Get(), (int)g_target_w_, (int)g_target_h_);
+      g_dev_.Get(), g_out_[idx].Get(), (int)g_target_w_, (int)g_target_h_,
+      g_shared_handle_);
   OnFrame(webrtc::VideoFrame(buf, 0, webrtc::TimeMillis(),
                              webrtc::kVideoRotation_0));
 }
