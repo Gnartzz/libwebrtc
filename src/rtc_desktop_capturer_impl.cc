@@ -351,12 +351,14 @@ static const char* kHcShaderHLSL =
 
 bool RTCDesktopCapturerImpl::InitGpu() {
   using Microsoft::WRL::ComPtr;
-  g_target_w_ = max_width_ ? max_width_ : 1920;
-  g_target_h_ = max_height_ ? max_height_ : 1080;
-  if (g_target_w_ > 4096) g_target_w_ = 1920;  // H.264-Grenze
-  if (g_target_h_ > 4096) g_target_h_ = 1080;
-  HcCapLog("InitGpu Versuch: max=%ux%u -> target=%ux%u",
-           max_width_, max_height_, g_target_w_, g_target_h_);
+  // Deckel-Box aus dem Quality-Setting (max_width/max_height). g_target wird
+  // erst NACH der Duplication berechnet: Desktop seitenverhaeltnis-korrekt in
+  // die Box eingepasst, NIE hochskaliert (Monitor <= Box => nativ).
+  uint32_t box_w = max_width_ ? max_width_ : 1920;
+  uint32_t box_h = max_height_ ? max_height_ : 1080;
+  if (box_w > 4096) box_w = 4096;  // H.264-Grenze
+  if (box_h > 4096) box_h = 4096;
+  HcCapLog("InitGpu Versuch: Deckel-Box=%ux%u", box_w, box_h);
 
   HRESULT hr;
   ComPtr<IDXGIFactory1> factory;
@@ -444,6 +446,19 @@ bool RTCDesktopCapturerImpl::InitGpu() {
   g_dup_->GetDesc(&dd);
   g_desk_w_ = dd.ModeDesc.Width;
   g_desk_h_ = dd.ModeDesc.Height;
+  // g_target: Desktop seitenverhaeltnis-korrekt in die Deckel-Box einpassen.
+  // s<=1 => nie hochskalieren (Monitor <= Box => nativ encoden, kein Downscale
+  // + keine Verzerrung; 5120x1440 @ Box 1920x1080 -> 1920x540). Gerade Maße.
+  {
+    double sx = static_cast<double>(box_w) / static_cast<double>(g_desk_w_);
+    double sy = static_cast<double>(box_h) / static_cast<double>(g_desk_h_);
+    double s = sx < sy ? sx : sy;
+    if (s > 1.0) s = 1.0;
+    g_target_w_ = static_cast<uint32_t>(static_cast<double>(g_desk_w_) * s) & ~1u;
+    g_target_h_ = static_cast<uint32_t>(static_cast<double>(g_desk_h_) * s) & ~1u;
+    if (g_target_w_ < 2) g_target_w_ = 2;
+    if (g_target_h_ < 2) g_target_h_ = 2;
+  }
 
   ComPtr<ID3DBlob> vsb, psb, err;
   if (FAILED(D3DCompile(kHcShaderHLSL, strlen(kHcShaderHLSL), nullptr, nullptr,
@@ -555,15 +570,17 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
   ComPtr<IDXGIResource> res;
   DXGI_OUTDUPL_FRAME_INFO fi;
   HRESULT a = g_dup_->AcquireNextFrame(15, &fi, &res);
+  bool changed = false;
   if (a == S_OK) {
     ComPtr<ID3D11Texture2D> desk;
     if (SUCCEEDED(res.As(&desk)))
       g_ctx_->CopyResource(g_cached_.Get(), desk.Get());
     g_dup_->ReleaseFrame();
     g_have_frame_ = true;
+    changed = true;  // neuer Bildinhalt
   } else if (a == DXGI_ERROR_WAIT_TIMEOUT) {
     if (!g_have_frame_) return;  // noch kein Frame -> nichts senden
-    // statisch: letzten (g_cached_) erneut downscalen + senden
+    // statisch: kein neuer Inhalt (changed bleibt false)
   } else if (a == DXGI_ERROR_ACCESS_LOST) {
     // Modus-/Aufloesungswechsel -> GPU-Pfad fallenlassen (CPU uebernimmt).
     ReleaseGpu();
@@ -572,6 +589,18 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
   } else {
     return;
   }
+
+  // Statische-Frame-Skip: bei UNVERAENDERTEM Bild nicht jeden Frame neu
+  // downscalen/encoden/komponieren (spart Sender-GPU + Empfaenger-Decode +
+  // Vorschau-Composite -- der groesste Last-Hebel beim Bildschirm-Teilen, das
+  // meist statisch ist). Nur alle ~1s ein Keepalive-Frame (haelt Stream +
+  // Vorschau lebendig). Aenderungen werden mit ~15ms Latenz erkannt
+  // (AcquireNextFrame-Timeout), daher kein Ruckeln bei Bewegung.
+  int64_t now_ms = webrtc::TimeMillis();
+  if (!changed && (now_ms - g_last_send_ms_) < 1000) {
+    return;  // statisch + innerhalb Keepalive -> nichts tun
+  }
+  g_last_send_ms_ = now_ms;
 
   // GPU-Downscale: g_cached_(SRV) -> Pool-Textur(RTV). Round-Robin, damit der
   // Encoder-Thread die gerade gelesene Textur nicht ueberschrieben bekommt.

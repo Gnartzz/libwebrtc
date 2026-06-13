@@ -128,6 +128,7 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   // der Sende-/Encode-Pfad unveraendert weiter (nur die Vorschau bleibt CPU).
   Microsoft::WRL::ComPtr<ID3D11Texture2D> g_shared_tex_;
   HANDLE g_shared_handle_ = nullptr;
+  int64_t g_last_send_ms_ = 0;  // statische-Frame-Skip: letzter gesendeter Frame
 #endif
 };
 
