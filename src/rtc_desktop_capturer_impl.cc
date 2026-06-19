@@ -528,17 +528,26 @@ bool RTCDesktopCapturerImpl::InitGpu() {
     // D3D-Device-Error -> korrumpiert ANGLEs (von der ganzen App geteilten)
     // Kontext -> komplette UI kaputt (Versuch 1). Also plain SHARED + Flush.
     shd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-    ComPtr<IDXGIResource> shres;
-    if (SUCCEEDED(g_dev_->CreateTexture2D(&shd, nullptr, &g_shared_tex_)) &&
-        SUCCEEDED(g_shared_tex_.As(&shres)) &&
-        SUCCEEDED(shres->GetSharedHandle(&g_shared_handle_)) &&
-        g_shared_handle_) {
-      HcCapLog("InitGpu: Vorschau-Shared-Textur ok (SHARED, kein KeyedMutex) handle=%p",
-               g_shared_handle_);
+    // RING: kShareRing Texturen mit je eigenem Legacy-Handle (s. Header) -> das
+    // pro Frame rotierte Handle erzwingt Flutters eglBindTexImage-Re-Bind.
+    bool ring_ok = true;
+    for (int i = 0; i < kShareRing; ++i) {
+      ComPtr<IDXGIResource> shres;
+      if (!(SUCCEEDED(g_dev_->CreateTexture2D(&shd, nullptr, &g_shared_tex_[i])) &&
+            SUCCEEDED(g_shared_tex_[i].As(&shres)) &&
+            SUCCEEDED(shres->GetSharedHandle(&g_shared_handle_[i])) &&
+            g_shared_handle_[i])) {
+        ring_ok = false;
+        break;
+      }
+    }
+    if (ring_ok) {
+      HcCapLog("InitGpu: Vorschau-Shared-Ring ok (%d Tex, SHARED, kein KeyedMutex) handle[0]=%p",
+               kShareRing, g_shared_handle_[0]);
     } else {
-      g_shared_tex_.Reset();
-      g_shared_handle_ = nullptr;
-      HcCapLog("InitGpu: Vorschau-Shared-Textur FEHLGESCHLAGEN (Vorschau bleibt CPU)");
+      for (auto& t : g_shared_tex_) t.Reset();
+      g_shared_handle_.fill(nullptr);
+      HcCapLog("InitGpu: Vorschau-Shared-Ring FEHLGESCHLAGEN (Vorschau bleibt CPU)");
     }
   }
 
@@ -556,10 +565,11 @@ void RTCDesktopCapturerImpl::ReleaseGpu() {
   g_smp_.Reset();
   g_ps_.Reset();
   g_vs_.Reset();
-  // Vorschau-Shared-Textur. Das Legacy-Shared-Handle (GetSharedHandle) gehoert
-  // der Ressource und wird mit ihr frei -> NICHT CloseHandle (nur NT-Handles).
-  g_shared_tex_.Reset();
-  g_shared_handle_ = nullptr;
+  // Vorschau-Shared-Ring. Die Legacy-Shared-Handles (GetSharedHandle) gehoeren
+  // den Ressourcen und werden mit ihnen frei -> NICHT CloseHandle (nur NT-Handles).
+  for (auto& t : g_shared_tex_) t.Reset();
+  g_shared_handle_.fill(nullptr);
+  g_share_idx_ = 0;
   g_ctx_.Reset();
   g_dev_.Reset();
   g_have_frame_ = false;
@@ -622,13 +632,17 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
   ID3D11ShaderResourceView* nullsrv = nullptr;
   g_ctx_->PSSetShaderResources(0, 1, &nullsrv);
 
-  // GPU-Vorschau: fertiges Bild zusaetzlich in die (Legacy-)Shared-Textur
-  // kopieren. KEIN Keyed-Mutex (ANGLE bedient keinen) -> nur CopyResource; der
-  // direkt folgende Flush stellt sicher, dass die Kopie fertig ist, bevor der
-  // Frame als verfuegbar markiert wird. Minimales Tearing-Risiko (ANGLE liest
-  // ggf. waehrend des naechsten Schreibens) ist akzeptabel; ggf. double-buffern.
-  if (g_shared_tex_) {
-    g_ctx_->CopyResource(g_shared_tex_.Get(), g_out_[idx].Get());
+  // GPU-Vorschau: fertiges Bild reihum in die naechste Shared-Textur des Rings
+  // kopieren und DEREN Handle durchreichen. So sieht Flutter pro Frame ein neues
+  // Handle und re-bindet die EGL-Surface (eglBindTexImage) jedes Frame statt nur
+  // 1x -> kein Einfrieren bei In-place-Updates (beige Vorschau). Der Ring gibt
+  // zugleich Producer/Consumer-Trennung. KEIN Keyed-Mutex (ANGLE bedient keinen).
+  HANDLE share_handle = nullptr;
+  if (g_shared_tex_[0]) {
+    int sidx = g_share_idx_;
+    g_share_idx_ = (g_share_idx_ + 1) % kShareRing;
+    g_ctx_->CopyResource(g_shared_tex_[sidx].Get(), g_out_[idx].Get());
+    share_handle = g_shared_handle_[sidx];
   }
 
   g_ctx_->Flush();  // sicherstellen, dass der Render fertig ist, bevor der
@@ -636,7 +650,7 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
 
   auto buf = honeycord::D3D11FrameBuffer::Create(
       g_dev_.Get(), g_out_[idx].Get(), (int)g_target_w_, (int)g_target_h_,
-      g_shared_handle_);
+      share_handle);
   OnFrame(webrtc::VideoFrame(buf, 0, webrtc::TimeMillis(),
                              webrtc::kVideoRotation_0));
 }

@@ -122,12 +122,18 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   int g_pool_idx_ = 0;
   bool g_have_frame_ = false;
   uint32_t g_target_w_ = 0, g_target_h_ = 0, g_desk_w_ = 0, g_desk_h_ = 0;
-  // GPU-Vorschau: eine KEYED_MUTEX-Shared-Textur, in die pro Frame das fertige
-  // BGRA-Bild kopiert wird; ihr Legacy-Shared-Handle geht an den Renderer
-  // (Flutter GpuSurfaceTexture). Optional — wenn die Erzeugung scheitert, laeuft
-  // der Sende-/Encode-Pfad unveraendert weiter (nur die Vorschau bleibt CPU).
-  Microsoft::WRL::ComPtr<ID3D11Texture2D> g_shared_tex_;
-  HANDLE g_shared_handle_ = nullptr;
+  // GPU-Vorschau: RING aus kShareRing plain-SHARED-Texturen, in die pro Frame
+  // reihum das fertige BGRA-Bild kopiert wird; ihr Legacy-Shared-Handle geht an
+  // den Renderer (Flutter GpuSurfaceTexture). Pro Frame rotiert das durchgereichte
+  // Handle, damit Flutters ExternalTextureD3d ein NEUES Handle sieht und
+  // eglBindTexImage erneut aufruft — sonst bindet es nur 1x pro Handle und friert
+  // bei In-place-Updates auf manchen NVIDIA-Treibern ein (beige Vorschau).
+  // Optional — scheitert die Erzeugung, laeuft der Sende-/Encode-Pfad unveraendert
+  // weiter (nur die Vorschau bleibt CPU).
+  static constexpr int kShareRing = 3;
+  std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, kShareRing> g_shared_tex_;
+  std::array<HANDLE, kShareRing> g_shared_handle_ = {};
+  int g_share_idx_ = 0;
   int64_t g_last_send_ms_ = 0;  // statische-Frame-Skip: letzter gesendeter Frame
 #endif
 };
