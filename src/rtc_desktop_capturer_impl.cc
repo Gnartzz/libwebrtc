@@ -570,6 +570,7 @@ void RTCDesktopCapturerImpl::ReleaseGpu() {
   for (auto& t : g_shared_tex_) t.Reset();
   g_shared_handle_.fill(nullptr);
   g_share_idx_ = 0;
+  g_last_out_idx_ = -1;
   g_ctx_.Reset();
   g_dev_.Reset();
   g_have_frame_ = false;
@@ -600,37 +601,41 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
     return;
   }
 
-  // Statische-Frame-Skip: bei UNVERAENDERTEM Bild nicht jeden Frame neu
-  // downscalen/encoden/komponieren (spart Sender-GPU + Empfaenger-Decode +
-  // Vorschau-Composite -- der groesste Last-Hebel beim Bildschirm-Teilen, das
-  // meist statisch ist). Nur alle ~1s ein Keepalive-Frame (haelt Stream +
-  // Vorschau lebendig). Aenderungen werden mit ~15ms Latenz erkannt
-  // (AcquireNextFrame-Timeout), daher kein Ruckeln bei Bewegung.
-  int64_t now_ms = webrtc::TimeMillis();
-  if (!changed && (now_ms - g_last_send_ms_) < 1000) {
-    return;  // statisch + innerhalb Keepalive -> nichts tun
+  // Stetiger Sende-Takt statt DXGI-gekoppelter Rate: bei UNVERAENDERTEM Bild
+  // (AcquireNextFrame-Timeout) NICHT skippen, sondern den letzten fertigen
+  // Downscale-Frame im festen Loop-Takt erneut senden. Das ergibt billige
+  // H.264-Skip-Frames (NVENC ~0,3ms, ~0 Bytes) und verhindert sowohl den
+  // 4-fps-Einbruch bei Stillstand als auch das FPS-Flackern bei Video/Bewegung
+  // (Luecken werden mit dem letzten Frame gefuellt). KEIN Re-Grab/Re-Downscale
+  // im Stillstand -> die g_out_-Textur wird wiederverwendet (Last bleibt gering).
+  // Self-View bleibt separat auf ~25fps gedrosselt.
+  int out_idx;
+  if (changed) {
+    // GPU-Downscale: g_cached_(SRV) -> Pool-Textur(RTV). Round-Robin, damit der
+    // Encoder-Thread die gerade gelesene Textur nicht ueberschrieben bekommt.
+    out_idx = g_pool_idx_;
+    g_pool_idx_ = (g_pool_idx_ + 1) % kGpuPool;
+    ID3D11RenderTargetView* rtv = g_rtv_[out_idx].Get();
+    ID3D11ShaderResourceView* srv = g_srv_.Get();
+    ID3D11SamplerState* smp = g_smp_.Get();
+    D3D11_VIEWPORT vp = {0, 0, (FLOAT)g_target_w_, (FLOAT)g_target_h_, 0, 1};
+    g_ctx_->OMSetRenderTargets(1, &rtv, nullptr);
+    g_ctx_->RSSetViewports(1, &vp);
+    g_ctx_->VSSetShader(g_vs_.Get(), nullptr, 0);
+    g_ctx_->PSSetShader(g_ps_.Get(), nullptr, 0);
+    g_ctx_->PSSetShaderResources(0, 1, &srv);
+    g_ctx_->PSSetSamplers(0, 1, &smp);
+    g_ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_ctx_->IASetInputLayout(nullptr);
+    g_ctx_->Draw(3, 0);
+    ID3D11ShaderResourceView* nullsrv = nullptr;
+    g_ctx_->PSSetShaderResources(0, 1, &nullsrv);
+    g_last_out_idx_ = out_idx;
+  } else {
+    // Stillstand: letzten fertigen Frame wiederholen (kein Re-Grab/Re-Downscale).
+    if (g_last_out_idx_ < 0) return;  // noch nichts zu wiederholen
+    out_idx = g_last_out_idx_;
   }
-  g_last_send_ms_ = now_ms;
-
-  // GPU-Downscale: g_cached_(SRV) -> Pool-Textur(RTV). Round-Robin, damit der
-  // Encoder-Thread die gerade gelesene Textur nicht ueberschrieben bekommt.
-  int idx = g_pool_idx_;
-  g_pool_idx_ = (g_pool_idx_ + 1) % kGpuPool;
-  ID3D11RenderTargetView* rtv = g_rtv_[idx].Get();
-  ID3D11ShaderResourceView* srv = g_srv_.Get();
-  ID3D11SamplerState* smp = g_smp_.Get();
-  D3D11_VIEWPORT vp = {0, 0, (FLOAT)g_target_w_, (FLOAT)g_target_h_, 0, 1};
-  g_ctx_->OMSetRenderTargets(1, &rtv, nullptr);
-  g_ctx_->RSSetViewports(1, &vp);
-  g_ctx_->VSSetShader(g_vs_.Get(), nullptr, 0);
-  g_ctx_->PSSetShader(g_ps_.Get(), nullptr, 0);
-  g_ctx_->PSSetShaderResources(0, 1, &srv);
-  g_ctx_->PSSetSamplers(0, 1, &smp);
-  g_ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  g_ctx_->IASetInputLayout(nullptr);
-  g_ctx_->Draw(3, 0);
-  ID3D11ShaderResourceView* nullsrv = nullptr;
-  g_ctx_->PSSetShaderResources(0, 1, &nullsrv);
 
   // GPU-Vorschau: fertiges Bild reihum in die naechste Shared-Textur des Rings
   // kopieren und DEREN Handle durchreichen. So sieht Flutter pro Frame ein neues
@@ -641,7 +646,7 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
   if (g_shared_tex_[0]) {
     int sidx = g_share_idx_;
     g_share_idx_ = (g_share_idx_ + 1) % kShareRing;
-    g_ctx_->CopyResource(g_shared_tex_[sidx].Get(), g_out_[idx].Get());
+    g_ctx_->CopyResource(g_shared_tex_[sidx].Get(), g_out_[out_idx].Get());
     share_handle = g_shared_handle_[sidx];
   }
 
@@ -649,7 +654,7 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
                     // Encoder-Thread aus der Pool-Textur kopiert.
 
   auto buf = honeycord::D3D11FrameBuffer::Create(
-      g_dev_.Get(), g_out_[idx].Get(), (int)g_target_w_, (int)g_target_h_,
+      g_dev_.Get(), g_out_[out_idx].Get(), (int)g_target_w_, (int)g_target_h_,
       share_handle);
   OnFrame(webrtc::VideoFrame(buf, 0, webrtc::TimeMillis(),
                              webrtc::kVideoRotation_0));

@@ -120,6 +120,9 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, kGpuPool> g_out_;   // Pool
   std::array<Microsoft::WRL::ComPtr<ID3D11RenderTargetView>, kGpuPool> g_rtv_;
   int g_pool_idx_ = 0;
+  int g_last_out_idx_ = -1;  // letzter fertiger Downscale-Frame; bei Stillstand
+                             // (DXGI-Timeout) im festen Takt wiederholt
+
   bool g_have_frame_ = false;
   uint32_t g_target_w_ = 0, g_target_h_ = 0, g_desk_w_ = 0, g_desk_h_ = 0;
   // GPU-Vorschau: RING aus kShareRing plain-SHARED-Texturen, in die pro Frame
@@ -134,7 +137,6 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, kShareRing> g_shared_tex_;
   std::array<HANDLE, kShareRing> g_shared_handle_ = {};
   int g_share_idx_ = 0;
-  int64_t g_last_send_ms_ = 0;  // statische-Frame-Skip: letzter gesendeter Frame
 #endif
 };
 
