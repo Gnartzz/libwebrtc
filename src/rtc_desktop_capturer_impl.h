@@ -34,6 +34,8 @@
 #include <d3d11_4.h>
 #include <wrl/client.h>
 #include <array>
+#include <cstdint>
+#include <memory>
 #endif
 
 namespace libwebrtc {
@@ -106,6 +108,16 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   // alles auf einem NVIDIA-Device. Aktiv, wenn InitGpu() erfolgreich (Screen +
   // Monitor an NVIDIA); sonst Fallback auf den webrtc-CPU-Capturer oben.
   bool InitGpu();
+  // WGC (Windows.Graphics.Capture): GPU-Zero-Copy-Capture eines FENSTERS auf
+  // g_dev_ (statt CPU/GDI). Liefert wie InitGpu einen nativen Frame -> Vorschau
+  // ueber den GPU-Ring (keine gelbe Kachel) + zero-copy Encode.
+  bool InitGpuWindow(intptr_t hwnd);
+  // Geteilte Pipeline-Einrichtung (Shader/Sampler/g_cached_/Pool/Ring) fuer beide
+  // Quellen (DXGI-Bildschirm + WGC-Fenster), parametrisiert ueber die Quellgroesse.
+  bool InitGpuPipeline(uint32_t src_w, uint32_t src_h);
+  // Naechsten WGC-Frame holen -> g_cached_. *changed=false bei keinem neuen Frame
+  // (Stillstand -> Steady-Cadence-Wiederholung). false = fataler Fehler (Fallback).
+  bool WgcAcquire(bool* changed);
   void ReleaseGpu();
   void GpuCaptureFrame();
   static constexpr int kGpuPool = 4;
@@ -137,6 +149,14 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, kShareRing> g_shared_tex_;
   std::array<HANDLE, kShareRing> g_shared_handle_ = {};
   int g_share_idx_ = 0;
+
+  // WGC-Fenster-Capture-State (PIMPL: WinRT-Typen bleiben in der .cc, da dieser
+  // Header von mehreren TUs inkludiert wird). wgc_mode_ aktiv => GpuCaptureFrame
+  // nimmt den WGC-Pfad; wgc_w_/h_ = aktuelle Frame-Pool-Groesse (Resize-Erkennung).
+  struct WgcState;
+  std::unique_ptr<WgcState> wgc_;
+  bool wgc_mode_ = false;
+  uint32_t wgc_w_ = 0, wgc_h_ = 0;
 #endif
 };
 

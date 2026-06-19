@@ -156,7 +156,11 @@ rtc_shared_library("libwebrtc") {
     ]
     # Zero-Copy-Capturer (rtc_desktop_capturer_impl) nutzt D3DCompile fuer den
     # Shader-Downscale -> d3dcompiler.lib (d3d11/dxgi kommen aus dem nvenc-Block).
-    libs += [ "d3dcompiler.lib" ]
+    # dwmapi.lib fuer den WGC-Fenster-Capture-Pfad (wie webrtcs eigener WGC-Block).
+    libs += [
+      "d3dcompiler.lib",
+      "dwmapi.lib",
+    ]
   }
 
   if (is_linux) {
@@ -398,6 +402,14 @@ rtc_shared_library("libwebrtc") {
     deps += [
       "../modules/desktop_capture",
     ]
+    if (is_win) {
+      # WGC-Fenster-Zero-Copy (rtc_desktop_capturer_impl::InitGpuWindow) nutzt
+      # dieselben WinRT-Helfer wie webrtcs eigener WGC-Capturer.
+      deps += [
+        "../rtc_base/win:create_direct3d_device",
+        "../rtc_base/win:get_activation_factory",
+      ]
+    }
     if (is_linux) {
       configs += [ ":gio" ]
     }

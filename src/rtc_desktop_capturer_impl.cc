@@ -34,6 +34,16 @@
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include "win/honeycord_d3d11_frame.h"
+// WGC (Windows.Graphics.Capture) fuer GPU-Zero-Copy-Fenster-Capture. Die WinRT-
+// Header + webrtc-Helfer (gleiche, die webrtcs eigener WGC-Capturer nutzt -> im
+// Build bewiesen funktionsfaehig).
+#include <windows.graphics.h>
+#include <windows.graphics.directx.h>
+#include <windows.graphics.capture.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+#include "rtc_base/win/create_direct3d_device.h"
+#include "rtc_base/win/get_activation_factory.h"
 #endif
 
 namespace libwebrtc {
@@ -66,6 +76,20 @@ static void HcCapLog(const char* fmt, ...) {
 }
 #else
 static void HcCapLog(const char*, ...) {}
+#endif
+
+#ifdef _WIN32
+namespace WGC = ABI::Windows::Graphics::Capture;
+namespace WGDX = ABI::Windows::Graphics::DirectX;
+
+// PIMPL-Definition: haelt die WinRT-Objekte der WGC-Fenster-Capture (die Typen
+// bleiben so aus dem von mehreren TUs inkludierten Header heraus).
+struct RTCDesktopCapturerImpl::WgcState {
+  Microsoft::WRL::ComPtr<WGDX::Direct3D11::IDirect3DDevice> device;
+  Microsoft::WRL::ComPtr<WGC::IDirect3D11CaptureFramePool> pool;
+  Microsoft::WRL::ComPtr<WGC::IGraphicsCaptureSession> session;
+  Microsoft::WRL::ComPtr<WGC::IGraphicsCaptureItem> item;
+};
 #endif
 
 RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
@@ -181,6 +205,13 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
         }
       });
     }
+  } else if (type_ == kWindow && source_id_ != -1) {
+    // WGC-Zero-Copy fuer Fenster auf der NVIDIA. Scheitert es (kein NVIDIA / WGC
+    // nicht verfuegbar / geschuetztes Fenster), uebernimmt der im Konstruktor
+    // erzeugte CPU-Window-Capturer ueber den !gpu_mode_-Pfad unten.
+    thread_->BlockingCall([this] { gpu_mode_ = InitGpuWindow(source_id_); });
+    HcCapLog(gpu_mode_ ? "Start: WGC-Fenster-Zero-Copy aktiv"
+                       : "Start: WGC fehlgeschlagen -> CPU-Window-Capturer");
   }
 #endif
 
@@ -556,6 +587,236 @@ bool RTCDesktopCapturerImpl::InitGpu() {
   return true;
 }
 
+// Geteilte GPU-Pipeline (Shader/Sampler/g_cached_+SRV/Output-Pool/Vorschau-Ring)
+// fuer die WGC-Fenster-Quelle, parametrisiert ueber die Quellgroesse. Spiegelt die
+// Pipeline aus InitGpu (DXGI-Bildschirm), damit der gesamte Downscale/Ring/NVENC/
+// Steady-Cadence-Pfad in GpuCaptureFrame unveraendert wiederverwendet wird.
+bool RTCDesktopCapturerImpl::InitGpuPipeline(uint32_t src_w, uint32_t src_h) {
+  using Microsoft::WRL::ComPtr;
+  if (src_w < 2 || src_h < 2) {
+    HcCapLog("InitGpuPipeline FAIL @ ungueltige Quellgroesse %ux%u", src_w, src_h);
+    return false;
+  }
+  g_desk_w_ = src_w;
+  g_desk_h_ = src_h;
+  uint32_t box_w = max_width_ ? max_width_ : 1920;
+  uint32_t box_h = max_height_ ? max_height_ : 1080;
+  if (box_w > 4096) box_w = 4096;
+  if (box_h > 4096) box_h = 4096;
+  {
+    double sx = static_cast<double>(box_w) / static_cast<double>(g_desk_w_);
+    double sy = static_cast<double>(box_h) / static_cast<double>(g_desk_h_);
+    double s = sx < sy ? sx : sy;
+    if (s > 1.0) s = 1.0;
+    g_target_w_ = static_cast<uint32_t>(static_cast<double>(g_desk_w_) * s) & ~1u;
+    g_target_h_ = static_cast<uint32_t>(static_cast<double>(g_desk_h_) * s) & ~1u;
+    if (g_target_w_ < 2) g_target_w_ = 2;
+    if (g_target_h_ < 2) g_target_h_ = 2;
+  }
+  ComPtr<ID3DBlob> vsb, psb, err;
+  if (FAILED(D3DCompile(kHcShaderHLSL, strlen(kHcShaderHLSL), nullptr, nullptr,
+                        nullptr, "VSMain", "vs_5_0", 0, 0, &vsb, &err)) ||
+      FAILED(D3DCompile(kHcShaderHLSL, strlen(kHcShaderHLSL), nullptr, nullptr,
+                        nullptr, "PSMain", "ps_5_0", 0, 0, &psb, &err))) {
+    HcCapLog("InitGpuPipeline FAIL @ D3DCompile");
+    ReleaseGpu(); return false;
+  }
+  if (FAILED(g_dev_->CreateVertexShader(vsb->GetBufferPointer(),
+                                        vsb->GetBufferSize(), nullptr, &g_vs_)) ||
+      FAILED(g_dev_->CreatePixelShader(psb->GetBufferPointer(),
+                                       psb->GetBufferSize(), nullptr, &g_ps_))) {
+    HcCapLog("InitGpuPipeline FAIL @ Create*Shader");
+    ReleaseGpu(); return false;
+  }
+  D3D11_SAMPLER_DESC sd = {};
+  sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+  sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sd.MaxLOD = D3D11_FLOAT32_MAX;
+  if (FAILED(g_dev_->CreateSamplerState(&sd, &g_smp_))) {
+    HcCapLog("InitGpuPipeline FAIL @ CreateSamplerState");
+    ReleaseGpu(); return false;
+  }
+  D3D11_TEXTURE2D_DESC cd = {};
+  cd.Width = g_desk_w_; cd.Height = g_desk_h_; cd.MipLevels = 1; cd.ArraySize = 1;
+  cd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; cd.SampleDesc.Count = 1;
+  cd.Usage = D3D11_USAGE_DEFAULT; cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  if (FAILED(g_dev_->CreateTexture2D(&cd, nullptr, &g_cached_)) ||
+      FAILED(g_dev_->CreateShaderResourceView(g_cached_.Get(), nullptr, &g_srv_))) {
+    HcCapLog("InitGpuPipeline FAIL @ Cached-Texture/SRV (%ux%u)", g_desk_w_, g_desk_h_);
+    ReleaseGpu(); return false;
+  }
+  D3D11_TEXTURE2D_DESC od = {};
+  od.Width = g_target_w_; od.Height = g_target_h_; od.MipLevels = 1; od.ArraySize = 1;
+  od.Format = DXGI_FORMAT_B8G8R8A8_UNORM; od.SampleDesc.Count = 1;
+  od.Usage = D3D11_USAGE_DEFAULT; od.BindFlags = D3D11_BIND_RENDER_TARGET;
+  for (int i = 0; i < kGpuPool; ++i) {
+    if (FAILED(g_dev_->CreateTexture2D(&od, nullptr, &g_out_[i])) ||
+        FAILED(g_dev_->CreateRenderTargetView(g_out_[i].Get(), nullptr, &g_rtv_[i]))) {
+      HcCapLog("InitGpuPipeline FAIL @ Pool-Texture[%d]", i);
+      ReleaseGpu(); return false;
+    }
+  }
+  {
+    D3D11_TEXTURE2D_DESC shd = {};
+    shd.Width = g_target_w_; shd.Height = g_target_h_;
+    shd.MipLevels = 1; shd.ArraySize = 1;
+    shd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; shd.SampleDesc.Count = 1;
+    shd.Usage = D3D11_USAGE_DEFAULT;
+    shd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    shd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    bool ring_ok = true;
+    for (int i = 0; i < kShareRing; ++i) {
+      ComPtr<IDXGIResource> shres;
+      if (!(SUCCEEDED(g_dev_->CreateTexture2D(&shd, nullptr, &g_shared_tex_[i])) &&
+            SUCCEEDED(g_shared_tex_[i].As(&shres)) &&
+            SUCCEEDED(shres->GetSharedHandle(&g_shared_handle_[i])) &&
+            g_shared_handle_[i])) {
+        ring_ok = false; break;
+      }
+    }
+    if (!ring_ok) {
+      for (auto& t : g_shared_tex_) t.Reset();
+      g_shared_handle_.fill(nullptr);
+      HcCapLog("InitGpuPipeline: Vorschau-Shared-Ring FEHLGESCHLAGEN");
+    }
+  }
+  g_last_out_idx_ = -1;  // nach (Re-)Init: Steady-Cadence wartet auf echten Frame
+  HcCapLog("InitGpuPipeline OK: Quelle %ux%u -> %ux%u", g_desk_w_, g_desk_h_,
+           g_target_w_, g_target_h_);
+  return true;
+}
+
+// WGC-Zero-Copy-Capture eines FENSTERS: NVIDIA-Device + WGC-Item(HWND) +
+// FreeThreaded-Frame-Pool/Session auf g_dev_ + geteilte Downscale-Pipeline. Pro
+// Frame liefert WgcAcquire die GPU-Textur direkt (kein CPU-Readback wie GDI).
+bool RTCDesktopCapturerImpl::InitGpuWindow(intptr_t hwnd) {
+  using Microsoft::WRL::ComPtr;
+  HcCapLog("InitGpuWindow Versuch (WGC) hwnd=%p", (void*)hwnd);
+  if (!hwnd) return false;
+
+  // --- NVIDIA-Device (wie InitGpu) ---
+  HRESULT hr;
+  ComPtr<IDXGIFactory1> factory;
+  if (FAILED(hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+    HcCapLog("InitGpuWindow FAIL @ CreateDXGIFactory1: 0x%08X", (unsigned)hr);
+    return false;
+  }
+  ComPtr<IDXGIAdapter1> adapter, nvidia;
+  for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i) {
+    DXGI_ADAPTER_DESC1 d; adapter->GetDesc1(&d);
+    if (d.VendorId == 0x10DE && !nvidia) nvidia = adapter;
+    adapter.Reset();
+  }
+  if (!nvidia) { HcCapLog("InitGpuWindow FAIL @ kein NVIDIA-Adapter"); return false; }
+  D3D_FEATURE_LEVEL fl;
+  if (FAILED(hr = D3D11CreateDevice(nvidia.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                    0, nullptr, 0, D3D11_SDK_VERSION, &g_dev_, &fl,
+                                    &g_ctx_))) {
+    HcCapLog("InitGpuWindow FAIL @ D3D11CreateDevice: 0x%08X", (unsigned)hr);
+    return false;
+  }
+  ComPtr<ID3D11Multithread> mt;
+  if (SUCCEEDED(g_ctx_.As(&mt))) mt->SetMultithreadProtected(TRUE);
+
+  wgc_.reset(new WgcState());
+
+  // --- WGC-Item aus dem Fenster ---
+  ComPtr<IGraphicsCaptureItemInterop> interop;
+  hr = webrtc::GetActivationFactory<
+      IGraphicsCaptureItemInterop,
+      RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem>(&interop);
+  if (FAILED(hr)) { HcCapLog("InitGpuWindow FAIL @ ItemInterop: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+  hr = interop->CreateForWindow(reinterpret_cast<HWND>(hwnd), IID_PPV_ARGS(&wgc_->item));
+  if (FAILED(hr) || !wgc_->item) { HcCapLog("InitGpuWindow FAIL @ CreateForWindow: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+  ABI::Windows::Graphics::SizeInt32 isize = {};
+  wgc_->item->get_Size(&isize);
+  if (isize.Width < 2 || isize.Height < 2) {
+    HcCapLog("InitGpuWindow FAIL @ Item-Groesse %dx%d", isize.Width, isize.Height);
+    ReleaseGpu(); return false;
+  }
+
+  // --- IDirect3DDevice aus unserem g_dev_ ---
+  ComPtr<IDXGIDevice> dxgi_device;
+  if (FAILED(g_dev_.As(&dxgi_device)) || !webrtc::ResolveCoreWinRTDirect3DDelayload()) {
+    HcCapLog("InitGpuWindow FAIL @ DXGIDevice/Delayload"); ReleaseGpu(); return false;
+  }
+  hr = webrtc::CreateDirect3DDeviceFromDXGIDevice(dxgi_device.Get(), &wgc_->device);
+  if (FAILED(hr)) { HcCapLog("InitGpuWindow FAIL @ CreateDirect3DDevice: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+
+  // --- Frame-Pool (FreeThreaded, von unserem Capture-Thread pollbar) + Session ---
+  ComPtr<WGC::IDirect3D11CaptureFramePoolStatics> fps;
+  hr = webrtc::GetActivationFactory<
+      WGC::IDirect3D11CaptureFramePoolStatics,
+      RuntimeClass_Windows_Graphics_Capture_Direct3D11CaptureFramePool>(&fps);
+  ComPtr<WGC::IDirect3D11CaptureFramePoolStatics2> fps2;
+  if (FAILED(hr) || FAILED(fps.As(&fps2))) { HcCapLog("InitGpuWindow FAIL @ FramePoolStatics"); ReleaseGpu(); return false; }
+  hr = fps2->CreateFreeThreaded(wgc_->device.Get(),
+       WGDX::DirectXPixelFormat_B8G8R8A8UIntNormalized, 2, isize, &wgc_->pool);
+  if (FAILED(hr)) { HcCapLog("InitGpuWindow FAIL @ CreateFreeThreaded: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+  hr = wgc_->pool->CreateCaptureSession(wgc_->item.Get(), &wgc_->session);
+  if (FAILED(hr)) { HcCapLog("InitGpuWindow FAIL @ CreateCaptureSession: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+  // Gelbe WGC-Border weg (Win11) + Cursor wie gewuenscht.
+  ComPtr<WGC::IGraphicsCaptureSession3> s3;
+  if (SUCCEEDED(wgc_->session.As(&s3))) s3->put_IsBorderRequired(false);
+  ComPtr<WGC::IGraphicsCaptureSession2> s2;
+  if (SUCCEEDED(wgc_->session.As(&s2))) s2->put_IsCursorCaptureEnabled(show_cursor_ ? TRUE : FALSE);
+  hr = wgc_->session->StartCapture();
+  if (FAILED(hr)) { HcCapLog("InitGpuWindow FAIL @ StartCapture: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+
+  wgc_w_ = static_cast<uint32_t>(isize.Width);
+  wgc_h_ = static_cast<uint32_t>(isize.Height);
+  wgc_mode_ = true;
+  if (!InitGpuPipeline(wgc_w_, wgc_h_)) return false;  // ReleaseGpu schon drin
+  HcCapLog("InitGpuWindow OK: Fenster %ux%u (WGC Zero-Copy aktiv)", wgc_w_, wgc_h_);
+  return true;
+}
+
+// Naechsten WGC-Frame -> g_cached_ (Zero-Copy, kein CPU-Readback). *changed=false
+// bei keinem neuen Frame (Stillstand -> Steady-Cadence) oder nach Resize (Frame
+// uebersprungen). false = fataler Fehler -> Aufrufer faellt auf CPU-Capturer.
+bool RTCDesktopCapturerImpl::WgcAcquire(bool* changed) {
+  using Microsoft::WRL::ComPtr;
+  *changed = false;
+  if (!wgc_ || !wgc_->pool) return false;
+  ComPtr<WGC::IDirect3D11CaptureFrame> frame;
+  if (FAILED(wgc_->pool->TryGetNextFrame(&frame))) return true;  // transient
+  if (!frame) return true;  // kein neuer Frame -> Stillstand
+
+  ABI::Windows::Graphics::SizeInt32 csize = {};
+  frame->get_ContentSize(&csize);
+  if (csize.Width >= 2 && csize.Height >= 2 &&
+      (static_cast<uint32_t>(csize.Width) != wgc_w_ ||
+       static_cast<uint32_t>(csize.Height) != wgc_h_)) {
+    // Fenster-Resize -> Frame-Pool + geteilte Pipeline auf neue Groesse.
+    ComPtr<ABI::Windows::Foundation::IClosable> cl;
+    if (SUCCEEDED(frame.As(&cl))) cl->Close();
+    frame.Reset();
+    if (FAILED(wgc_->pool->Recreate(wgc_->device.Get(),
+            WGDX::DirectXPixelFormat_B8G8R8A8UIntNormalized, 2, csize))) {
+      ReleaseGpu(); wgc_mode_ = false; return false;
+    }
+    wgc_w_ = static_cast<uint32_t>(csize.Width);
+    wgc_h_ = static_cast<uint32_t>(csize.Height);
+    if (!InitGpuPipeline(wgc_w_, wgc_h_)) { wgc_mode_ = false; return false; }
+    return true;  // diesen Frame ueberspringen, naechster hat die neue Groesse
+  }
+
+  ComPtr<WGDX::Direct3D11::IDirect3DSurface> surf;
+  if (FAILED(frame->get_Surface(&surf)) || !surf) return true;
+  ComPtr<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess> acc;
+  if (FAILED(surf.As(&acc))) return true;
+  ComPtr<ID3D11Texture2D> tex;
+  if (FAILED(acc->GetInterface(IID_PPV_ARGS(&tex))) || !tex) return true;
+  // Zero-Copy: Fenster-Textur (auf g_dev_) -> g_cached_ (gleiche Groesse). Danach
+  // laeuft die geteilte Downscale/Ring/NVENC-Pipeline wie beim Bildschirm.
+  g_ctx_->CopyResource(g_cached_.Get(), tex.Get());
+  g_have_frame_ = true;
+  *changed = true;
+  ComPtr<ABI::Windows::Foundation::IClosable> cl;
+  if (SUCCEEDED(frame.As(&cl))) cl->Close();
+  return true;
+}
+
 void RTCDesktopCapturerImpl::ReleaseGpu() {
   g_dup_.Reset();
   for (auto& r : g_rtv_) r.Reset();
@@ -571,6 +832,20 @@ void RTCDesktopCapturerImpl::ReleaseGpu() {
   g_shared_handle_.fill(nullptr);
   g_share_idx_ = 0;
   g_last_out_idx_ = -1;
+  // WGC-Fenster-Capture beenden (haelt Refs auf g_dev_).
+  if (wgc_) {
+    if (wgc_->session) {
+      Microsoft::WRL::ComPtr<ABI::Windows::Foundation::IClosable> cl;
+      if (SUCCEEDED(wgc_->session.As(&cl))) cl->Close();
+    }
+    if (wgc_->pool) {
+      Microsoft::WRL::ComPtr<ABI::Windows::Foundation::IClosable> cl;
+      if (SUCCEEDED(wgc_->pool.As(&cl))) cl->Close();
+    }
+    wgc_.reset();
+  }
+  wgc_mode_ = false;
+  wgc_w_ = wgc_h_ = 0;
   g_ctx_.Reset();
   g_dev_.Reset();
   g_have_frame_ = false;
@@ -578,27 +853,36 @@ void RTCDesktopCapturerImpl::ReleaseGpu() {
 
 void RTCDesktopCapturerImpl::GpuCaptureFrame() {
   using Microsoft::WRL::ComPtr;
-  ComPtr<IDXGIResource> res;
-  DXGI_OUTDUPL_FRAME_INFO fi;
-  HRESULT a = g_dup_->AcquireNextFrame(15, &fi, &res);
   bool changed = false;
-  if (a == S_OK) {
-    ComPtr<ID3D11Texture2D> desk;
-    if (SUCCEEDED(res.As(&desk)))
-      g_ctx_->CopyResource(g_cached_.Get(), desk.Get());
-    g_dup_->ReleaseFrame();
-    g_have_frame_ = true;
-    changed = true;  // neuer Bildinhalt
-  } else if (a == DXGI_ERROR_WAIT_TIMEOUT) {
-    if (!g_have_frame_) return;  // noch kein Frame -> nichts senden
-    // statisch: kein neuer Inhalt (changed bleibt false)
-  } else if (a == DXGI_ERROR_ACCESS_LOST) {
-    // Modus-/Aufloesungswechsel -> GPU-Pfad fallenlassen (CPU uebernimmt).
-    ReleaseGpu();
-    gpu_mode_ = false;
-    return;
+  if (wgc_mode_) {
+    // WGC-Fenster: naechste GPU-Textur -> g_cached_ (Zero-Copy). changed=false bei
+    // Stillstand (-> Steady-Cadence-Wiederholung). false = diesen Frame skippen.
+    if (!WgcAcquire(&changed)) return;
+    if (!changed && !g_have_frame_) return;  // noch kein Frame
+  } else if (g_dup_) {
+    ComPtr<IDXGIResource> res;
+    DXGI_OUTDUPL_FRAME_INFO fi;
+    HRESULT a = g_dup_->AcquireNextFrame(15, &fi, &res);
+    if (a == S_OK) {
+      ComPtr<ID3D11Texture2D> desk;
+      if (SUCCEEDED(res.As(&desk)))
+        g_ctx_->CopyResource(g_cached_.Get(), desk.Get());
+      g_dup_->ReleaseFrame();
+      g_have_frame_ = true;
+      changed = true;  // neuer Bildinhalt
+    } else if (a == DXGI_ERROR_WAIT_TIMEOUT) {
+      if (!g_have_frame_) return;  // noch kein Frame -> nichts senden
+      // statisch: kein neuer Inhalt (changed bleibt false)
+    } else if (a == DXGI_ERROR_ACCESS_LOST) {
+      // Modus-/Aufloesungswechsel -> GPU-Pfad fallenlassen (CPU uebernimmt).
+      ReleaseGpu();
+      gpu_mode_ = false;
+      return;
+    } else {
+      return;
+    }
   } else {
-    return;
+    return;  // GPU-Pfad abgebaut (z.B. WGC-Teardown) -> nichts tun (kein Crash)
   }
 
   // Stetiger Sende-Takt statt DXGI-gekoppelter Rate: bei UNVERAENDERTEM Bild
