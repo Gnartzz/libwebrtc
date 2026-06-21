@@ -4,6 +4,7 @@ declare_args() {
   libwebrtc_intel_media_sdk = false
   libwebrtc_nvenc = true
   libwebrtc_amf = true   # HoneyCord: stub-encoder for bisect of 0xc0000005
+  libwebrtc_hwdec = true # HoneyCord: vendor-neutral D3D11VA/MF H.264 HW decoder
   libwebrtc_desktop_capture = true
 }
 
@@ -334,6 +335,28 @@ rtc_shared_library("libwebrtc") {
     libs += [
       "d3d11.lib",
       "dxgi.lib",
+    ]
+  }
+
+  # Vendor-neutral D3D11VA/Media-Foundation H.264 hardware DECODER + factory.
+  # Pure system MFT/D3D11 (no SDK, no exceptions) -> can live in the main lib.
+  # Outputs honeycord::D3D11FrameBuffer (zero-copy) like the screen-capture path.
+  # d3d11.lib/dxgi.lib come from the nvenc block above (both default true).
+  if (is_win && libwebrtc_hwdec) {
+    defines += [ "USE_HWDEC" ]
+    sources += [
+      "src/win/hwdec/honeycord_d3d11va_h264_decoder.cc",
+      "src/win/hwdec/honeycord_d3d11va_h264_decoder.h",
+      "src/win/hwdec/honeycord_video_decoder_factory.cc",
+      "src/win/hwdec/honeycord_video_decoder_factory.h",
+    ]
+    libs += [
+      "mfplat.lib",
+      "mfuuid.lib",
+      "mf.lib",
+      "wmcodecdspuuid.lib",
+      "strmiids.lib",
+      "dxva2.lib",
     ]
   }
 
