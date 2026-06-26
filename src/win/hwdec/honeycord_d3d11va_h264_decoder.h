@@ -102,6 +102,15 @@ class D3D11VAH264Decoder : public webrtc::VideoDecoder {
   int disp_x_ = 0, disp_y_ = 0;
   int out_w_ = 0, out_h_ = 0;   // sichtbare Display-Groesse (== Shared-Textur-Groesse)
   int conv_w_ = 0, conv_h_ = 0; // Groesse, fuer die der VideoProcessor/Ring grad init ist
+
+  // TEMPORAERE Instrumentierung (Diagnose Mehr-Stream-Decode): misst, ob die
+  // ms/Frame im MS-Decode (ProcessOutput) oder unserem Convert (EmitFrame inkl.
+  // View-Erzeugung) stecken. Schreibt alle 120 Decode-Calls eine Zeile nach
+  // %LOCALAPPDATA%\HoneyCord\hwdec.log. Nach der Diagnose wieder entfernen.
+  unsigned long long dbg_calls_ = 0, dbg_frames_ = 0;
+  double dbg_po_ms_ = 0, dbg_emit_ms_ = 0, dbg_view_ms_ = 0;
+  void DbgFlush();
+
   std::mutex mutex_;
 };
 

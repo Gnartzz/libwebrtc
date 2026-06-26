@@ -8,6 +8,11 @@
 #include <mferror.h>
 #include <wmcodecdsp.h>
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 #include "api/video/video_frame.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
@@ -23,6 +28,13 @@ constexpr char kImplName[] = "HoneyCordD3D11VA_H264";
 // RTP-Zeitbasis (90 kHz) -> Media-Foundation-Einheit (100 ns).
 inline LONGLONG RtpTo100ns(uint32_t rtp_90khz) {
   return static_cast<LONGLONG>(rtp_90khz) * 1000 / 9;  // /90000 * 1e7
+}
+
+// Diagnose-Timing: ms seit t0.
+inline double MsSince(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
 }
 
 // Eine IMFMediaType anlegen (Major=Video, Subtype=subtype).
@@ -321,11 +333,13 @@ bool D3D11VAH264Decoder::EmitFrame(ID3D11Texture2D* nv12, UINT array_index,
   ivd.Texture2D.MipSlice = 0;
   ivd.Texture2D.ArraySlice = array_index;
   ComPtr<ID3D11VideoProcessorInputView> in_view;
+  auto _t_v = std::chrono::steady_clock::now();
   if (FAILED(video_device_->CreateVideoProcessorInputView(nv12, video_enum_.Get(),
                                                           &ivd, &in_view))) {
     RTC_LOG(LS_ERROR) << "[hwdec] input view failed";
     return false;
   }
+  dbg_view_ms_ += MsSince(_t_v);
 
   const int idx = share_idx_;
   share_idx_ = (share_idx_ + 1) % kShareRing;
@@ -398,7 +412,9 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
     odb.dwStreamID = 0;
     odb.pSample = nullptr;  // MFT stellt D3D11-Sample selbst (PROVIDES_SAMPLES)
     DWORD status = 0;
+    auto _t_po = std::chrono::steady_clock::now();
     hr = mft_->ProcessOutput(0, 1, &odb, &status);
+    dbg_po_ms_ += MsSince(_t_po);
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
       if (!retried_input) {
         retried_input = true;
@@ -431,12 +447,38 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
       UINT slice = 0;
       if (SUCCEEDED(dxgi->GetResource(IID_PPV_ARGS(&tex))) &&
           SUCCEEDED(dxgi->GetSubresourceIndex(&slice))) {
+        auto _t_em = std::chrono::steady_clock::now();
         EmitFrame(tex.Get(), slice, rtp, ntp);
+        dbg_emit_ms_ += MsSince(_t_em);
+        ++dbg_frames_;
       }
     }
   }
 
+  ++dbg_calls_;
+  if (dbg_calls_ >= 120) DbgFlush();
   return WEBRTC_VIDEO_CODEC_OK;
+}
+
+void D3D11VAH264Decoder::DbgFlush() {
+  const char* base = std::getenv("LOCALAPPDATA");
+  if (base && dbg_calls_ > 0) {
+    std::string dir = std::string(base) + "\\HoneyCord";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    std::string path = dir + "\\hwdec.log";
+    if (FILE* f = std::fopen(path.c_str(), "a")) {
+      std::fprintf(f,
+                   "[hwdec %dx%d] calls=%llu frames=%llu | ProcessOutput=%.1f "
+                   "ms/call | EmitFrame=%.1f ms/frame (View=%.2f ms)\n",
+                   out_w_, out_h_, dbg_calls_, dbg_frames_,
+                   dbg_po_ms_ / static_cast<double>(dbg_calls_),
+                   dbg_frames_ ? dbg_emit_ms_ / static_cast<double>(dbg_frames_) : 0.0,
+                   dbg_frames_ ? dbg_view_ms_ / static_cast<double>(dbg_frames_) : 0.0);
+      std::fclose(f);
+    }
+  }
+  dbg_calls_ = dbg_frames_ = 0;
+  dbg_po_ms_ = dbg_emit_ms_ = dbg_view_ms_ = 0;
 }
 
 int32_t D3D11VAH264Decoder::Release() {
