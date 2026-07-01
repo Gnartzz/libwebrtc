@@ -397,7 +397,9 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
   sample->SetSampleTime(RtpTo100ns(rtp));
 
   // ProcessInput; bei NOTACCEPTING erst Output abziehen, dann erneut.
+  auto _t_pi = std::chrono::steady_clock::now();
   HRESULT hr = mft_->ProcessInput(0, sample.Get(), 0);
+  dbg_pi_ms_ += MsSince(_t_pi);
   if (hr == MF_E_NOTACCEPTING) {
     // wird unten nach dem Drain nochmal versucht
   } else if (FAILED(hr)) {
@@ -418,7 +420,10 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
       if (!retried_input) {
         retried_input = true;
-        if (FAILED(mft_->ProcessInput(0, sample.Get(), 0))) break;
+        auto _t_pi2 = std::chrono::steady_clock::now();
+        bool pi_fail = FAILED(mft_->ProcessInput(0, sample.Get(), 0));
+        dbg_pi_ms_ += MsSince(_t_pi2);
+        if (pi_fail) break;
         continue;
       }
       break;
@@ -468,9 +473,11 @@ void D3D11VAH264Decoder::DbgFlush() {
     std::string path = dir + "\\hwdec.log";
     if (FILE* f = std::fopen(path.c_str(), "a")) {
       std::fprintf(f,
-                   "[hwdec %dx%d] calls=%llu frames=%llu | ProcessOutput=%.1f "
-                   "ms/call | EmitFrame=%.1f ms/frame (View=%.2f ms)\n",
+                   "[hwdec %dx%d] calls=%llu frames=%llu | ProcessInput=%.1f "
+                   "ms/call | ProcessOutput=%.1f ms/call | EmitFrame=%.1f ms/frame "
+                   "(View=%.2f ms)\n",
                    out_w_, out_h_, dbg_calls_, dbg_frames_,
+                   dbg_pi_ms_ / static_cast<double>(dbg_calls_),
                    dbg_po_ms_ / static_cast<double>(dbg_calls_),
                    dbg_frames_ ? dbg_emit_ms_ / static_cast<double>(dbg_frames_) : 0.0,
                    dbg_frames_ ? dbg_view_ms_ / static_cast<double>(dbg_frames_) : 0.0);
@@ -478,7 +485,7 @@ void D3D11VAH264Decoder::DbgFlush() {
     }
   }
   dbg_calls_ = dbg_frames_ = 0;
-  dbg_po_ms_ = dbg_emit_ms_ = dbg_view_ms_ = 0;
+  dbg_po_ms_ = dbg_emit_ms_ = dbg_view_ms_ = dbg_pi_ms_ = 0;
 }
 
 int32_t D3D11VAH264Decoder::Release() {

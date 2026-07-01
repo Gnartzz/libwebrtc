@@ -116,6 +116,7 @@ class D3D11VAH264Decoder : public webrtc::VideoDecoder {
   // %LOCALAPPDATA%\HoneyCord\hwdec.log. Nach der Diagnose wieder entfernen.
   unsigned long long dbg_calls_ = 0, dbg_frames_ = 0;
   double dbg_po_ms_ = 0, dbg_emit_ms_ = 0, dbg_view_ms_ = 0;
+  double dbg_pi_ms_ = 0;  // ProcessInput-Zeit: misst, ob der Decode-Input selbst stallt (vs. WebRTC-Drossel oben)
   void DbgFlush();
 
   std::mutex mutex_;
