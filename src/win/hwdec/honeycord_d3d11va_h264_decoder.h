@@ -85,14 +85,21 @@ class D3D11VAH264Decoder : public webrtc::VideoDecoder {
   Microsoft::WRL::ComPtr<ID3D11VideoProcessor> video_processor_;
   Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> video_enum_;
 
-  // Shared-Textur-Ring (D3D11_RESOURCE_MISC_SHARED, Legacy-Handle via
-  // IDXGIResource::GetSharedHandle — kein Keyed-Mutex, wie der Capturer; der Ring
-  // gegen Tearing/eingefrorene Vorschau, weil Producer=Decode-Thread und
-  // Consumer=Raster-Thread/ANGLE getrennt laufen).
-  static constexpr int kShareRing = 3;
+  // EINE stabile Shared-Textur (D3D11_RESOURCE_MISC_SHARED, Legacy-Handle via
+  // IDXGIResource::GetSharedHandle, kein Keyed-Mutex — wie der Capturer).
+  // WICHTIG (Fix Mehr-Stream-/Einzel-Stream-Ruckeln, 2026-07-01): Flutters
+  // Windows-Embedder cached die EGL-Surface PRO HANDLE-Wert und legt sie bei JEDEM
+  // Handle-Wechsel teuer neu an (CreateSurfaceFromHandle -> OpenSharedResource).
+  // Ein Ring aus MEHREREN Texturen wechselt den Handle jeden Frame -> Neu-Anlage
+  // pro Frame -> Remote-Video bricht auf ~8 fps ein (WebRTC verwirft dann vor dem
+  // Decode). Mit kShareRing=1 bleibt der Handle KONSTANT -> Embedder cached genau
+  // einmal -> volle FPS. Trade: minimaler Tearing-Rest (Producer=Decode-Thread /
+  // Consumer=ANGLE ohne Keyed-Mutex); bei sichtbarem Tearing per GPU-Fence nach
+  // dem VideoProcessorBlt entschaerfen (Frame fertig, bevor MarkTextureFrameAvailable).
+  static constexpr int kShareRing = 1;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> share_tex_[kShareRing];
   Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> share_view_[kShareRing];
-  HANDLE share_handle_[kShareRing] = {nullptr, nullptr, nullptr};
+  HANDLE share_handle_[kShareRing] = {nullptr};
   int share_idx_ = 0;
 
   // Coded-Groesse = Decoder-Output-Textur (16-aligned, evtl. groesser); Display-
