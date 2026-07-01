@@ -122,6 +122,47 @@ bool D3D11VAH264Decoder::EnsureMft() {
   ComPtr<ID3D10Multithread> mt;
   if (SUCCEEDED(context_.As(&mt))) mt->SetMultithreadProtected(TRUE);
 
+  // Diagnose (2026-07-01): auf welchem GPU-Adapter laeuft der Decoder, und welcher
+  // Adapter treibt das Display (= den ANGLE zum Fenster-Composite nutzt)? Sind das
+  // VERSCHIEDENE Adapter, sampelt ANGLE die dekodierte Shared-Textur ueber die
+  // Adapter-Grenze -> teures Cross-Adapter-Sampling pro Composite -> ~8 fps.
+  {
+    auto logline = [](const char* s) {
+      if (const char* base = std::getenv("LOCALAPPDATA")) {
+        std::string p = std::string(base) + "\\HoneyCord";
+        CreateDirectoryA(p.c_str(), nullptr);
+        if (FILE* f = std::fopen((p + "\\hwdec.log").c_str(), "a")) { std::fputs(s, f); std::fclose(f); }
+      }
+    };
+    ComPtr<IDXGIDevice> dd;
+    ComPtr<IDXGIAdapter> da;
+    ComPtr<IDXGIFactory1> fac;
+    LUID decLuid = {};
+    if (SUCCEEDED(device_.As(&dd)) && SUCCEEDED(dd->GetAdapter(&da))) {
+      DXGI_ADAPTER_DESC ddesc = {};
+      if (SUCCEEDED(da->GetDesc(&ddesc))) decLuid = ddesc.AdapterLuid;
+      da->GetParent(IID_PPV_ARGS(&fac));  // Factory ueber den Adapter (kein dxgi.lib noetig)
+    }
+    if (fac) {
+      ComPtr<IDXGIAdapter1> a;
+      for (UINT i = 0; fac->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 ad = {};
+        a->GetDesc1(&ad);
+        ComPtr<IDXGIOutput> o;
+        bool hasOut = SUCCEEDED(a->EnumOutputs(0, &o));
+        bool isDec = (ad.AdapterLuid.LowPart == decLuid.LowPart &&
+                      ad.AdapterLuid.HighPart == decLuid.HighPart);
+        char buf[320];
+        std::snprintf(buf, sizeof(buf),
+                      "[hwdec] adapter[%u] '%ls' vram=%lluMB display-output=%d%s\n",
+                      i, ad.Description,
+                      static_cast<unsigned long long>(ad.DedicatedVideoMemory >> 20),
+                      hasOut ? 1 : 0, isDec ? "  <= DECODER benutzt diesen" : "");
+        logline(buf);
+      }
+    }
+  }
+
   if (FAILED(device_.As(&video_device_)) || FAILED(context_.As(&video_context_))) {
     RTC_LOG(LS_ERROR) << "[hwdec] no ID3D11VideoDevice/Context";
     return false;
