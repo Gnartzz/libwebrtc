@@ -17,6 +17,7 @@
 #ifdef _WIN32
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 
@@ -115,8 +116,13 @@ class D3D11VAH264Decoder : public webrtc::VideoDecoder {
   // View-Erzeugung) stecken. Schreibt alle 120 Decode-Calls eine Zeile nach
   // %LOCALAPPDATA%\HoneyCord\hwdec.log. Nach der Diagnose wieder entfernen.
   unsigned long long dbg_calls_ = 0, dbg_frames_ = 0;
+  unsigned long long dbg_rtp_mismatch_ = 0;  // Outputs, deren rtp != Input-rtp (MFT-Umordnung)
   double dbg_po_ms_ = 0, dbg_emit_ms_ = 0, dbg_view_ms_ = 0;
   double dbg_pi_ms_ = 0;  // ProcessInput-Zeit: misst, ob der Decode-Input selbst stallt (vs. WebRTC-Drossel oben)
+  // Fensterstart (wall-clock): erlaubt echte Decode-CALL-Rate (calls/s) statt nur
+  // ms/Call. Entscheidet: werden Frames VOR dem Decode verworfen (decode_fps ~8,
+  // Decoder gedrosselt) oder NACH dem Decode (decode_fps ~30, Render-Queue droppt)?
+  std::chrono::steady_clock::time_point dbg_win_{};
   void DbgFlush();
 
   std::mutex mutex_;

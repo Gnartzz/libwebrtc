@@ -486,6 +486,20 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
     ComPtr<IMFSample> out;
     out.Attach(odb.pSample);
     if (odb.pEvents) odb.pEvents->Release();
+    // WICHTIG: den rtp aus dem OUTPUT-Sample lesen, nicht den rtp des aktuellen
+    // Input-Calls verwenden. Der MFT puffert/liefert mehrere Frames pro Call
+    // (calls!=frames) und in eigener Reihenfolge -> mit dem Input-rtp wuerden
+    // Outputs falsch/doppelt getaggt, worauf WebRTCs FindFrameInfo scheitert und
+    // ~2/3 der dekodierten Frames als "Too many frames backed up" verwirft
+    // (empfangen 30 / dekodiert 8). Der MFT propagiert die Sample-Zeit vom Input;
+    // Ruecktransformation 100ns -> rtp(90kHz) = t*9/1000.
+    uint32_t out_rtp = rtp;
+    LONGLONG out_time_100ns = 0;
+    if (out && SUCCEEDED(out->GetSampleTime(&out_time_100ns)) &&
+        out_time_100ns > 0) {
+      out_rtp = static_cast<uint32_t>(out_time_100ns * 9 / 1000);
+    }
+    if (out_rtp != rtp) ++dbg_rtp_mismatch_;
     ComPtr<IMFMediaBuffer> ob;
     ComPtr<IMFDXGIBuffer> dxgi;
     if (out && SUCCEEDED(out->GetBufferByIndex(0, &ob)) && SUCCEEDED(ob.As(&dxgi))) {
@@ -494,13 +508,15 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
       if (SUCCEEDED(dxgi->GetResource(IID_PPV_ARGS(&tex))) &&
           SUCCEEDED(dxgi->GetSubresourceIndex(&slice))) {
         auto _t_em = std::chrono::steady_clock::now();
-        EmitFrame(tex.Get(), slice, rtp, ntp);
+        EmitFrame(tex.Get(), slice, out_rtp, ntp);
         dbg_emit_ms_ += MsSince(_t_em);
         ++dbg_frames_;
       }
     }
   }
 
+  if (dbg_win_.time_since_epoch().count() == 0)
+    dbg_win_ = std::chrono::steady_clock::now();
   ++dbg_calls_;
   if (dbg_calls_ >= 120) DbgFlush();
   return WEBRTC_VIDEO_CODEC_OK;
@@ -512,12 +528,20 @@ void D3D11VAH264Decoder::DbgFlush() {
     std::string dir = std::string(base) + "\\HoneyCord";
     CreateDirectoryA(dir.c_str(), nullptr);
     std::string path = dir + "\\hwdec.log";
+    double win_s =
+        dbg_win_.time_since_epoch().count()
+            ? std::chrono::duration<double>(std::chrono::steady_clock::now() - dbg_win_).count()
+            : 0.0;
+    double decode_fps = win_s > 0 ? dbg_calls_ / win_s : 0.0;
+    double emit_fps = win_s > 0 ? dbg_frames_ / win_s : 0.0;
     if (FILE* f = std::fopen(path.c_str(), "a")) {
       std::fprintf(f,
-                   "[hwdec %dx%d] calls=%llu frames=%llu | ProcessInput=%.1f "
+                   "[hwdec %dx%d] calls=%llu frames=%llu in %.1fs -> "
+                   "decode_fps=%.1f emit_fps=%.1f rtpMismatch=%llu | ProcessInput=%.1f "
                    "ms/call | ProcessOutput=%.1f ms/call | EmitFrame=%.1f ms/frame "
                    "(View=%.2f ms)\n",
-                   out_w_, out_h_, dbg_calls_, dbg_frames_,
+                   out_w_, out_h_, dbg_calls_, dbg_frames_, win_s, decode_fps, emit_fps,
+                   dbg_rtp_mismatch_,
                    dbg_pi_ms_ / static_cast<double>(dbg_calls_),
                    dbg_po_ms_ / static_cast<double>(dbg_calls_),
                    dbg_frames_ ? dbg_emit_ms_ / static_cast<double>(dbg_frames_) : 0.0,
@@ -526,7 +550,9 @@ void D3D11VAH264Decoder::DbgFlush() {
     }
   }
   dbg_calls_ = dbg_frames_ = 0;
+  dbg_rtp_mismatch_ = 0;
   dbg_po_ms_ = dbg_emit_ms_ = dbg_view_ms_ = dbg_pi_ms_ = 0;
+  dbg_win_ = {};
 }
 
 int32_t D3D11VAH264Decoder::Release() {
