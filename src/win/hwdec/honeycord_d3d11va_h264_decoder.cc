@@ -496,12 +496,14 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
     // bekamen einen rtp mehrerer Frames voraus -> WebRTCs FindFrameInfo fand sie
     // nicht und verwarf ~2/3 als "Too many frames backed up" (empfangen 30 /
     // dekodiert 8). (Kein Zeitstempel-Rueckrechnen: 100ns<->rtp rundet daneben.)
-    uint32_t out_rtp = rtp;
-    if (!pending_rtp_.empty()) {
-      out_rtp = pending_rtp_.front();
-      pending_rtp_.pop_front();
-    }
-    if (out_rtp != rtp) ++dbg_rtp_mismatch_;
+    // DIAGNOSE: Puffertiefe des MFT messen (offene Inputs bei diesem Output).
+    // > ~10 => WebRTCs 10er-Map (kDecoderFrameMemoryLength) hat den korrekten
+    // aelteren rtp schon evakuiert -> KEIN rtp-Tag kann helfen, dann muss die
+    // MFT-Pufferung runter (Low-Latency/Drain). Emit vorerst ORIGINAL (aktueller
+    // Input-rtp) = funktionierender Zustand (Bild da, dec~8), nicht schwarz.
+    if (pending_rtp_.size() > dbg_max_pending_)
+      dbg_max_pending_ = static_cast<unsigned>(pending_rtp_.size());
+    if (!pending_rtp_.empty()) pending_rtp_.pop_front();
     ComPtr<IMFMediaBuffer> ob;
     ComPtr<IMFDXGIBuffer> dxgi;
     if (out && SUCCEEDED(out->GetBufferByIndex(0, &ob)) && SUCCEEDED(ob.As(&dxgi))) {
@@ -510,7 +512,7 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
       if (SUCCEEDED(dxgi->GetResource(IID_PPV_ARGS(&tex))) &&
           SUCCEEDED(dxgi->GetSubresourceIndex(&slice))) {
         auto _t_em = std::chrono::steady_clock::now();
-        EmitFrame(tex.Get(), slice, out_rtp, ntp);
+        EmitFrame(tex.Get(), slice, rtp, ntp);
         dbg_emit_ms_ += MsSince(_t_em);
         ++dbg_frames_;
       }
@@ -539,11 +541,11 @@ void D3D11VAH264Decoder::DbgFlush() {
     if (FILE* f = std::fopen(path.c_str(), "a")) {
       std::fprintf(f,
                    "[hwdec %dx%d] calls=%llu frames=%llu in %.1fs -> "
-                   "decode_fps=%.1f emit_fps=%.1f rtpMismatch=%llu | ProcessInput=%.1f "
+                   "decode_fps=%.1f emit_fps=%.1f maxPending=%u | ProcessInput=%.1f "
                    "ms/call | ProcessOutput=%.1f ms/call | EmitFrame=%.1f ms/frame "
                    "(View=%.2f ms)\n",
                    out_w_, out_h_, dbg_calls_, dbg_frames_, win_s, decode_fps, emit_fps,
-                   dbg_rtp_mismatch_,
+                   dbg_max_pending_,
                    dbg_pi_ms_ / static_cast<double>(dbg_calls_),
                    dbg_po_ms_ / static_cast<double>(dbg_calls_),
                    dbg_frames_ ? dbg_emit_ms_ / static_cast<double>(dbg_frames_) : 0.0,
@@ -552,7 +554,7 @@ void D3D11VAH264Decoder::DbgFlush() {
     }
   }
   dbg_calls_ = dbg_frames_ = 0;
-  dbg_rtp_mismatch_ = 0;
+  dbg_max_pending_ = 0;
   dbg_po_ms_ = dbg_emit_ms_ = dbg_view_ms_ = dbg_pi_ms_ = 0;
   dbg_win_ = {};
 }

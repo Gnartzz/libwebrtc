@@ -120,7 +120,7 @@ class D3D11VAH264Decoder : public webrtc::VideoDecoder {
   // aus -> jeder Output nimmt den aeltesten (front). Verhindert falsche rtp-Tags.
   std::deque<uint32_t> pending_rtp_;
   unsigned long long dbg_calls_ = 0, dbg_frames_ = 0;
-  unsigned long long dbg_rtp_mismatch_ = 0;  // Outputs, deren rtp != aktueller Input-rtp (Puffertiefe)
+  unsigned dbg_max_pending_ = 0;  // max. MFT-Puffertiefe (offene Inputs) im Fenster
   double dbg_po_ms_ = 0, dbg_emit_ms_ = 0, dbg_view_ms_ = 0;
   double dbg_pi_ms_ = 0;  // ProcessInput-Zeit: misst, ob der Decode-Input selbst stallt (vs. WebRTC-Drossel oben)
   // Fensterstart (wall-clock): erlaubt echte Decode-CALL-Rate (calls/s) statt nur
