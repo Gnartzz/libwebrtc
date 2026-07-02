@@ -185,14 +185,25 @@ bool D3D11VAH264Decoder::EnsureMft() {
     return false;
   }
 
-  // Low-Latency fuer Echtzeit (kein B-Frame-Reordering-Puffer).
+  // Low-Latency fuer Echtzeit (kein tiefer Reordering-/DPB-Puffer). Der MS-H264-
+  // MFT puffert sonst ~21 Frames (~700ms) -> WebRTCs 10er-Timestamp-Map evakuiert
+  // den korrekten rtp, bevor der Frame rauskommt -> FindFrameInfo scheitert ->
+  // ~2/3 verworfen ("backed up") = 8 statt 30 fps. Zwei Wege setzen (MF-Attribut
+  // + ICodecAPI), Ergebnis loggen.
+  HRESULT hr_ll_attr = E_FAIL, hr_ll_codec = E_FAIL;
+  ComPtr<IMFAttributes> mft_attrs;
+  if (SUCCEEDED(mft_->GetAttributes(&mft_attrs)) && mft_attrs) {
+    hr_ll_attr = mft_attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
+  }
   ComPtr<ICodecAPI> codec;
   if (SUCCEEDED(mft_.As(&codec))) {
     VARIANT v;
     v.vt = VT_BOOL;
     v.boolVal = VARIANT_TRUE;
-    codec->SetValue(&CODECAPI_AVLowLatencyMode, &v);
+    hr_ll_codec = codec->SetValue(&CODECAPI_AVLowLatencyMode, &v);
   }
+  RTC_LOG(LS_INFO) << "[hwdec] low-latency: MF_LOW_LATENCY hr=" << hr_ll_attr
+                   << " CODECAPI hr=" << hr_ll_codec;
 
   // Input = H.264. Output = NV12 (erste passende verfuegbare Output-Type).
   ComPtr<IMFMediaType> in = MakeVideoType(MFVideoFormat_H264);
@@ -496,14 +507,18 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
     // bekamen einen rtp mehrerer Frames voraus -> WebRTCs FindFrameInfo fand sie
     // nicht und verwarf ~2/3 als "Too many frames backed up" (empfangen 30 /
     // dekodiert 8). (Kein Zeitstempel-Rueckrechnen: 100ns<->rtp rundet daneben.)
-    // DIAGNOSE: Puffertiefe des MFT messen (offene Inputs bei diesem Output).
-    // > ~10 => WebRTCs 10er-Map (kDecoderFrameMemoryLength) hat den korrekten
-    // aelteren rtp schon evakuiert -> KEIN rtp-Tag kann helfen, dann muss die
-    // MFT-Pufferung runter (Low-Latency/Drain). Emit vorerst ORIGINAL (aktueller
-    // Input-rtp) = funktionierender Zustand (Bild da, dec~8), nicht schwarz.
+    // Korrekter Output-rtp = aeltester offener Input (FIFO-front), ABER nur wenn
+    // der Puffer flach genug ist (<=8), sonst ist der front-rtp bereits aus
+    // WebRTCs 10er-Map (kDecoderFrameMemoryLength) evakuiert -> Drop/schwarz;
+    // dann Fallback auf den aktuellen Input-rtp (Bild bleibt, ~dec 8). Greift die
+    // Low-Latency-Konfig (Puffer ~1-2), liefert der front den exakten rtp -> 30fps.
     if (pending_rtp_.size() > dbg_max_pending_)
       dbg_max_pending_ = static_cast<unsigned>(pending_rtp_.size());
-    if (!pending_rtp_.empty()) pending_rtp_.pop_front();
+    uint32_t out_rtp = rtp;
+    if (!pending_rtp_.empty()) {
+      if (pending_rtp_.size() <= 8) out_rtp = pending_rtp_.front();
+      pending_rtp_.pop_front();
+    }
     ComPtr<IMFMediaBuffer> ob;
     ComPtr<IMFDXGIBuffer> dxgi;
     if (out && SUCCEEDED(out->GetBufferByIndex(0, &ob)) && SUCCEEDED(ob.As(&dxgi))) {
@@ -512,7 +527,7 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
       if (SUCCEEDED(dxgi->GetResource(IID_PPV_ARGS(&tex))) &&
           SUCCEEDED(dxgi->GetSubresourceIndex(&slice))) {
         auto _t_em = std::chrono::steady_clock::now();
-        EmitFrame(tex.Get(), slice, rtp, ntp);
+        EmitFrame(tex.Get(), slice, out_rtp, ntp);
         dbg_emit_ms_ += MsSince(_t_em);
         ++dbg_frames_;
       }
