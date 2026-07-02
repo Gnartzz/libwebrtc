@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <memory>
 #include <mutex>
 
@@ -115,8 +116,11 @@ class D3D11VAH264Decoder : public webrtc::VideoDecoder {
   // ms/Frame im MS-Decode (ProcessOutput) oder unserem Convert (EmitFrame inkl.
   // View-Erzeugung) stecken. Schreibt alle 120 Decode-Calls eine Zeile nach
   // %LOCALAPPDATA%\HoneyCord\hwdec.log. Nach der Diagnose wieder entfernen.
+  // FIFO offener Input-rtps: der MFT gibt Frames verzoegert, aber in Reihenfolge
+  // aus -> jeder Output nimmt den aeltesten (front). Verhindert falsche rtp-Tags.
+  std::deque<uint32_t> pending_rtp_;
   unsigned long long dbg_calls_ = 0, dbg_frames_ = 0;
-  unsigned long long dbg_rtp_mismatch_ = 0;  // Outputs, deren rtp != Input-rtp (MFT-Umordnung)
+  unsigned long long dbg_rtp_mismatch_ = 0;  // Outputs, deren rtp != aktueller Input-rtp (Puffertiefe)
   double dbg_po_ms_ = 0, dbg_emit_ms_ = 0, dbg_view_ms_ = 0;
   double dbg_pi_ms_ = 0;  // ProcessInput-Zeit: misst, ob der Decode-Input selbst stallt (vs. WebRTC-Drossel oben)
   // Fensterstart (wall-clock): erlaubt echte Decode-CALL-Rate (calls/s) statt nur

@@ -446,6 +446,8 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
   } else if (FAILED(hr)) {
     RTC_LOG(LS_ERROR) << "[hwdec] ProcessInput failed hr=0x" << hr;
     return WEBRTC_VIDEO_CODEC_ERROR;
+  } else {
+    pending_rtp_.push_back(rtp);  // Input akzeptiert -> rtp fuer den Output vormerken
   }
 
   bool retried_input = (hr != MF_E_NOTACCEPTING);
@@ -465,6 +467,7 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
         bool pi_fail = FAILED(mft_->ProcessInput(0, sample.Get(), 0));
         dbg_pi_ms_ += MsSince(_t_pi2);
         if (pi_fail) break;
+        pending_rtp_.push_back(rtp);  // Input nach Drain akzeptiert
         continue;
       }
       break;
@@ -486,18 +489,17 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
     ComPtr<IMFSample> out;
     out.Attach(odb.pSample);
     if (odb.pEvents) odb.pEvents->Release();
-    // WICHTIG: den rtp aus dem OUTPUT-Sample lesen, nicht den rtp des aktuellen
-    // Input-Calls verwenden. Der MFT puffert/liefert mehrere Frames pro Call
-    // (calls!=frames) und in eigener Reihenfolge -> mit dem Input-rtp wuerden
-    // Outputs falsch/doppelt getaggt, worauf WebRTCs FindFrameInfo scheitert und
-    // ~2/3 der dekodierten Frames als "Too many frames backed up" verwirft
-    // (empfangen 30 / dekodiert 8). Der MFT propagiert die Sample-Zeit vom Input;
-    // Ruecktransformation 100ns -> rtp(90kHz) = t*9/1000.
+    // Der rtp des Outputs = AELTESTER noch offener Input-rtp (FIFO). Der MFT
+    // puffert/verzoegert Frames (calls!=frames), gibt sie aber IN REIHENFOLGE
+    // aus (WebRTC-H.264 = keine B-Frames -> Decode- = Anzeigereihenfolge). Den
+    // rtp des AKTUELLEN Input-Calls zu verwenden war falsch: gepufferte Outputs
+    // bekamen einen rtp mehrerer Frames voraus -> WebRTCs FindFrameInfo fand sie
+    // nicht und verwarf ~2/3 als "Too many frames backed up" (empfangen 30 /
+    // dekodiert 8). (Kein Zeitstempel-Rueckrechnen: 100ns<->rtp rundet daneben.)
     uint32_t out_rtp = rtp;
-    LONGLONG out_time_100ns = 0;
-    if (out && SUCCEEDED(out->GetSampleTime(&out_time_100ns)) &&
-        out_time_100ns > 0) {
-      out_rtp = static_cast<uint32_t>(out_time_100ns * 9 / 1000);
+    if (!pending_rtp_.empty()) {
+      out_rtp = pending_rtp_.front();
+      pending_rtp_.pop_front();
     }
     if (out_rtp != rtp) ++dbg_rtp_mismatch_;
     ComPtr<IMFMediaBuffer> ob;
@@ -566,6 +568,7 @@ void D3D11VAH264Decoder::ReleaseInternal() {
     mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
   }
+  pending_rtp_.clear();  // offene rtp-Zuordnung fallenlassen (Flush/Res-Wechsel)
   for (int i = 0; i < kShareRing; ++i) {
     share_view_[i].Reset();
     share_tex_[i].Reset();
