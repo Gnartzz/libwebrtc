@@ -48,6 +48,9 @@ class VcmCapturer : public VideoCapturer,
   webrtc::scoped_refptr<VideoCaptureModule> vcm_;
   webrtc::Thread* worker_thread_ = nullptr;
   VideoCaptureCapability capability_;
+  // Kamera-Telemetrie (cam.log, nur Windows genutzt): geliefert-fps 1x/min.
+  int64_t cam_dbg_start_ms_ = 0;
+  unsigned cam_dbg_frames_ = 0;
 };
 
 class CapturerTrackSource : public webrtc::VideoTrackSource {
