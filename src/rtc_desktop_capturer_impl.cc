@@ -931,9 +931,32 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
       if (!g_have_frame_) return;  // noch kein Frame -> nichts senden
       // statisch: kein neuer Inhalt (changed bleibt false)
     } else if (a == DXGI_ERROR_ACCESS_LOST) {
-      // Modus-/Aufloesungswechsel -> GPU-Pfad fallenlassen (CPU uebernimmt).
+      // Modus-/Aufloesungswechsel/MONITOR-HOTPLUG -> GPU-Pfad fallenlassen.
+      // WICHTIG (Crash-Fix 2026-07-03): im GPU-Modus wurde der CPU-Capturer
+      // NIE angelegt (Start() baut ihn nur lazy, wenn InitGpu scheitert).
+      // Ohne Nachbau dereferenziert der naechste CaptureFrame()-Tick
+      // capturer_ == nullptr -> App-Absturz (okunoku: Monitor angesteckt).
+      // Wir laufen hier bereits auf thread_ -> direkt bauen + starten.
       ReleaseGpu();
       gpu_mode_ = false;
+      if (!capturer_) {
+        HcCapLog("ACCESS_LOST: baue CPU-Fallback-Capturer nach (Hotplug)");
+        if (show_cursor_) {
+          capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
+              webrtc::DesktopCapturer::CreateScreenCapturer(options_), options_);
+        } else {
+          capturer_ =
+              webrtc::DesktopAndCursorComposer::CreateWithoutMouseCursorMonitor(
+                  webrtc::DesktopCapturer::CreateScreenCapturer(options_));
+        }
+        if (capturer_) {
+          if (source_id_ != -1) capturer_->SelectSource(source_id_);
+          capturer_->Start(this);
+        } else {
+          HcCapLog("ACCESS_LOST: CPU-Fallback fehlgeschlagen -> Capture ENDET");
+          capture_state_ = CS_FAILED;
+        }
+      }
       return;
     } else {
       return;
