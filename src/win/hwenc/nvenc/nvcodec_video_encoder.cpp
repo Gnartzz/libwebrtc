@@ -84,6 +84,36 @@ const int kHighH264QpThreshold = 40;
 // to %LOCALAPPDATA%\HoneyCord\nvenc-probe.log. User can pull that file
 // after a failed start to see exactly where IsSupported / CreateEncoder
 // died.
+// Log-Rotation (einmal pro Prozess): > 1 MB -> <file>.old (ersetzt den
+// Vorgaenger); ein Archiv aelter als 14 Tage wird geloescht.
+static void RotateLogIfNeededW(const wchar_t* path) {
+  wchar_t old_path[MAX_PATH + 8] = {0};
+  swprintf_s(old_path, _countof(old_path), L"%s.old", path);
+  WIN32_FILE_ATTRIBUTE_DATA fad = {};
+  if (GetFileAttributesExW(old_path, GetFileExInfoStandard, &fad)) {
+    FILETIME now_ft;
+    GetSystemTimeAsFileTime(&now_ft);
+    ULARGE_INTEGER now_u = {}, old_u = {};
+    now_u.LowPart = now_ft.dwLowDateTime;
+    now_u.HighPart = now_ft.dwHighDateTime;
+    old_u.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+    old_u.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    const unsigned long long k14Days100ns = 14ULL * 24 * 3600 * 10000000ULL;
+    if (now_u.QuadPart > old_u.QuadPart &&
+        now_u.QuadPart - old_u.QuadPart > k14Days100ns) {
+      DeleteFileW(old_path);
+    }
+  }
+  if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) {
+    const unsigned long long size =
+        (static_cast<unsigned long long>(fad.nFileSizeHigh) << 32) |
+        fad.nFileSizeLow;
+    if (size > 1024ULL * 1024ULL) {
+      MoveFileExW(path, old_path, MOVEFILE_REPLACE_EXISTING);
+    }
+  }
+}
+
 static void NvProbeLog(const char* fmt, ...) {
   wchar_t localAppData[MAX_PATH] = {0};
   if (FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
@@ -94,6 +124,14 @@ static void NvProbeLog(const char* fmt, ...) {
   CreateDirectoryW(dir, NULL);  // ignore EEXIST
   wchar_t file[MAX_PATH] = {0};
   swprintf_s(file, MAX_PATH, L"%s\\nvenc-probe.log", dir);
+  {
+    // Einmal pro Prozess rotieren (thread-safe magic static).
+    static const bool rotated = [&file] {
+      RotateLogIfNeededW(file);
+      return true;
+    }();
+    (void)rotated;
+  }
   FILE* f = nullptr;
   if (_wfopen_s(&f, file, L"a") != 0 || !f) return;
   SYSTEMTIME st;
