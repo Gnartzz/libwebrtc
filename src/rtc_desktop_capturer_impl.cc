@@ -380,6 +380,34 @@ static const char* kHcShaderHLSL =
     "o.p=float4(o.uv*float2(2,-2)+float2(-1,1),0,1);return o;}"
     "float4 PSMain(VO i):SV_TARGET{return tex.Sample(smp,i.uv);}";
 
+// id12: die im Picker gewaehlte Screen-ID (GDI-Index der MediaList, d. h.
+// EnumDisplayDevices-Reihenfolge) in den Windows-Geraetenamen (\\.\DISPLAYn)
+// aufloesen. NUR ueber den Namen darf der DXGI-Output gesucht werden — die
+// DXGI-Output-Reihenfolge (Port-Reihenfolge am Adapter) ist NICHT die
+// GDI-Reihenfolge; Index-Gleichsetzung streamt den falschen Monitor.
+// id < 0 (kFullDesktop) -> primaerer Monitor.
+static bool ScreenIdToDeviceName(intptr_t screen_id, wchar_t* name, size_t cch) {
+  DISPLAY_DEVICEW dd = {};
+  dd.cb = sizeof(dd);
+  if (screen_id < 0) {
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+      if ((dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) &&
+          (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE)) {
+        wcsncpy_s(name, cch, dd.DeviceName, _TRUNCATE);
+        return true;
+      }
+      dd = {};
+      dd.cb = sizeof(dd);
+    }
+    return false;
+  }
+  if (!EnumDisplayDevicesW(nullptr, static_cast<DWORD>(screen_id), &dd, 0))
+    return false;
+  if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) return false;
+  wcsncpy_s(name, cch, dd.DeviceName, _TRUNCATE);
+  return true;
+}
+
 bool RTCDesktopCapturerImpl::InitGpu() {
   using Microsoft::WRL::ComPtr;
   // Deckel-Box aus dem Quality-Setting (max_width/max_height). g_target wird
@@ -429,12 +457,41 @@ bool RTCDesktopCapturerImpl::InitGpu() {
   ComPtr<ID3D11Multithread> mt;
   if (SUCCEEDED(g_ctx_.As(&mt))) mt->SetMultithreadProtected(TRUE);
 
-  // Desktop-Duplication am NVIDIA-Output 0. Scheitert, wenn der Monitor nicht an
-  // der NVIDIA haengt -> false -> Fallback auf den CPU-Capturer.
+  // id12-Fix: den DXGI-Output des GEWAEHLTEN Monitors duplizieren (vorher stur
+  // Output 0 -> "Screen 2 gewaehlt, Screen 1 gestreamt"). Mapping ueber den
+  // Geraetenamen; haengt der gewaehlte Monitor nicht am NVIDIA-Adapter ->
+  // false -> CPU-Fallback (SelectSource loest die ID dort korrekt auf).
+  wchar_t want[32] = L"";
+  const bool have_name =
+      ScreenIdToDeviceName(static_cast<intptr_t>(source_id_), want,
+                           sizeof(want) / sizeof(want[0]));
+  HcCapLog("InitGpu: source_id=%lld -> device='%ls' (aufgeloest=%d)",
+           (long long)source_id_, want, have_name ? 1 : 0);
   ComPtr<IDXGIOutput> out;
-  if (FAILED(hr = nvidia->EnumOutputs(0, &out))) {
-    HcCapLog("InitGpu FAIL @ EnumOutputs(0) nvidia: hr=0x%08X", (unsigned)hr);
-    ReleaseGpu(); return false;
+  if (have_name) {
+    ComPtr<IDXGIOutput> cand;
+    for (UINT k = 0; nvidia->EnumOutputs(k, &cand) == S_OK; ++k) {
+      DXGI_OUTPUT_DESC od = {};
+      if (SUCCEEDED(cand->GetDesc(&od)) && wcscmp(od.DeviceName, want) == 0) {
+        HcCapLog("InitGpu: Output[%u] = '%ls' MATCH", k, od.DeviceName);
+        out = cand;
+        break;
+      }
+      cand.Reset();
+    }
+    if (!out) {
+      HcCapLog("InitGpu FAIL @ Output '%ls' haengt nicht am NVIDIA-Adapter "
+               "-> CPU-Fallback (der die ID korrekt aufloest)", want);
+      ReleaseGpu();
+      return false;
+    }
+  } else {
+    // ID nicht aufloesbar (sollte nicht vorkommen): altes Verhalten als
+    // letzte Rettung — Output 0.
+    if (FAILED(hr = nvidia->EnumOutputs(0, &out))) {
+      HcCapLog("InitGpu FAIL @ EnumOutputs(0) nvidia: hr=0x%08X", (unsigned)hr);
+      ReleaseGpu(); return false;
+    }
   }
   // Hybrid-GPU (NVIDIA dGPU + AMD iGPU) + Per-Monitor-DPI-aware Prozess (Flutter
   // ist das): das aeltere IDXGIOutput1::DuplicateOutput wirft hier E_INVALIDARG
