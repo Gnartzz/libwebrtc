@@ -87,18 +87,18 @@ class D3D11VAH264Decoder : public webrtc::VideoDecoder {
   Microsoft::WRL::ComPtr<ID3D11VideoProcessor> video_processor_;
   Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> video_enum_;
 
-  // EINE stabile Shared-Textur (D3D11_RESOURCE_MISC_SHARED, Legacy-Handle via
+  // Shared-Textur-RING (D3D11_RESOURCE_MISC_SHARED, Legacy-Handle via
   // IDXGIResource::GetSharedHandle, kein Keyed-Mutex — wie der Capturer).
-  // WICHTIG (Fix Mehr-Stream-/Einzel-Stream-Ruckeln, 2026-07-01): Flutters
-  // Windows-Embedder cached die EGL-Surface PRO HANDLE-Wert und legt sie bei JEDEM
-  // Handle-Wechsel teuer neu an (CreateSurfaceFromHandle -> OpenSharedResource).
-  // Ein Ring aus MEHREREN Texturen wechselt den Handle jeden Frame -> Neu-Anlage
-  // pro Frame -> Remote-Video bricht auf ~8 fps ein (WebRTC verwirft dann vor dem
-  // Decode). Mit kShareRing=1 bleibt der Handle KONSTANT -> Embedder cached genau
-  // einmal -> volle FPS. Trade: minimaler Tearing-Rest (Producer=Decode-Thread /
-  // Consumer=ANGLE ohne Keyed-Mutex); bei sichtbarem Tearing per GPU-Fence nach
-  // dem VideoProcessorBlt entschaerfen (Frame fertig, bevor MarkTextureFrameAvailable).
-  static constexpr int kShareRing = 1;
+  // Ring=3, damit die Textur hinter einem emittierten D3D11FrameBuffer ~100ms
+  // gueltig bleibt: WebRTCs Render-Pacing zeigt den Frame erst 15-70ms nach dem
+  // Decode an. Mit Ring=1 (Experiment 2026-07-01, widerlegt: aenderte am 8-fps-
+  // Stall NICHTS — der war der 21-tiefe MFT-Puffer, s. MF_LOW_LATENCY in EnsureMft)
+  // ueberschreibt der Decoder die EINE Textur waehrend ANGLE sie sampelt ->
+  // Pacing ausgehebelt (es erscheint immer der neueste Frame) + Tearing-Risiko.
+  // Trade: Handle wechselt pro Frame -> Flutters Embedder legt die EGL-Surface
+  // pro Composite neu an; gemessen billig (Self-View-Capturer-Ring schafft so
+  // seine volle Composite-Rate, mark~0ms).
+  static constexpr int kShareRing = 3;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> share_tex_[kShareRing];
   Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> share_view_[kShareRing];
   HANDLE share_handle_[kShareRing] = {nullptr};
