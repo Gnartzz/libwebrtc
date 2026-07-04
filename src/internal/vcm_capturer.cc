@@ -120,12 +120,84 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
 
   vcm_->RegisterCaptureDataCallback(this);
 
-  device_info->GetCapability(vcm_->CurrentDeviceName(), 0, capability_);
+  const char* uid = vcm_->CurrentDeviceName();
+  const int32_t wantW = static_cast<int32_t>(width);
+  const int32_t wantH = static_cast<int32_t>(height);
+  const int32_t wantF = static_cast<int32_t>(target_fps);
 
-  capability_.width = static_cast<int32_t>(width);
-  capability_.height = static_cast<int32_t>(height);
-  capability_.maxFPS = static_cast<int32_t>(target_fps);
-  capability_.videoType = VideoType::kI420;
+  // Format-Wahl (2026-07-04): FRUEHER wurde stur Capability[0] genommen und
+  // videoType hart auf kI420 gezwungen. Fuer USB-Webcams ist das die
+  // Bandbreiten-Falle: 720p60 als RAW (I420/YUY2) = ~660 Mbps -> Kamera oeffnet
+  // langsam (#5) und faellt unter Last auf 24/15 fps (Abendtest). Native
+  // Webcams liefern hohe Aufloesung/fps als MJPEG (~10x kleiner, von libwebrtc
+  // intern billig nach I420 dekodiert) — genau das nutzt auch die Windows-
+  // Kamera-App (die deshalb fluessig lief). Also: alle Geraete-Capabilities
+  // durchsuchen und die beste fuer (Wunsch-Aufloesung, -fps, Format) waehlen.
+  const bool prefer_mjpeg = (wantW * wantH) >= (1280 * 720);
+  const int32_t ncaps = device_info->NumberOfCapabilities(uid);
+  VideoCaptureCapability best;
+  bool have_best = false;
+  int64_t best_score = 0;
+  for (int32_t i = 0; i < ncaps; ++i) {
+    VideoCaptureCapability c;
+    if (device_info->GetCapability(uid, i, c) != 0) continue;
+    if (c.width <= 0 || c.height <= 0) continue;
+    const int32_t dw = c.width > wantW ? c.width - wantW : wantW - c.width;
+    const int32_t dh = c.height > wantH ? c.height - wantH : wantH - c.height;
+    // Aufloesung dominiert; darunter fps (unter Ziel STARK bestrafen, ueber Ziel
+    // nur leicht); Format entscheidet nur noch Gleichstaende.
+    int64_t score = (static_cast<int64_t>(dw) + dh) * 100000;
+    if (c.maxFPS >= wantF)
+      score += (c.maxFPS - wantF);
+    else
+      score += static_cast<int64_t>(wantF - c.maxFPS) * 1000;
+    int type_pref;
+    if (prefer_mjpeg) {
+      type_pref = (c.videoType == VideoType::kMJPEG)  ? 0
+                  : (c.videoType == VideoType::kNV12)  ? 20
+                  : (c.videoType == VideoType::kYUY2 ||
+                     c.videoType == VideoType::kUYVY)  ? 30
+                  : (c.videoType == VideoType::kI420)  ? 40
+                                                       : 60;
+    } else {
+      // Niedrige Aufloesung: RAW bevorzugen (kein MJPEG-Decode noetig).
+      type_pref = (c.videoType == VideoType::kNV12)   ? 0
+                  : (c.videoType == VideoType::kI420)  ? 10
+                  : (c.videoType == VideoType::kYUY2 ||
+                     c.videoType == VideoType::kUYVY)  ? 20
+                  : (c.videoType == VideoType::kMJPEG) ? 40
+                                                       : 60;
+    }
+    score += type_pref;
+    if (!have_best || score < best_score) {
+      best = c;
+      best_score = score;
+      have_best = true;
+    }
+  }
+
+  if (have_best) {
+    // Echte Geraete-Capability uebernehmen (inkl. korrektem videoType) — NICHT
+    // mehr Aufloesung/fps ueberschreiben, sonst verhandelt DirectShow neu.
+    capability_ = best;
+#ifdef _WIN32
+    CamLog("Init: Wunsch %dx%d@%d prefMJPEG=%d -> gewaehlt %dx%d@%d Format=%s (aus %d Caps)",
+           wantW, wantH, wantF, prefer_mjpeg ? 1 : 0, capability_.width,
+           capability_.height, capability_.maxFPS,
+           CamVideoTypeName(capability_.videoType), ncaps);
+#endif
+  } else {
+    // Fallback: alte Heuristik (Index 0 + Wunschwerte, I420-Konvertierung).
+    device_info->GetCapability(uid, 0, capability_);
+    capability_.width = wantW;
+    capability_.height = wantH;
+    capability_.maxFPS = wantF;
+    capability_.videoType = VideoType::kI420;
+#ifdef _WIN32
+    CamLog("Init: keine Caps gefunden (%d) -> Fallback %dx%d@%d I420", ncaps,
+           wantW, wantH, wantF);
+#endif
+  }
 
   return true;
 }
@@ -159,18 +231,10 @@ bool VcmCapturer::StartCapture() {
   }
 
 #ifdef _WIN32
-  // Verhandeltes Format loggen — RAW (I420/YUY2) bei 720p+ = USB-Bandbreiten-
-  // Falle (liefert real weniger fps als nominell); MJPEG/NV12 = ok.
-  VideoCaptureCapability settings;
-  if (vcm_->CaptureSettings(settings) == 0) {
-    CamLog("Start: angefordert %dx%d@%d -> verhandelt %dx%d@%d Format=%s",
-           capability_.width, capability_.height, capability_.maxFPS,
-           settings.width, settings.height, settings.maxFPS,
-           CamVideoTypeName(settings.videoType));
-  } else {
-    CamLog("Start: angefordert %dx%d@%d (CaptureSettings n/a)",
-           capability_.width, capability_.height, capability_.maxFPS);
-  }
+  // capability_ ist jetzt die ECHTE, in Init() gewaehlte Geraete-Capability
+  // (inkl. wahrem videoType) — kein CaptureSettings-Echo mehr noetig.
+  CamLog("Start OK: %dx%d@%d Format=%s", capability_.width, capability_.height,
+         capability_.maxFPS, CamVideoTypeName(capability_.videoType));
 #endif
   return true;
 }
