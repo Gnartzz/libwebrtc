@@ -22,6 +22,45 @@
 
 #ifdef WEBRTC_WIN
 #include "modules/desktop_capture/win/window_capture_utils.h"
+#include <windows.h>
+#include <cstdio>
+#include <cstring>
+namespace {
+// Picker-Diagnose (2026-07-04): Vorschaubilder werden ab dem 2. Öffnen schwarz,
+// nachdem einmal ein echter Screen-/Game-Share lief. Loggt SelectSource-Erfolg
+// + Capture-Ergebnis-Code nach %LOCALAPPDATA%\HoneyCord\picker.log, um zu sehen
+// WO es bricht (Source verloren / Capture-Fehler / Frame schwarz).
+void PickLog(const char* fmt, ...) {
+  char path[MAX_PATH];
+  DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return;
+  std::strncat(path, "\\HoneyCord", MAX_PATH - n - 1);
+  CreateDirectoryA(path, nullptr);
+  std::strncat(path, "\\picker.log", MAX_PATH - std::strlen(path) - 1);
+  // grobe Rotation: > 512 KB -> neu anfangen (Diagnose, kurzlebig).
+  WIN32_FILE_ATTRIBUTE_DATA fad{};
+  if (GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) {
+    unsigned long long sz =
+        (static_cast<unsigned long long>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+    if (sz > 512ULL * 1024ULL) DeleteFileA(path);
+  }
+  if (FILE* f = std::fopen(path, "a")) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::fprintf(f, "[pick %02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(f, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', f);
+    std::fclose(f);
+  }
+}
+}  // namespace
+#else
+namespace {
+void PickLog(const char*, ...) {}
+}  // namespace
 #endif
 
 #include <fstream>
@@ -168,9 +207,13 @@ bool RTCDesktopMediaListImpl::GetThumbnail(scoped_refptr<MediaSource> source,
                                            bool notify) {
   thread_->PostTask([this, source, notify] {
     MediaSourceImpl* source_impl = static_cast<MediaSourceImpl*>(source.get());
-    if (capturer_->SelectSource(source_impl->source_id())) {
+    const bool sel = capturer_->SelectSource(source_impl->source_id());
+    if (sel) {
       callback_->SetCallback([&](webrtc::DesktopCapturer::Result result,
                                  std::unique_ptr<webrtc::DesktopFrame> frame) {
+        PickLog("thumb id=%lld SelectSource=1 Capture=%d frame=%s",
+                (long long)source_impl->source_id(), (int)result,
+                frame ? "ja" : "null");
         auto old_thumbnail = source_impl->thumbnail();
         source_impl->SaveCaptureResult(result, std::move(frame));
         if (observer_ && notify) {
@@ -180,6 +223,9 @@ bool RTCDesktopMediaListImpl::GetThumbnail(scoped_refptr<MediaSource> source,
         }
       });
       capturer_->CaptureFrame();
+    } else {
+      PickLog("thumb id=%lld SelectSource=0 (Quelle verloren)",
+              (long long)source_impl->source_id());
     }
   });
   return true;
