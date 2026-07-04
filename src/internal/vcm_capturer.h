@@ -51,6 +51,8 @@ class VcmCapturer : public VideoCapturer,
   // Kamera-Telemetrie (cam.log, nur Windows genutzt): geliefert-fps 1x/min.
   int64_t cam_dbg_start_ms_ = 0;
   unsigned cam_dbg_frames_ = 0;
+  // Dauer des DirectShow-Capability-Map-Baus (Init) — fuer #5 „Open langsam".
+  int64_t cap_map_ms_ = 0;
 };
 
 class CapturerTrackSource : public webrtc::VideoTrackSource {

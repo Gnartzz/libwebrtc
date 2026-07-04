@@ -134,7 +134,17 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
   // Kamera-App (die deshalb fluessig lief). Also: alle Geraete-Capabilities
   // durchsuchen und die beste fuer (Wunsch-Aufloesung, -fps, Format) waehlen.
   const bool prefer_mjpeg = (wantW * wantH) >= (1280 * 720);
+  // Timing (#5 „Kamera oeffnet langsam"): NumberOfCapabilities baut auf Windows
+  // die DirectShow-Capability-Map (verbindet sich mit dem Geraet, enumeriert
+  // Medientypen) — klassischer Zeitfresser. Getrennt messen, um Enumeration vs
+  // Geraete-Open vs erster Frame im Feld zu unterscheiden.
+#ifdef _WIN32
+  const int64_t t_caps0 = static_cast<int64_t>(GetTickCount64());
+#endif
   const int32_t ncaps = device_info->NumberOfCapabilities(uid);
+#ifdef _WIN32
+  cap_map_ms_ = static_cast<int64_t>(GetTickCount64()) - t_caps0;
+#endif
   VideoCaptureCapability best;
   bool have_best = false;
   int64_t best_score = 0;
@@ -181,10 +191,10 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
     // mehr Aufloesung/fps ueberschreiben, sonst verhandelt DirectShow neu.
     capability_ = best;
 #ifdef _WIN32
-    CamLog("Init: Wunsch %dx%d@%d prefMJPEG=%d -> gewaehlt %dx%d@%d Format=%s (aus %d Caps)",
+    CamLog("Init: Wunsch %dx%d@%d prefMJPEG=%d -> gewaehlt %dx%d@%d Format=%s (aus %d Caps, CapMap=%lldms)",
            wantW, wantH, wantF, prefer_mjpeg ? 1 : 0, capability_.width,
            capability_.height, capability_.maxFPS,
-           CamVideoTypeName(capability_.videoType), ncaps);
+           CamVideoTypeName(capability_.videoType), ncaps, (long long)cap_map_ms_);
 #endif
   } else {
     // Fallback: alte Heuristik (Index 0 + Wunschwerte, I420-Konvertierung).
@@ -218,6 +228,9 @@ std::shared_ptr<VcmCapturer> VcmCapturer::Create(webrtc::Thread* worker_thread,
 }
 
 bool VcmCapturer::StartCapture() {
+#ifdef _WIN32
+  const int64_t t_start0 = static_cast<int64_t>(GetTickCount64());
+#endif
   int32_t result = worker_thread_->BlockingCall(
       [&] { return vcm_->StartCapture(capability_); });
 
@@ -233,8 +246,13 @@ bool VcmCapturer::StartCapture() {
 #ifdef _WIN32
   // capability_ ist jetzt die ECHTE, in Init() gewaehlte Geraete-Capability
   // (inkl. wahrem videoType) — kein CaptureSettings-Echo mehr noetig.
-  CamLog("Start OK: %dx%d@%d Format=%s", capability_.width, capability_.height,
-         capability_.maxFPS, CamVideoTypeName(capability_.videoType));
+  // StartCapture-Dauer = DirectShow-Graph bauen + Geraet hochfahren (der zweite
+  // grosse Zeitblock beim Kamera-Oeffnen). Erster Frame folgt separat (OnFrame).
+  const int64_t start_ms = static_cast<int64_t>(GetTickCount64()) - t_start0;
+  CamLog("Start OK: %dx%d@%d Format=%s (StartCapture=%lldms, CapMap war %lldms)",
+         capability_.width, capability_.height, capability_.maxFPS,
+         CamVideoTypeName(capability_.videoType), (long long)start_ms,
+         (long long)cap_map_ms_);
 #endif
   return true;
 }
