@@ -211,9 +211,31 @@ bool RTCDesktopMediaListImpl::GetThumbnail(scoped_refptr<MediaSource> source,
     if (sel) {
       callback_->SetCallback([&](webrtc::DesktopCapturer::Result result,
                                  std::unique_ptr<webrtc::DesktopFrame> frame) {
-        PickLog("thumb id=%lld SelectSource=1 Capture=%d frame=%s",
+        // Schwarz-Check: mittlere Helligkeit ueber ein grobes Raster. Sagt uns,
+        // ob der Capture erfolgreich ist ABER schwarze Pixel liefert (GDI ueber
+        // RDP / nach DXGI-Share) — dann liegt der Bug am Frame, nicht am UI.
+        long long avg = -1;
+        int fw = 0, fh = 0;
+        if (frame && frame->data()) {
+          fw = frame->size().width();
+          fh = frame->size().height();
+          const int stride = frame->stride();  // Bytes/Zeile (BGRA)
+          unsigned long long sum = 0;
+          int n = 0;
+          for (int y = 0; y < fh; y += (fh / 16 > 0 ? fh / 16 : 1)) {
+            const uint8_t* row = frame->data() + (size_t)y * stride;
+            for (int x = 0; x < fw; x += (fw / 16 > 0 ? fw / 16 : 1)) {
+              const uint8_t* px = row + (size_t)x * 4;  // BGRA
+              sum += px[0] + px[1] + px[2];
+              ++n;
+            }
+          }
+          if (n > 0) avg = (long long)(sum / (3ULL * n));  // 0..255
+        }
+        PickLog("thumb id=%lld SelectSource=1 Capture=%d frame=%s %dx%d avgLum=%lld%s",
                 (long long)source_impl->source_id(), (int)result,
-                frame ? "ja" : "null");
+                frame ? "ja" : "null", fw, fh, avg,
+                (avg >= 0 && avg < 4) ? " [SCHWARZ]" : "");
         auto old_thumbnail = source_impl->thumbnail();
         source_impl->SaveCaptureResult(result, std::move(frame));
         if (observer_ && notify) {
