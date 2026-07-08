@@ -25,6 +25,8 @@
 // WAS wurde mit der Kamera verhandelt (Format! MJPEG vs RAW = USB-Bandbreite)
 // und WAS liefert sie wirklich.
 #include <windows.h>
+#include <dshow.h>  // id34: IAMCameraControl, ICreateDevEnum, Moniker-Enum
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 namespace {
@@ -89,6 +91,129 @@ const char* CamVideoTypeName(webrtc::VideoType t) {
     default: return "andere";
   }
 }
+
+// id34: Toleranter Vergleich der DirectShow-DevicePaths (case-insensitiv, einer
+// darf den anderen enthalten — webrtcs unique_name kann sich in Nuancen von der
+// Moniker-„DevicePath"-Property unterscheiden).
+bool ExpPathMatch(const char* a, const char* b) {
+  if (!a || !b) return false;
+  if (_stricmp(a, b) == 0) return true;
+  size_t la = std::strlen(a), lb = std::strlen(b);
+  const char* hay = la >= lb ? a : b;
+  const char* need = la >= lb ? b : a;
+  if (*need == '\0') return false;
+  for (const char* p = hay; *p; ++p) {
+    size_t i = 0;
+    while (need[i] && p[i] &&
+           std::tolower((unsigned char)need[i]) ==
+               std::tolower((unsigned char)p[i]))
+      ++i;
+    if (need[i] == '\0') return true;
+  }
+  return false;
+}
+
+// id34 „Framerate <-> Helligkeit": deckelt die Kamera-Belichtung auf <= 1/32 s
+// (log2-Wert -5), damit die Auto-Belichtung bei wenig Licht die Belichtungszeit
+// nicht ueber 1/30 s ziehen und dadurch Frames droppen kann (Ursache des
+// 15-fps-Falls, per Licht-Test bewiesen). Oeffnet das Geraet separat per
+// Moniker (DevicePath == unique_name), holt IAMCameraControl, setzt
+// Exposure=Manual. Best effort — jeder Fehler wird nur geloggt, nie geworfen.
+void ApplyExposureCap(const char* device_unique_name) {
+  if (!device_unique_name || !device_unique_name[0]) {
+    CamLog("[hc-exp] kein DevicePath -> uebersprungen");
+    return;
+  }
+  bool com_inited = false;
+  HRESULT hrco = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  if (SUCCEEDED(hrco)) com_inited = true;  // RPC_E_CHANGED_MODE = schon init
+
+  ICreateDevEnum* dev_enum = nullptr;
+  IEnumMoniker* mon_enum = nullptr;
+  HRESULT hr =
+      CoCreateInstance(CLSID_SystemDeviceEnum, nullptr, CLSCTX_INPROC_SERVER,
+                       IID_ICreateDevEnum, reinterpret_cast<void**>(&dev_enum));
+  if (SUCCEEDED(hr) && dev_enum) {
+    hr = dev_enum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory,
+                                         &mon_enum, 0);
+  }
+  bool applied = false, found = false;
+  if (hr == S_OK && mon_enum) {
+    IMoniker* mon = nullptr;
+    while (!applied && mon_enum->Next(1, &mon, nullptr) == S_OK) {
+      IPropertyBag* bag = nullptr;
+      if (SUCCEEDED(mon->BindToStorage(nullptr, nullptr, IID_IPropertyBag,
+                                       reinterpret_cast<void**>(&bag))) &&
+          bag) {
+        VARIANT v;
+        VariantInit(&v);
+        if (SUCCEEDED(bag->Read(L"DevicePath", &v, nullptr)) &&
+            v.vt == VT_BSTR && v.bstrVal) {
+          char path[512] = {0};
+          WideCharToMultiByte(CP_ACP, 0, v.bstrVal, -1, path, sizeof(path),
+                              nullptr, nullptr);
+          if (ExpPathMatch(path, device_unique_name)) {
+            found = true;
+            IBaseFilter* filter = nullptr;
+            if (SUCCEEDED(mon->BindToObject(
+                    nullptr, nullptr, IID_IBaseFilter,
+                    reinterpret_cast<void**>(&filter))) &&
+                filter) {
+              IAMCameraControl* cam = nullptr;
+              if (SUCCEEDED(filter->QueryInterface(
+                      IID_IAMCameraControl,
+                      reinterpret_cast<void**>(&cam))) &&
+                  cam) {
+                long mn = 0, mx = 0, step = 0, def = 0, caps = 0;
+                if (SUCCEEDED(cam->GetRange(CameraControl_Exposure, &mn, &mx,
+                                            &step, &def, &caps))) {
+                  long target = -5;  // 2^-5 = 1/32 s ~ 31 fps Deckel
+                  if (target < mn) target = mn;
+                  if (target > mx) target = mx;
+                  if (step > 0) {  // nach unten (=kuerzer) aufs Raster snappen
+                    long off = target - mn;
+                    target = mn + (off / step) * step;
+                  }
+                  HRESULT hs = cam->Set(CameraControl_Exposure, target,
+                                        CameraControl_Flags_Manual);
+                  if (SUCCEEDED(hs)) {
+                    applied = true;
+                    CamLog(
+                        "[hc-exp] Belichtung gedeckelt: Exposure=%ld "
+                        "(Range %ld..%ld step %ld def %ld) Flag=Manual",
+                        target, mn, mx, step, def);
+                  } else {
+                    CamLog(
+                        "[hc-exp] Set(Exposure) FEHLGESCHLAGEN hr=0x%08lx "
+                        "(Ziel %ld, Range %ld..%ld)",
+                        (unsigned long)hs, target, mn, mx);
+                  }
+                } else {
+                  CamLog("[hc-exp] GetRange(Exposure) nicht unterstuetzt");
+                }
+                cam->Release();
+              } else {
+                CamLog("[hc-exp] IAMCameraControl nicht verfuegbar");
+              }
+              filter->Release();
+            } else {
+              CamLog("[hc-exp] BindToObject(IBaseFilter) fehlgeschlagen");
+            }
+          }
+        }
+        VariantClear(&v);
+        bag->Release();
+      }
+      mon->Release();
+      mon = nullptr;
+    }
+  }
+  if (!found)
+    CamLog("[hc-exp] Geraet nicht gefunden (DevicePath-Match) -> kein Cap");
+  if (mon_enum) mon_enum->Release();
+  if (dev_enum) dev_enum->Release();
+  if (com_inited) CoUninitialize();
+}
 }  // namespace
 #endif  // _WIN32
 
@@ -111,6 +236,10 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
     Destroy();
     return false;
   }
+
+  // id34: DevicePath merken, um die Kamera in StartCapture separat per Moniker
+  // zu oeffnen und (opt-in) die Belichtung zu deckeln.
+  unique_name_ = unique_name;
 
   vcm_ = webrtc::VideoCaptureFactory::Create(unique_name);
 
@@ -253,6 +382,15 @@ bool VcmCapturer::StartCapture() {
          capability_.width, capability_.height, capability_.maxFPS,
          CamVideoTypeName(capability_.videoType), (long long)start_ms,
          (long long)cap_map_ms_);
+  // id34 „Framerate <-> Helligkeit" (opt-in): flutter_webrtc setzt die
+  // Prozess-Umgebungsvariable via Win32-SetEnvironmentVariableA — im selben
+  // Prozess hier per GetEnvironmentVariableA sichtbar (CRT-/DLL-unabhaengig).
+  // Bei „1" die Belichtung deckeln, damit wenig Licht keine fps-Drops erzwingt.
+  char hf[8] = {0};
+  DWORD hfn = GetEnvironmentVariableA("HONEYCORD_HOLD_FRAMERATE", hf, sizeof(hf));
+  if (hfn > 0 && hf[0] == '1') {
+    ApplyExposureCap(unique_name_.c_str());
+  }
 #endif
   return true;
 }

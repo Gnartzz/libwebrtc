@@ -158,9 +158,14 @@ rtc_shared_library("libwebrtc") {
     # Zero-Copy-Capturer (rtc_desktop_capturer_impl) nutzt D3DCompile fuer den
     # Shader-Downscale -> d3dcompiler.lib (d3d11/dxgi kommen aus dem nvenc-Block).
     # dwmapi.lib fuer den WGC-Fenster-Capture-Pfad (wie webrtcs eigener WGC-Block).
+    # id34: strmiids (CLSID_SystemDeviceEnum/-VideoInputDeviceCategory) +
+    # ole32/oleaut32 fuer die DirectShow-Belichtungssteuerung in vcm_capturer.
     libs += [
       "d3dcompiler.lib",
       "dwmapi.lib",
+      "strmiids.lib",
+      "ole32.lib",
+      "oleaut32.lib",
     ]
   }
 

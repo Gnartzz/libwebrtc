@@ -11,6 +11,7 @@
 #define INTERNAL_VCM_CAPTURER_H_
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "api/scoped_refptr.h"
@@ -48,6 +49,10 @@ class VcmCapturer : public VideoCapturer,
   webrtc::scoped_refptr<VideoCaptureModule> vcm_;
   webrtc::Thread* worker_thread_ = nullptr;
   VideoCaptureCapability capability_;
+  // DirectShow-DevicePath des gewaehlten Geraets (Init) — id34: erlaubt es,
+  // die Kamera in StartCapture separat via Moniker zu oeffnen und die
+  // Belichtung zu deckeln (Framerate-Halten bei wenig Licht).
+  std::string unique_name_;
   // Kamera-Telemetrie (cam.log, nur Windows genutzt): geliefert-fps 1x/min.
   int64_t cam_dbg_start_ms_ = 0;
   unsigned cam_dbg_frames_ = 0;
