@@ -26,6 +26,7 @@
 // und WAS liefert sie wirklich.
 #include <windows.h>
 #include <dshow.h>  // id34: IAMCameraControl, ICreateDevEnum, Moniker-Enum
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -113,13 +114,16 @@ bool ExpPathMatch(const char* a, const char* b) {
   return false;
 }
 
-// id34 „Framerate <-> Helligkeit": deckelt die Kamera-Belichtung auf <= 1/32 s
-// (log2-Wert -5), damit die Auto-Belichtung bei wenig Licht die Belichtungszeit
-// nicht ueber 1/30 s ziehen und dadurch Frames droppen kann (Ursache des
-// 15-fps-Falls, per Licht-Test bewiesen). Oeffnet das Geraet separat per
-// Moniker (DevicePath == unique_name), holt IAMCameraControl, setzt
-// Exposure=Manual. Best effort — jeder Fehler wird nur geloggt, nie geworfen.
-void ApplyExposureCap(const char* device_unique_name) {
+// id34 „Framerate <-> Helligkeit": stellt die Kamera-Belichtung ein.
+//  hold=true : deckelt auf Manual <= 1/32 s (log2-Wert -5), damit die
+//              Auto-Belichtung bei wenig Licht die Belichtungszeit nicht ueber
+//              1/30 s ziehen und Frames droppen kann (15-fps-Fall).
+//  hold=false: setzt auf Auto ZURUECK — WICHTIG, weil UVC-Cams eine Manual-
+//              Belichtung in der Hardware behalten (bis Auto/USB-Reset); ohne
+//              diesen Restore bliebe die Cam nach dem Ausschalten gedrosselt.
+// Oeffnet das Geraet separat per Moniker (DevicePath == unique_name), holt
+// IAMCameraControl. Best effort — jeder Fehler wird nur geloggt, nie geworfen.
+void ApplyExposure(const char* device_unique_name, bool hold) {
   if (!device_unique_name || !device_unique_name[0]) {
     CamLog("[hc-exp] kein DevicePath -> uebersprungen");
     return;
@@ -167,26 +171,44 @@ void ApplyExposureCap(const char* device_unique_name) {
                 long mn = 0, mx = 0, step = 0, def = 0, caps = 0;
                 if (SUCCEEDED(cam->GetRange(CameraControl_Exposure, &mn, &mx,
                                             &step, &def, &caps))) {
-                  long target = -5;  // 2^-5 = 1/32 s ~ 31 fps Deckel
-                  if (target < mn) target = mn;
-                  if (target > mx) target = mx;
-                  if (step > 0) {  // nach unten (=kuerzer) aufs Raster snappen
-                    long off = target - mn;
-                    target = mn + (off / step) * step;
-                  }
-                  HRESULT hs = cam->Set(CameraControl_Exposure, target,
-                                        CameraControl_Flags_Manual);
-                  if (SUCCEEDED(hs)) {
-                    applied = true;
-                    CamLog(
-                        "[hc-exp] Belichtung gedeckelt: Exposure=%ld "
-                        "(Range %ld..%ld step %ld def %ld) Flag=Manual",
-                        target, mn, mx, step, def);
+                  HRESULT hs;
+                  if (hold) {
+                    long target = -5;  // 2^-5 = 1/32 s ~ 31 fps Deckel
+                    if (target < mn) target = mn;
+                    if (target > mx) target = mx;
+                    if (step > 0) {  // nach unten (=kuerzer) aufs Raster snappen
+                      long off = target - mn;
+                      target = mn + (off / step) * step;
+                    }
+                    hs = cam->Set(CameraControl_Exposure, target,
+                                  CameraControl_Flags_Manual);
+                    if (SUCCEEDED(hs)) {
+                      applied = true;
+                      CamLog(
+                          "[hc-exp] Belichtung gedeckelt: Exposure=%ld "
+                          "(Range %ld..%ld step %ld def %ld) Flag=Manual",
+                          target, mn, mx, step, def);
+                    } else {
+                      CamLog(
+                          "[hc-exp] Set(Exposure) FEHLGESCHLAGEN hr=0x%08lx "
+                          "(Ziel %ld, Range %ld..%ld)",
+                          (unsigned long)hs, target, mn, mx);
+                    }
                   } else {
-                    CamLog(
-                        "[hc-exp] Set(Exposure) FEHLGESCHLAGEN hr=0x%08lx "
-                        "(Ziel %ld, Range %ld..%ld)",
-                        (unsigned long)hs, target, mn, mx);
+                    // Auf Auto zurueck (Standardwert def, Flag Auto).
+                    hs = cam->Set(CameraControl_Exposure, def,
+                                  CameraControl_Flags_Auto);
+                    if (SUCCEEDED(hs)) {
+                      applied = true;
+                      CamLog(
+                          "[hc-exp] Belichtung auf Auto zurueckgesetzt "
+                          "(def=%ld, Range %ld..%ld)",
+                          def, mn, mx);
+                    } else {
+                      CamLog(
+                          "[hc-exp] Auto-Restore FEHLGESCHLAGEN hr=0x%08lx",
+                          (unsigned long)hs);
+                    }
                   }
                 } else {
                   CamLog("[hc-exp] GetRange(Exposure) nicht unterstuetzt");
@@ -385,12 +407,30 @@ bool VcmCapturer::StartCapture() {
   // id34 „Framerate <-> Helligkeit" (opt-in): flutter_webrtc setzt die
   // Prozess-Umgebungsvariable via Win32-SetEnvironmentVariableA — im selben
   // Prozess hier per GetEnvironmentVariableA sichtbar (CRT-/DLL-unabhaengig).
-  // Bei „1" die Belichtung deckeln, damit wenig Licht keine fps-Drops erzwingt.
+  //  „1" -> Belichtung Manual deckeln (haelt fps bei wenig Licht).
+  //  „0" -> auf Auto ZURUECK. Noetig, weil eine Manual-Belichtung in der Cam-
+  //         Hardware klebt: ohne Restore bliebe die Cam nach dem Ausschalten
+  //         (oder nach einem Crash mit gesetztem Manual) dauerhaft gedrosselt.
+  // Kosten sparen: den (teuren) Auto-Restore nur laufen, wenn wir in diesem
+  // Prozess Manual gesetzt haben ODER noch nie Auto erzwungen wurde (deckt eine
+  // aus einer frueheren/gecrashten Session haengende Manual-Belichtung beim
+  // ERSTEN Kamera-Start ab). Danach ist „0" ein billiger No-op.
+  static std::atomic<bool> s_manual_active{false};
+  static std::atomic<bool> s_auto_ensured{false};
   char hf[8] = {0};
   DWORD hfn = GetEnvironmentVariableA("HONEYCORD_HOLD_FRAMERATE", hf, sizeof(hf));
   if (hfn > 0 && hf[0] == '1') {
-    ApplyExposureCap(unique_name_.c_str());
+    ApplyExposure(unique_name_.c_str(), /*hold=*/true);
+    s_manual_active.store(true);
+    s_auto_ensured.store(false);
+  } else if (hfn > 0 && hf[0] == '0') {
+    if (s_manual_active.load() || !s_auto_ensured.load()) {
+      ApplyExposure(unique_name_.c_str(), /*hold=*/false);
+      s_manual_active.store(false);
+      s_auto_ensured.store(true);
+    }
   }
+  // hfn==0 (Env nicht gesetzt): Belichtung gar nicht anfassen.
 #endif
   return true;
 }
