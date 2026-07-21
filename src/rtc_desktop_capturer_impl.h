@@ -137,18 +137,30 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
 
   bool g_have_frame_ = false;
   uint32_t g_target_w_ = 0, g_target_h_ = 0, g_desk_w_ = 0, g_desk_h_ = 0;
-  // GPU-Vorschau: RING aus kShareRing plain-SHARED-Texturen, in die pro Frame
-  // reihum das fertige BGRA-Bild kopiert wird; ihr Legacy-Shared-Handle geht an
-  // den Renderer (Flutter GpuSurfaceTexture). Pro Frame rotiert das durchgereichte
+  // GPU-Vorschau: RING aus kShareRing plain-SHARED-Texturen, in die MIT
+  // KADENZ (~30 fps, s. kShareCadenceMs) reihum das fertige BGRA-Bild kopiert
+  // wird; ihr Legacy-Shared-Handle geht an den Renderer (Flutter
+  // GpuSurfaceTexture). Bei jedem Ring-Update rotiert das durchgereichte
   // Handle, damit Flutters ExternalTextureD3d ein NEUES Handle sieht und
-  // eglBindTexImage erneut aufruft — sonst bindet es nur 1x pro Handle und friert
-  // bei In-place-Updates auf manchen NVIDIA-Treibern ein (beige Vorschau).
-  // Optional — scheitert die Erzeugung, laeuft der Sende-/Encode-Pfad unveraendert
-  // weiter (nur die Vorschau bleibt CPU).
-  static constexpr int kShareRing = 3;
+  // eglBindTexImage erneut aufruft — sonst bindet es nur 1x pro Handle und
+  // friert bei In-place-Updates ein (beige Vorschau). ZWISCHEN Updates traegt
+  // der Frame dasselbe Handle -> die Engine bindet nicht neu (billig).
+  // KADENZ + RING=6 (2026-07-21, AIX1-Messreihe): das Zeichnen eines Ring-
+  // Slots synchronisiert cross-device gegen die Producer-Queue; wurde der Ring
+  // mit 60 fps beschrieben, blieb Flutters Fenster-Compositor bei ~18,5 fps —
+  // unabhaengig von der Re-Bind-Rate (Drossel-Probe: Re-Binds halbiert, 0 fps
+  // Gewinn; statische Texturen im selben Szenario: 31-85 fps). Mit ~30-fps-
+  // Kadenz + 6er-Ring ist der angezeigte Slot laengst fertig geschrieben und
+  // wird erst ~200 ms spaeter wiederverwendet -> Draws warten nicht mehr.
+  // Sende-/Encode-Pfad (g_out_) voellig unberuehrt. Optional — scheitert die
+  // Erzeugung, laeuft der Sende-Pfad unveraendert weiter (Vorschau bleibt CPU).
+  static constexpr int kShareRing = 6;
+  static constexpr int64_t kShareCadenceMs = 33;  // ~30 fps Vorschau-Kadenz
   std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, kShareRing> g_shared_tex_;
   std::array<HANDLE, kShareRing> g_shared_handle_ = {};
   int g_share_idx_ = 0;
+  HANDLE g_share_cur_handle_ = nullptr;  // zuletzt beschriebener Slot
+  int64_t g_share_last_ms_ = 0;          // letztes Ring-Update (Kadenz-Gate)
 
   // WGC-Fenster-Capture-State (PIMPL: WinRT-Typen bleiben in der .cc, da dieser
   // Header von mehreren TUs inkludiert wird). wgc_mode_ aktiv => GpuCaptureFrame

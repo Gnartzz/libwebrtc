@@ -888,6 +888,8 @@ void RTCDesktopCapturerImpl::ReleaseGpu() {
   for (auto& t : g_shared_tex_) t.Reset();
   g_shared_handle_.fill(nullptr);
   g_share_idx_ = 0;
+  g_share_cur_handle_ = nullptr;
+  g_share_last_ms_ = 0;
   g_last_out_idx_ = -1;
   // WGC-Fenster-Capture beenden (haelt Refs auf g_dev_).
   if (wgc_) {
@@ -1001,17 +1003,30 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
     out_idx = g_last_out_idx_;
   }
 
-  // GPU-Vorschau: fertiges Bild reihum in die naechste Shared-Textur des Rings
-  // kopieren und DEREN Handle durchreichen. So sieht Flutter pro Frame ein neues
-  // Handle und re-bindet die EGL-Surface (eglBindTexImage) jedes Frame statt nur
-  // 1x -> kein Einfrieren bei In-place-Updates (beige Vorschau). Der Ring gibt
-  // zugleich Producer/Consumer-Trennung. KEIN Keyed-Mutex (ANGLE bedient keinen).
+  // GPU-Vorschau: fertiges Bild MIT KADENZ (~30 fps) reihum in die naechste
+  // Shared-Textur des Rings kopieren und DEREN Handle durchreichen. Bei jedem
+  // Ring-Update sieht Flutter ein neues Handle und re-bindet die EGL-Surface
+  // (eglBindTexImage) -> kein Einfrieren bei In-place-Updates (beige Vorschau);
+  // zwischen Updates bleibt das Handle gleich (kein Re-Bind, billig). Der
+  // 6er-Ring gibt Producer/Consumer-Trennung: der gerade angezeigte Slot wird
+  // erst ~200 ms spaeter wiederverwendet -> das Compositor-Zeichnen wartet nie
+  // auf frische Writes (18,5-fps-Deckel, s. Header). KEIN Keyed-Mutex.
   HANDLE share_handle = nullptr;
   if (g_shared_tex_[0]) {
-    int sidx = g_share_idx_;
-    g_share_idx_ = (g_share_idx_ + 1) % kShareRing;
-    g_ctx_->CopyResource(g_shared_tex_[sidx].Get(), g_out_[out_idx].Get());
-    share_handle = g_shared_handle_[sidx];
+    // KADENZ-Gate (s. Header): Ring nur alle kShareCadenceMs beschreiben+
+    // rotieren (~30 fps). Zwischen Updates traegt der Frame dasselbe Handle ->
+    // die Engine re-bindet nicht (billig), und der angezeigte Slot wird bei
+    // 6er-Ring erst ~200 ms spaeter wiederverwendet -> das Zeichnen wartet
+    // nie mehr auf frische Producer-Writes (der 18,5-fps-Compositor-Deckel).
+    int64_t nowp = webrtc::TimeMillis();
+    if (!g_share_cur_handle_ || nowp - g_share_last_ms_ >= kShareCadenceMs) {
+      int sidx = g_share_idx_;
+      g_share_idx_ = (g_share_idx_ + 1) % kShareRing;
+      g_ctx_->CopyResource(g_shared_tex_[sidx].Get(), g_out_[out_idx].Get());
+      g_share_cur_handle_ = g_shared_handle_[sidx];
+      g_share_last_ms_ = nowp;
+    }
+    share_handle = g_share_cur_handle_;
   }
 
   g_ctx_->Flush();  // sicherstellen, dass der Render fertig ist, bevor der
