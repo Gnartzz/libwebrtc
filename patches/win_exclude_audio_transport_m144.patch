@@ -1,0 +1,98 @@
+HoneyCord #62 (Windows), Teil 2: Custom-Quellen aus dem AudioTransport-Router
+ausschliessen, damit AudioState::AddSendingStream fuer reinen Bildschirm-Ton
+NICHT die ADM-Mikrofon-Aufnahme startet (Windows-Ducking). Portierung des auf
+macOS bewaehrten exclude_from_audio_transport-Mechanismus; der Windows-m144-
+Baum hatte ihn gar nicht. GEMESSEN wirksam (AIX1, 80%-Einstellung, 2026-07-23).
+
+--- a/call/audio_send_stream.h
++++ b/call/audio_send_stream.h
+@@ -195,6 +195,15 @@
+   // When a stream is stopped, it can't receive, process or deliver packets.
+   virtual void Stop() = 0;
+ 
++  // HoneyCord (#62): Sendestreams aus einer Custom-Quelle (z. B. Bildschirm-
++  // Ton) werden nicht in den AudioTransport-Router aufgenommen, damit das ADM
++  // nicht parallel Mikrofon-Daten in deren Encoder pumpt -- und vor allem, damit
++  // AudioState::AddSendingStream fuer sie NICHT die Mikrofon-Aufnahme startet
++  // (sonst oeffnet reiner Bildschirm-Ton das Mikrofon -> Windows-Ducking).
++  // Default: false (= bestehende Mikrofon-/Track-Streams unveraendert).
++  virtual void SetExcludeFromAudioTransport(bool exclude) {}
++  virtual bool exclude_from_audio_transport() const { return false; }
++
+   // TODO(solenberg): Make payload_type a config property instead.
+   virtual bool SendTelephoneEvent(int payload_type,
+                                   int payload_frequency,
+--- a/audio/audio_send_stream.h
++++ b/audio/audio_send_stream.h
+@@ -93,6 +93,8 @@
+                    SetParametersCallback callback) override;
+   void Start() override;
+   void Stop() override;
++  void SetExcludeFromAudioTransport(bool exclude) override;
++  bool exclude_from_audio_transport() const override;
+   void SendAudioData(std::unique_ptr<AudioFrame> audio_frame) override;
+   bool SendTelephoneEvent(int payload_type,
+                           int payload_frequency,
+@@ -181,6 +183,9 @@
+   int encoder_sample_rate_hz_ RTC_GUARDED_BY(worker_thread_checker_) = 0;
+   size_t encoder_num_channels_ RTC_GUARDED_BY(worker_thread_checker_) = 0;
+   bool sending_ RTC_GUARDED_BY(worker_thread_checker_) = false;
++  // HoneyCord (#62): Custom-Quelle (Bildschirm-Ton) -> nicht in den Router.
++  bool exclude_from_audio_transport_
++      RTC_GUARDED_BY(worker_thread_checker_) = false;
+   mutable Mutex audio_level_lock_;
+   // Keeps track of audio level, total audio energy and total samples duration.
+   // https://w3c.github.io/webrtc-stats/#dom-rtcaudiohandlerstats-totalaudioenergy
+--- a/audio/audio_send_stream.cc
++++ b/audio/audio_send_stream.cc
+@@ -373,10 +373,23 @@
+   }
+   channel_send_->StartSend();
+   sending_ = true;
+-  audio_state()->AddSendingStream(this, encoder_sample_rate_hz_,
+-                                  encoder_num_channels_);
++  // HoneyCord (#62): Custom-Quellen ueberspringen den AudioTransport-Router
++  // -> AddSendingStream startet fuer sie keine Mikrofon-Aufnahme.
++  if (!exclude_from_audio_transport_) {
++    audio_state()->AddSendingStream(this, encoder_sample_rate_hz_,
++                                    encoder_num_channels_);
++  }
+ }
+ 
++void AudioSendStream::SetExcludeFromAudioTransport(bool exclude) {
++  RTC_DCHECK_RUN_ON(&worker_thread_checker_);
++  exclude_from_audio_transport_ = exclude;
++}
++
++bool AudioSendStream::exclude_from_audio_transport() const {
++  return exclude_from_audio_transport_;
++}
++
+ void AudioSendStream::Stop() {
+   RTC_DCHECK_RUN_ON(&worker_thread_checker_);
+   if (!sending_) {
+@@ -577,7 +590,7 @@
+                                              size_t num_channels) {
+   encoder_sample_rate_hz_ = sample_rate_hz;
+   encoder_num_channels_ = num_channels;
+-  if (sending_) {
++  if (sending_ && !exclude_from_audio_transport_) {
+     // Update AudioState's information about the stream.
+     audio_state()->AddSendingStream(this, sample_rate_hz, num_channels);
+   }
+--- a/media/engine/webrtc_voice_engine.cc
++++ b/media/engine/webrtc_voice_engine.cc
+@@ -1011,6 +1011,13 @@
+     }
+     source->SetSink(this);
+     source_ = source;
++    // HoneyCord (#62): Custom-Quelle (Bildschirm-Ton) aus dem AudioTransport-
++    // Router nehmen, BEVOR UpdateSendState den Stream startet. Sonst startet
++    // AudioState::AddSendingStream fuer reinen Bildschirm-Ton die Mikrofon-
++    // Aufnahme (Windows senkt dann alle anderen Apps ab, "Ducking").
++    if (source->IsCustomSource() && stream_ != nullptr) {
++      stream_->SetExcludeFromAudioTransport(true);
++    }
+     UpdateSendState();
+   }
+ 
