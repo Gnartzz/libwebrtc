@@ -1,0 +1,67 @@
+diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
+--- a/modules/audio_device/win/audio_device_core_win.cc
++++ b/modules/audio_device/win/audio_device_core_win.cc
+@@ -24,6 +24,7 @@
+ #include <strsafe.h>
+ #include <uuids.h>
+ #include <windows.h>
++#include <audiopolicy.h>  // HoneyCord: IAudioSessionControl2 (Ducking-Opt-out)
+ 
+ #include <iomanip>
+ 
+@@ -2005,6 +2006,27 @@
+   // to be processed by the client.
+   hr = _ptrClientOut->SetEventHandle(_hRenderSamplesReadyEvent);
+   EXIT_ON_ERROR(hr);
++
++  // HoneyCord: Opt-out aus der Windows-Kommunikations-Absenkung ("Ducking").
++  // Ohne dies senkt Windows beim Oeffnen einer Kommunikations-Session ALLE
++  // anderen Apps (z. B. Spotify) um 80 % ab und stellt das beim Beenden nicht
++  // zurueck. Muss gesetzt sein, BEVOR die Session aktiv wird (MSDN).
++  {
++    IAudioSessionControl* pSessionCtrl = NULL;
++    if (SUCCEEDED(_ptrClientOut->GetService(__uuidof(IAudioSessionControl),
++                                             (void**)&pSessionCtrl)) &&
++        pSessionCtrl != NULL) {
++      IAudioSessionControl2* pSessionCtrl2 = NULL;
++      if (SUCCEEDED(pSessionCtrl->QueryInterface(
++              __uuidof(IAudioSessionControl2), (void**)&pSessionCtrl2)) &&
++          pSessionCtrl2 != NULL) {
++        HRESULT hrDuck = pSessionCtrl2->SetDuckingPreference(TRUE);
++        RTC_LOG(LS_INFO) << "HoneyCord: SetDuckingPreference(TRUE) hr=" << hrDuck;
++        SAFE_RELEASE(pSessionCtrl2);
++      }
++      SAFE_RELEASE(pSessionCtrl);
++    }
++  }
+ 
+   // Get an IAudioRenderClient interface.
+   SAFE_RELEASE(_ptrRenderClient);
+@@ -2295,6 +2317,27 @@
+   hr = _ptrClientIn->SetEventHandle(_hCaptureSamplesReadyEvent);
+   EXIT_ON_ERROR(hr);
+ 
++  // HoneyCord: Opt-out aus der Windows-Kommunikations-Absenkung ("Ducking").
++  // Ohne dies senkt Windows beim Oeffnen einer Kommunikations-Session ALLE
++  // anderen Apps (z. B. Spotify) um 80 % ab und stellt das beim Beenden nicht
++  // zurueck. Muss gesetzt sein, BEVOR die Session aktiv wird (MSDN).
++  {
++    IAudioSessionControl* pSessionCtrl = NULL;
++    if (SUCCEEDED(_ptrClientIn->GetService(__uuidof(IAudioSessionControl),
++                                             (void**)&pSessionCtrl)) &&
++        pSessionCtrl != NULL) {
++      IAudioSessionControl2* pSessionCtrl2 = NULL;
++      if (SUCCEEDED(pSessionCtrl->QueryInterface(
++              __uuidof(IAudioSessionControl2), (void**)&pSessionCtrl2)) &&
++          pSessionCtrl2 != NULL) {
++        HRESULT hrDuck = pSessionCtrl2->SetDuckingPreference(TRUE);
++        RTC_LOG(LS_INFO) << "HoneyCord: SetDuckingPreference(TRUE) hr=" << hrDuck;
++        SAFE_RELEASE(pSessionCtrl2);
++      }
++      SAFE_RELEASE(pSessionCtrl);
++    }
++  }
++
+   // Get an IAudioCaptureClient interface.
+   SAFE_RELEASE(_ptrCaptureClient);
+   hr = _ptrClientIn->GetService(__uuidof(IAudioCaptureClient),
