@@ -1,0 +1,174 @@
+HoneyCord #62 (Windows): Mikrofon-Aufnahme nur bei echter Mikrofon-Quelle.
+
+Bildschirmton wird als Custom-Quelle (kCustom) erzeugt und liefert seine
+Abtastwerte selbst; er hat deshalb keinen Audio-Transport. Bisher zaehlte
+sein Sendestream trotzdem in MuteStream mit -> is_all_muted wurde false ->
+adm->StartRecording() riss das Mikrofon auf, obwohl der Nutzer stumm war.
+Windows senkt daraufhin alle anderen Apps ab ("Ducking"), bis der Kanal
+verlassen wird. Portierung des macOS-Fixes, dort ueber HoneycordCustomAudioSource.
+
+--- a/api/media_stream_interface.h
++++ b/api/media_stream_interface.h
+@@ -268,6 +268,10 @@
+   // (for some of the settings this approach is broken, e.g. setting
+   // audio network adaptation on the source is the wrong layer of abstraction).
+   virtual const AudioOptions options() const;
++
++  // HoneyCord (#62/Windows): true bei Quellen, die ihre Abtastwerte selbst
++  // liefern (Bildschirm-Ton). Standard false -> Mikrofon-Quellen unveraendert.
++  virtual bool IsCustomSource() const { return false; }
+ };
+ 
+ // Interface of the audio processor used by the audio track to collect
+--- a/media/base/audio_source.h
++++ b/media/base/audio_source.h
+@@ -49,6 +49,12 @@
+   // to the source at a time.
+   virtual void SetSink(Sink* sink) = 0;
+ 
++  // HoneyCord (#62/Windows): Marker fuer Quellen, die ihre Abtastwerte selbst
++  // liefern (z. B. Bildschirm-Ton per WASAPI-Loopback). Solche Streams duerfen
++  // die Mikrofon-Aufnahme des ADM NICHT hochfahren. Standard false -> alle
++  // bestehenden, mikrofon-gespeisten Streams bleiben unveraendert.
++  virtual bool IsCustomSource() const { return false; }
++
+  protected:
+   virtual ~AudioSource() {}
+ };
+--- a/media/engine/webrtc_voice_engine.cc
++++ b/media/engine/webrtc_voice_engine.cc
+@@ -1019,6 +1019,16 @@
+     return source_ != nullptr;
+   }
+ 
++  // HoneyCord (#62): true nur bei einer ECHTEN Mikrofon-Quelle. Custom-
++  // Quellen (Bildschirm-Ton) zaehlen NICHT - sie liefern ihre Abtastwerte
++  // selbst und brauchen die ADM-Aufnahme nicht. Steuert, ob das Mikrofon
++  // hochgefahren wird, damit reiner Bildschirm-Ton es nicht ungewollt
++  // oeffnet (Windows senkt sonst alle anderen Apps ab; macOS: A2DP->HFP).
++  bool HasRealMicSource() const {
++    RTC_DCHECK_RUN_ON(&worker_thread_checker_);
++    return source_ != nullptr && !source_->IsCustomSource();
++  }
++
+   // Stops sending by setting the sink of the AudioSource to nullptr. No data
+   // callback will be received after this method.
+   // This method is called on the libjingle worker thread.
+@@ -1561,7 +1571,13 @@
+ 
+     // Initialize the ADM for recording (this may take time on some platforms,
+     // e.g. Android).
+-    if (options_.init_recording_on_send.value_or(true) &&
++    // HoneyCord (#62): nur hochfahren, wenn wirklich ein Mikrofon-Track
++    // sendet - nicht bei reinem Bildschirm-Ton (Custom-Quelle).
++    const bool has_real_mic_source =
++        std::any_of(send_streams_.begin(), send_streams_.end(),
++                    [](const auto& kv) { return kv.second->HasRealMicSource(); });
++    if (has_real_mic_source &&
++        options_.init_recording_on_send.value_or(true) &&
+         // InitRecording() may return an error if the ADM is already recording.
+         !engine()->adm()->RecordingIsInitialized() &&
+         !engine()->adm()->Recording()) {
+@@ -1774,9 +1790,24 @@
+         std::none_of(send_streams_.begin(), send_streams_.end(),
+                      [](const auto& kv) { return kv.second->HasSource(); });
+ 
++    // HoneyCord (#62): wie is_all_no_source, aber Custom-Quellen (Bildschirm-
++    // Ton) zaehlen als "kein Mikrofon".
++    bool is_all_no_mic_source =
++        std::none_of(send_streams_.begin(), send_streams_.end(),
++                     [](const auto& kv) { return kv.second->HasRealMicSource(); });
++
+     bool is_all_muted =
+         std::all_of(send_streams_.begin(), send_streams_.end(),
+                     [](const auto& kv) { return kv.second->IsMuted(); });
++
++    // HoneyCord (#62): Stummschalt-Zustand NUR ueber echte Mikrofon-Streams.
++    // Ein laufender Bildschirm-Ton-Stream ist nie stumm und wuerde sonst das
++    // Mikrofon aufreissen, obwohl der Nutzer stumm ist. Ohne Custom-Quellen
++    // ist dieser Wert identisch mit is_all_muted -> Verhalten unveraendert.
++    bool is_all_mic_muted = std::all_of(
++        send_streams_.begin(), send_streams_.end(), [](const auto& kv) {
++          return !kv.second->HasRealMicSource() || kv.second->IsMuted();
++        });
+ 
+     // Only mute the microphone if we're not in cleanup state
+     // (i.e. if we have active send streams)
+@@ -1787,25 +1818,32 @@
+       ap->set_output_will_be_muted(v);
+     }
+ 
+-    if (!is_all_no_source) {
++    // HoneyCord (#62): reiner Bildschirm-Ton (nur Custom-Quellen, kein echtes
++    // Mikrofon) zaehlt hier wie "cleanup" -> die Aufnahme bleibt aus.
++    if (!is_all_no_mic_source) {
+       // We don't mute when ClearSend() is called.
+       webrtc::AudioDeviceModule* adm = engine()->adm();
+       if (adm) {
+-        RTC_LOG(LS_INFO) << "WebRtcVoiceSendChannel::MuteStream: ADM:"
+-                         << is_all_muted;
++        RTC_LOG(LS_WARNING) << "HoneyCord MuteStream: mic_muted="
++                            << is_all_mic_muted << " all_muted=" << is_all_muted
++                            << " streams=" << send_streams_.size();
+ 
+         if (adm->IsStopOnMuteModeEnabled()) {
+-          if (!is_all_muted && !adm->Recording()) {
++          if (!is_all_mic_muted && !adm->Recording()) {
+             if (adm->InitRecording() == 0) {
+               adm->StartRecording();
+             }
+-          } else if (is_all_muted && adm->Recording()) {
++          } else if (is_all_mic_muted && adm->Recording()) {
+             adm->StopRecording();
+           }
+         } else {
+-          adm->SetMicrophoneMute(is_all_muted);
++          adm->SetMicrophoneMute(is_all_mic_muted);
+         }
+       }
++    } else {
++      RTC_LOG(LS_WARNING) << "HoneyCord MuteStream: kein Mikrofon-Stream - "
++                             "Aufnahme bleibt aus (streams="
++                          << send_streams_.size() << ")";
+     }
+   }
+ 
+--- a/pc/rtp_sender.h
++++ b/pc/rtp_sender.h
+@@ -332,11 +332,19 @@
+ 
+   // webrtc::AudioSource implementation.
+   void SetSink(AudioSource::Sink* sink) override;
++  bool IsCustomSource() const override { return custom_source_; }
++
++ public:
++  // HoneyCord (#62/Windows): wird vom AudioRtpSender gesetzt, wenn der Track
++  // aus einer Custom-Quelle (Bildschirm-Ton) gespeist wird.
++  void SetCustomSource(bool custom) { custom_source_ = custom; }
+ 
++ private:
+   AudioSource::Sink* sink_;
+   // Critical section protecting `sink_`.
+   Mutex lock_;
+   int num_preferred_channels_ = -1;
++  bool custom_source_ = false;
+ };
+ 
+ class AudioRtpSender : public DtmfProviderInterface, public RtpSenderBase {
+--- a/pc/rtp_sender.cc
++++ b/pc/rtp_sender.cc
+@@ -754,6 +754,14 @@
+ void AudioRtpSender::AttachTrack() {
+   RTC_DCHECK(track_);
+   cached_track_enabled_ = track_->enabled();
++  // HoneyCord (#62/Windows): Quellen, die ihre Abtastwerte selbst liefern
++  // (Bildschirm-Ton), am Sink-Adapter markieren. WebRtcVoiceSendChannel nutzt
++  // die Markierung, damit reiner Bildschirm-Ton nicht die Mikrofon-Aufnahme
++  // hochfaehrt (Windows senkt sonst alle anderen Apps ab, "Ducking").
++  // Bei jedem Anhaengen neu bestimmt -> ein wiederverwendeter Sender behaelt
++  // die Markierung eines alten Tracks nicht.
++  sink_adapter_->SetCustomSource(audio_track()->GetSource() != nullptr &&
++                                 audio_track()->GetSource()->IsCustomSource());
+   audio_track()->AddSink(sink_adapter_.get());
+ }
+ 
