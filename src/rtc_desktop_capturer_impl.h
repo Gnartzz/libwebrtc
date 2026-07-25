@@ -116,6 +116,9 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   // g_dev_ (statt CPU/GDI). Liefert wie InitGpu einen nativen Frame -> Vorschau
   // ueber den GPU-Ring (keine gelbe Kachel) + zero-copy Encode.
   bool InitGpuWindow(intptr_t hwnd);
+  // AMD (#77): WGC-Zero-Copy fuer den BILDSCHIRM (CreateForMonitor, ohne
+  // Vendor-Bindung). Spart den Vollbild-Readback des CPU-Wegs.
+  bool InitGpuScreenWgc();
   // Geteilte Pipeline-Einrichtung (Shader/Sampler/g_cached_/Pool/Ring) fuer beide
   // Quellen (DXGI-Bildschirm + WGC-Fenster), parametrisiert ueber die Quellgroesse.
   bool InitGpuPipeline(uint32_t src_w, uint32_t src_h);

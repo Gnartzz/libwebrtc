@@ -28,6 +28,7 @@
 #include "third_party/libyuv/include/libyuv.h"
 #ifdef WEBRTC_WIN
 #include "modules/desktop_capture/win/window_capture_utils.h"
+#include "modules/desktop_capture/win/screen_capture_utils.h"
 #include "modules/desktop_capture/win/screen_capturer_win_directx.h"
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
@@ -189,6 +190,12 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
   // Monitor-an-iGPU / kein-NVIDIA sauber durch -> CPU-Capturer uebernimmt.
   if (type_ == kScreen) {
     thread_->BlockingCall([this] { gpu_mode_ = InitGpu(); });
+    if (!gpu_mode_) {
+      // AMD (#77): kein NVIDIA-Zero-Copy -> Bildschirm per WGC auf der GPU
+      // abgreifen und dort verkleinern, statt jeden Frame in voller Groesse in
+      // den Hauptspeicher zu holen. Scheitert das, bleibt der CPU-Weg unten.
+      thread_->BlockingCall([this] { gpu_mode_ = InitGpuScreenWgc(); });
+    }
     if (!gpu_mode_ && !capturer_) {
       // GPU-Pfad inaktiv -> jetzt erst den webrtc-Bildschirm-Capturer bauen
       // (lazy, siehe Konstruktor). Ab hier darf DirectX/DxgiDuplicator
@@ -875,6 +882,111 @@ bool RTCDesktopCapturerImpl::InitGpuWindow(intptr_t hwnd) {
   wgc_mode_ = true;
   if (!InitGpuPipeline(wgc_w_, wgc_h_)) return false;  // ReleaseGpu schon drin
   HcCapLog("InitGpuWindow OK: Fenster %ux%u (WGC Zero-Copy aktiv)", wgc_w_, wgc_h_);
+  return true;
+}
+
+// WGC-Zero-Copy-Capture eines BILDSCHIRMS (AMD-Weg, #77). Baugleich zu
+// InitGpuWindow, nur mit CreateForMonitor statt CreateForWindow und OHNE
+// Vendor-Bindung (Standard-Hardware-Adapter).
+//
+// Zweck ist die BANDBREITE: der CPU-Weg holt JEDEN Frame in voller Groesse in den
+// Hauptspeicher (5120x1440 = 29,5 MB je Bild, bei 60fps 1,8 GB/s). GEMESSEN auf
+// der Radeon 890M kostete allein das Abgreifen 16-27 ms und deckelte die Rate auf
+// ~37 fps. Hier bleibt der Frame auf der GPU, wird per Shader auf die Zielgroesse
+// verkleinert, und erst der Encoder liest das KLEINE Bild zurueck (2560x720 =
+// 7,4 MB, ein Viertel). Scheitert irgendetwas, bleibt der CPU-Weg unveraendert.
+bool RTCDesktopCapturerImpl::InitGpuScreenWgc() {
+  using Microsoft::WRL::ComPtr;
+  HcCapLog("InitGpuScreenWgc Versuch (WGC-Bildschirm) source_id=%lld",
+           (long long)source_id_);
+
+  // --- Monitor bestimmen. WGC kann immer nur EINEN Monitor; die gesamte
+  // virtuelle Flaeche ueber mehrere Monitore kann CreateForMonitor nicht.
+  HMONITOR mon = nullptr;
+  if (source_id_ != -1) {
+    if (!webrtc::GetHmonitorFromDeviceIndex(source_id_, &mon)) {
+      HcCapLog("InitGpuScreenWgc FAIL @ kein HMONITOR zur Quelle");
+      return false;
+    }
+  } else if (GetSystemMetrics(SM_CMONITORS) == 1) {
+    POINT origin = {0, 0};
+    mon = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+  } else {
+    HcCapLog("InitGpuScreenWgc FAIL @ ganze Desktop-Spanne (mehrere Monitore)");
+    return false;
+  }
+  // Ohne gueltiges/aktives Display stuerzt CreateForMonitor auf aelteren
+  // Windows-Versionen ab (webrtc dokumentiert das in wgc_capture_source.cc).
+  if (!mon || !webrtc::IsMonitorValid(mon)) {
+    HcCapLog("InitGpuScreenWgc FAIL @ Monitor ungueltig");
+    return false;
+  }
+
+  // --- Device auf dem STANDARD-Hardware-Adapter (kein Vendor-Filter) ---
+  HRESULT hr;
+  D3D_FEATURE_LEVEL fl;
+  if (FAILED(hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                                    nullptr, 0, D3D11_SDK_VERSION, &g_dev_, &fl,
+                                    &g_ctx_))) {
+    HcCapLog("InitGpuScreenWgc FAIL @ D3D11CreateDevice: 0x%08X", (unsigned)hr);
+    return false;
+  }
+  // Capture-Thread (Render) und Encoder-Thread (CopyResource) teilen sich das
+  // Device -> Multithread-Schutz ist Pflicht (wie in InitGpu).
+  ComPtr<ID3D11Multithread> mt;
+  if (SUCCEEDED(g_ctx_.As(&mt))) mt->SetMultithreadProtected(TRUE);
+
+  wgc_.reset(new WgcState());
+
+  // --- WGC-Item aus dem Monitor ---
+  ComPtr<IGraphicsCaptureItemInterop> interop;
+  hr = webrtc::GetActivationFactory<
+      IGraphicsCaptureItemInterop,
+      RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem>(&interop);
+  if (FAILED(hr)) { HcCapLog("InitGpuScreenWgc FAIL @ ItemInterop: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+  hr = interop->CreateForMonitor(mon, IID_PPV_ARGS(&wgc_->item));
+  if (FAILED(hr) || !wgc_->item) { HcCapLog("InitGpuScreenWgc FAIL @ CreateForMonitor: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+  ABI::Windows::Graphics::SizeInt32 isize = {};
+  wgc_->item->get_Size(&isize);
+  if (isize.Width < 2 || isize.Height < 2) {
+    HcCapLog("InitGpuScreenWgc FAIL @ Item-Groesse %dx%d", isize.Width, isize.Height);
+    ReleaseGpu(); return false;
+  }
+
+  // --- IDirect3DDevice aus unserem g_dev_ ---
+  ComPtr<IDXGIDevice> dxgi_device;
+  if (FAILED(g_dev_.As(&dxgi_device)) || !webrtc::ResolveCoreWinRTDirect3DDelayload()) {
+    HcCapLog("InitGpuScreenWgc FAIL @ DXGIDevice/Delayload"); ReleaseGpu(); return false;
+  }
+  hr = webrtc::CreateDirect3DDeviceFromDXGIDevice(dxgi_device.Get(), &wgc_->device);
+  if (FAILED(hr)) { HcCapLog("InitGpuScreenWgc FAIL @ CreateDirect3DDevice: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+
+  // --- Frame-Pool (FreeThreaded) + Session ---
+  ComPtr<WGC::IDirect3D11CaptureFramePoolStatics> fps;
+  hr = webrtc::GetActivationFactory<
+      WGC::IDirect3D11CaptureFramePoolStatics,
+      RuntimeClass_Windows_Graphics_Capture_Direct3D11CaptureFramePool>(&fps);
+  ComPtr<WGC::IDirect3D11CaptureFramePoolStatics2> fps2;
+  if (FAILED(hr) || FAILED(fps.As(&fps2))) { HcCapLog("InitGpuScreenWgc FAIL @ FramePoolStatics"); ReleaseGpu(); return false; }
+  hr = fps2->CreateFreeThreaded(wgc_->device.Get(),
+       WGDX::DirectXPixelFormat_B8G8R8A8UIntNormalized, 2, isize, &wgc_->pool);
+  if (FAILED(hr)) { HcCapLog("InitGpuScreenWgc FAIL @ CreateFreeThreaded: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+  hr = wgc_->pool->CreateCaptureSession(wgc_->item.Get(), &wgc_->session);
+  if (FAILED(hr)) { HcCapLog("InitGpuScreenWgc FAIL @ CreateCaptureSession: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+  // Gelbe WGC-Border weg (Win11) + Cursor wie gewuenscht.
+  ComPtr<WGC::IGraphicsCaptureSession3> s3;
+  if (SUCCEEDED(wgc_->session.As(&s3))) s3->put_IsBorderRequired(false);
+  ComPtr<WGC::IGraphicsCaptureSession2> s2;
+  if (SUCCEEDED(wgc_->session.As(&s2))) s2->put_IsCursorCaptureEnabled(show_cursor_ ? TRUE : FALSE);
+  hr = wgc_->session->StartCapture();
+  if (FAILED(hr)) { HcCapLog("InitGpuScreenWgc FAIL @ StartCapture: 0x%08X", (unsigned)hr); ReleaseGpu(); return false; }
+
+  wgc_w_ = static_cast<uint32_t>(isize.Width);
+  wgc_h_ = static_cast<uint32_t>(isize.Height);
+  wgc_mode_ = true;
+  if (!InitGpuPipeline(wgc_w_, wgc_h_)) return false;  // ReleaseGpu schon drin
+  HcCapLog("InitGpuScreenWgc OK: Bildschirm %ux%u (WGC auf der GPU, kein Vollbild-Readback)",
+           wgc_w_, wgc_h_);
   return true;
 }
 
