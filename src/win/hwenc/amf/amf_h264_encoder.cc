@@ -5,7 +5,10 @@
 
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame_buffer.h"
+#include "libyuv/convert_argb.h"
 #include "libyuv/convert_from.h"
+
+#include "../../honeycord_d3d11_frame.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
@@ -104,6 +107,88 @@ int32_t AmfH264Encoder::InitEncode(const webrtc::VideoCodec* codec_settings,
   return InitAmfPipeline();
 }
 
+void AmfH264Encoder::ApplyEncoderProperties(amf::AMFComponent* enc) {
+  if (!enc) return;
+  enc->SetProperty(AMF_VIDEO_ENCODER_USAGE,
+                   AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY);
+  enc->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET,
+                   AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
+  enc->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+                   AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
+  enc->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE,
+                   static_cast<amf_int64>(target_bitrate_bps_));
+  enc->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE,
+                   static_cast<amf_int64>(max_bitrate_bps_));
+  enc->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE,
+                   ::AMFConstructRate(framerate_, 1));
+  enc->SetProperty(AMF_VIDEO_ENCODER_FRAMESIZE,
+                   ::AMFConstructSize(width_, height_));
+  enc->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, static_cast<amf_int64>(0));
+  enc->SetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN, static_cast<amf_int64>(0));
+  // Output style: in-stream SPS/PPS so the bitstream parser can fish them
+  // out of the first slices (same model as Momo's NVENC path).
+  enc->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, true);
+  enc->SetProperty(AMF_VIDEO_ENCODER_INSERT_PPS, true);
+}
+
+// Stufe 3 (#77): Encoder auf DEM D3D11-Device aufbauen, auf dem der Capturer
+// seine Textur haelt. Dann kann der fertige Frame GPU->GPU in die Encoder-
+// Oberflaeche wandern, statt per ToI420()-Readback ueber den Hauptspeicher zu
+// laufen (2560x720 = 7,4 MB je Bild, GEMESSEN ~8 ms Encoder-Zeit).
+//
+// Vorsichtsprinzip: die neue Kette wird komplett in lokalen Variablen aufgebaut
+// und erst bei vollem Erfolg uebernommen. Nimmt der Treiber BGRA nicht als
+// Encoder-Eingabe an (aeltere AMF-Versionen wollen NV12), bleibt der bestehende
+// Host-Pfad unveraendert in Betrieb und wir versuchen es nie wieder.
+bool AmfH264Encoder::EnsureNativeAmf(ID3D11Device* dev) {
+  if (dx11_failed_ || !dev) return false;
+  if (dx11_mode_ && d3d11_device_.Get() == dev) return true;
+
+  amf::AMFContextPtr ctx;
+  amf::AMFComponentPtr enc;
+  amf::AMFFactory* factory = g_AMFFactory.GetFactory();
+  if (!factory || factory->CreateContext(&ctx) != AMF_OK || !ctx) {
+    RTC_LOG(LS_WARNING) << "AmfH264Encoder: DX11 CreateContext fehlgeschlagen";
+    dx11_failed_ = true;
+    return false;
+  }
+  if (ctx->InitDX11(dev) != AMF_OK) {
+    RTC_LOG(LS_WARNING) << "AmfH264Encoder: InitDX11(Capturer-Device) fehlgeschlagen";
+    ctx->Terminate();
+    dx11_failed_ = true;
+    return false;
+  }
+  if (factory->CreateComponent(ctx, kAmfH264Encoder, &enc) != AMF_OK || !enc) {
+    RTC_LOG(LS_WARNING) << "AmfH264Encoder: DX11 CreateComponent fehlgeschlagen";
+    ctx->Terminate();
+    dx11_failed_ = true;
+    return false;
+  }
+  ApplyEncoderProperties(enc);
+  if (enc->Init(amf::AMF_SURFACE_BGRA, width_, height_) != AMF_OK) {
+    RTC_LOG(LS_WARNING) << "AmfH264Encoder: BGRA-Eingabe nicht unterstuetzt "
+                           "-> bleibe beim Host-Pfad";
+    enc->Terminate();
+    ctx->Terminate();
+    dx11_failed_ = true;
+    return false;
+  }
+
+  // Umschalten: alte Kette abbauen, neue uebernehmen.
+  if (amf_encoder_) amf_encoder_->Terminate();
+  if (amf_context_) amf_context_->Terminate();
+  amf_encoder_ = enc;
+  amf_context_ = ctx;
+  d3d11_device_ = dev;
+  d3d11_context_.Reset();
+  dev->GetImmediateContext(&d3d11_context_);
+  dx11_mode_ = true;
+  force_keyframe_ = true;  // neuer Encoder -> Empfaenger brauchen ein Keyframe
+  RTC_LOG(LS_INFO) << "AmfH264Encoder: GPU-Zero-Copy aktiv (BGRA auf dem "
+                      "Capturer-Device, kein Readback mehr)";
+  return true;
+}
+
 int32_t AmfH264Encoder::InitAmfPipeline() {
   if (g_AMFFactory.Init() != AMF_OK) {
     RTC_LOG(LS_ERROR) << "AmfH264Encoder: AMF runtime not loadable";
@@ -133,28 +218,7 @@ int32_t AmfH264Encoder::InitAmfPipeline() {
   //  * Rate control = CBR (constant bitrate; matches WebRTC's pacer model)
   //  * IDR period = infinite — keyframes are driven by WebRTC RTCP requests
   //  * B-frames off (1 reference frame between keyframes)
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_USAGE,
-                             AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY);
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET,
-                             AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
-                             AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE,
-                             static_cast<amf_int64>(target_bitrate_bps_));
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE,
-                             static_cast<amf_int64>(max_bitrate_bps_));
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE,
-                             ::AMFConstructRate(framerate_, 1));
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_FRAMESIZE,
-                             ::AMFConstructSize(width_, height_));
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD,
-                             static_cast<amf_int64>(0));
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN,
-                             static_cast<amf_int64>(0));
-  // Output style: in-stream SPS/PPS so the bitstream parser can fish them
-  // out of the first slices (same model as Momo's NVENC path).
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, true);
-  amf_encoder_->SetProperty(AMF_VIDEO_ENCODER_INSERT_PPS, true);
+  ApplyEncoderProperties(amf_encoder_);
 
   if (amf_encoder_->Init(amf::AMF_SURFACE_NV12, width_, height_) != AMF_OK) {
     RTC_LOG(LS_ERROR) << "AmfH264Encoder: encoder->Init failed";
@@ -190,6 +254,12 @@ void AmfH264Encoder::ReleaseAmfPipeline() {
     amf_context_->Terminate();
     amf_context_ = nullptr;
   }
+  // Stufe 3: Zustand zuruecksetzen, damit sich der GPU-Pfad nach einem Neu-Init
+  // (z.B. Aufloesungswechsel) frisch etablieren kann.
+  d3d11_context_.Reset();
+  d3d11_device_.Reset();
+  dx11_mode_ = false;
+  dx11_failed_ = false;
 }
 
 int32_t AmfH264Encoder::Encode(
@@ -219,30 +289,71 @@ int32_t AmfH264Encoder::Encode(
     reconfigure_needed_ = false;
   }
 
-  // Allocate an NV12 host-side AMF surface and copy the I420 frame in.
-  // For our use-case (libwebrtc receives I420 from desktop_capturer and
-  // camera capturer in software) host-memory transfer is fine; AMF copies
-  // it onto the GPU when SubmitInput is invoked.
-  amf::AMFSurfacePtr surface;
-  if (amf_context_->AllocSurface(amf::AMF_MEMORY_HOST, amf::AMF_SURFACE_NV12,
-                                  width_, height_, &surface) != AMF_OK) {
-    RTC_LOG(LS_WARNING) << "AmfH264Encoder: AllocSurface failed";
-    return WEBRTC_VIDEO_CODEC_ERROR;
+  // Stufe 3 (#77): Liegt der Frame schon als GPU-Textur vor (unser Bildschirm-
+  // Capturer liefert kNative), geht er ohne Umweg ueber den Hauptspeicher in
+  // den Encoder. Sonst der bisherige Host-Pfad (Kamera, CPU-Fallback,
+  // Adaptation): Frame nach I420 holen und in eine Host-Oberflaeche schreiben.
+  honeycord::D3D11FrameBuffer* nb = nullptr;
+  if (frame.video_frame_buffer()->type() ==
+          webrtc::VideoFrameBuffer::Type::kNative &&
+      frame.video_frame_buffer()->width() == static_cast<int>(width_) &&
+      frame.video_frame_buffer()->height() == static_cast<int>(height_)) {
+    nb = static_cast<honeycord::D3D11FrameBuffer*>(
+        frame.video_frame_buffer().get());
   }
 
-  amf::AMFPlane* y_plane = surface->GetPlaneAt(0);
-  amf::AMFPlane* uv_plane = surface->GetPlaneAt(1);
-  uint8_t* y_dst = static_cast<uint8_t*>(y_plane->GetNative());
-  uint8_t* uv_dst = static_cast<uint8_t*>(uv_plane->GetNative());
+  amf::AMFSurfacePtr surface;
+  bool gpu_path = false;
+  if (nb && nb->texture() && EnsureNativeAmf(nb->device())) {
+    if (amf_context_->AllocSurface(amf::AMF_MEMORY_DX11, amf::AMF_SURFACE_BGRA,
+                                    width_, height_, &surface) == AMF_OK &&
+        surface) {
+      amf::AMFPlane* plane = surface->GetPlaneAt(0);
+      ID3D11Texture2D* dst =
+          plane ? static_cast<ID3D11Texture2D*>(plane->GetNative()) : nullptr;
+      if (dst && d3d11_context_) {
+        // Bewusst eine Kopie statt eines Direktverweises auf die Capturer-
+        // Textur: der Capturer schreibt seinen Ring weiter, waehrend der
+        // Encoder liest. Die Kopie bleibt auf der GPU (kein Readback).
+        d3d11_context_->CopyResource(dst, nb->texture());
+        gpu_path = true;
+      }
+    }
+    if (!gpu_path) {
+      surface = nullptr;
+      RTC_LOG(LS_WARNING) << "AmfH264Encoder: DX11-Oberflaeche fehlgeschlagen "
+                             "-> Host-Pfad fuer diesen Frame";
+    }
+  }
 
-  webrtc::scoped_refptr<const webrtc::I420BufferInterface> i420 =
-      frame.video_frame_buffer()->ToI420();
-  libyuv::I420ToNV12(
-      i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(),
-      i420->DataV(), i420->StrideV(),
-      y_dst, y_plane->GetHPitch(),
-      uv_dst, uv_plane->GetHPitch(),
-      width_, height_);
+  if (!gpu_path) {
+    // Das Format muss zu dem passen, mit dem der Encoder initialisiert wurde.
+    const amf::AMF_SURFACE_FORMAT host_fmt =
+        dx11_mode_ ? amf::AMF_SURFACE_BGRA : amf::AMF_SURFACE_NV12;
+    if (amf_context_->AllocSurface(amf::AMF_MEMORY_HOST, host_fmt, width_,
+                                    height_, &surface) != AMF_OK) {
+      RTC_LOG(LS_WARNING) << "AmfH264Encoder: AllocSurface failed";
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    webrtc::scoped_refptr<const webrtc::I420BufferInterface> i420 =
+        frame.video_frame_buffer()->ToI420();
+    if (dx11_mode_) {
+      amf::AMFPlane* plane = surface->GetPlaneAt(0);
+      libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(),
+                         i420->StrideU(), i420->DataV(), i420->StrideV(),
+                         static_cast<uint8_t*>(plane->GetNative()),
+                         plane->GetHPitch(), width_, height_);
+    } else {
+      amf::AMFPlane* y_plane = surface->GetPlaneAt(0);
+      amf::AMFPlane* uv_plane = surface->GetPlaneAt(1);
+      libyuv::I420ToNV12(
+          i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(),
+          i420->DataV(), i420->StrideV(),
+          static_cast<uint8_t*>(y_plane->GetNative()), y_plane->GetHPitch(),
+          static_cast<uint8_t*>(uv_plane->GetNative()), uv_plane->GetHPitch(),
+          width_, height_);
+    }
+  }
 
   if (force_keyframe_) {
     surface->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE,

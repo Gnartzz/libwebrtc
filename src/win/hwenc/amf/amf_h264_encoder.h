@@ -53,6 +53,13 @@ class AmfH264Encoder : public webrtc::VideoEncoder {
  private:
   int32_t InitAmfPipeline();
   void ReleaseAmfPipeline();
+  // Stufe 3 (#77): Encoder-Einstellungen an eine Komponente haengen. Beide
+  // Pfade (Host und GPU) teilen sich damit exakt dieselbe Konfiguration.
+  void ApplyEncoderProperties(amf::AMFComponent* enc);
+  // Encoder auf dem D3D11-Device des Capturers aufbauen (Eingabe = BGRA-Textur).
+  // Umgeschaltet wird erst bei vollem Erfolg; scheitert etwas, laeuft der
+  // bestehende Host-Pfad unveraendert weiter.
+  bool EnsureNativeAmf(ID3D11Device* dev);
   void DrainEncoderTo(webrtc::VideoFrameType frame_type_hint,
                       uint32_t rtp_timestamp,
                       int64_t ntp_time_ms,
@@ -73,6 +80,9 @@ class AmfH264Encoder : public webrtc::VideoEncoder {
   bool reconfigure_needed_ = false;
   bool force_keyframe_ = false;
   bool screensharing_mode_ = false;
+  // Stufe 3: Encoder laeuft auf dem Capturer-Device und nimmt BGRA-Texturen an.
+  bool dx11_mode_ = false;
+  bool dx11_failed_ = false;  // einmal gescheitert -> nicht erneut versuchen
 
   Microsoft::WRL::ComPtr<ID3D11Device> d3d11_device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> d3d11_context_;
