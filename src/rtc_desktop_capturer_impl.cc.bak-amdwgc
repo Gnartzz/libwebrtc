@@ -193,16 +193,8 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
       // GPU-Pfad inaktiv -> jetzt erst den webrtc-Bildschirm-Capturer bauen
       // (lazy, siehe Konstruktor). Ab hier darf DirectX/DxgiDuplicator
       // initialisieren, da kein GPU-Pfad mehr um die eine erlaubte Monitor-
-      // Duplication konkurriert. AMD (#77): WGC-Bildschirm-Capturer. GDI lieferte
-      // zwar ein echtes Bild, aber nur ~18 fps (CPU-BitBlt von 5120x1440). WGC
-      // nutzt den GPU-Compositor (Grab ~12 ms -> bis 60 fps) und captured auch
-      // Spiele/HW-Inhalte; vendor-neutral. Faellt WGC zur Laufzeit aus, waehlt
-      // CreateScreenCapturer weiter DXGI/GDI.
+      // Duplication konkurriert.
       thread_->BlockingCall([this] {
-#if defined(RTC_ENABLE_WIN_WGC)
-        options_.set_allow_wgc_screen_capturer(true);
-        HcCapLog("AMD-Fallback: WGC-Screen aktiviert");
-#endif
         if (show_cursor_) {
           capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
               webrtc::DesktopCapturer::CreateScreenCapturer(options_), options_);
@@ -323,87 +315,45 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
     }
 
     int64_t hc_tc = webrtc::TimeMillis();
-
-    // AMD (#77): Vollbild-Screen ZUERST in ARGB herunterskalieren, erst das
-    // kleine Bild nach I420 umwandeln. Spart auf grossen Panels (32:9 = 7,4
-    // MPixel) die volle ConvertToI420 der Monitor-Aufloesung -> mehr fps. Nur
-    // ohne Crop (x_/y_/w_/h_ = 0); sonst der generische Pfad darunter.
-    webrtc::scoped_refptr<webrtc::I420BufferInterface> out_buffer;
-    bool hc_fast = false;
+    libyuv::ConvertToI420(frame->data(), 0, i420_buffer_->MutableDataY(),
+                          i420_buffer_->StrideY(), i420_buffer_->MutableDataU(),
+                          i420_buffer_->StrideU(), i420_buffer_->MutableDataV(),
+                          i420_buffer_->StrideV(), x_, y_,
 #ifdef WEBRTC_WIN
-    if (type_ == kScreen && x_ == 0 && y_ == 0 && w_ == 0 && h_ == 0 &&
-        max_width_ > 0 && max_height_ > 0) {
-      int src_w = rect_.width();
-      int src_h = rect_.height();
-      double s = static_cast<double>(max_width_) / src_w;
-      double sy = static_cast<double>(max_height_) / src_h;
-      if (sy < s) s = sy;
-      if (s < 1.0 && src_w > 0 && src_h > 0) {
-        int dst_w = (static_cast<int>(src_w * s)) & ~1;
-        int dst_h = (static_cast<int>(src_h * s)) & ~1;
-        if (dst_w > 1 && dst_h > 1) {
-          size_t need = static_cast<size_t>(dst_w) * 4 * dst_h;
-          if (hc_argb_scaled_.size() != need) hc_argb_scaled_.resize(need);
-          libyuv::ARGBScale(frame->data(), frame->stride(), src_w, src_h,
-                            hc_argb_scaled_.data(), dst_w * 4, dst_w, dst_h,
-                            libyuv::kFilterBilinear);
-          if (!scaled_buffer_ || scaled_buffer_->width() != dst_w ||
-              scaled_buffer_->height() != dst_h) {
-            scaled_buffer_ = webrtc::I420Buffer::Create(dst_w, dst_h);
-          }
-          libyuv::ARGBToI420(
-              hc_argb_scaled_.data(), dst_w * 4,
-              scaled_buffer_->MutableDataY(), scaled_buffer_->StrideY(),
-              scaled_buffer_->MutableDataU(), scaled_buffer_->StrideU(),
-              scaled_buffer_->MutableDataV(), scaled_buffer_->StrideV(),
-              dst_w, dst_h);
-          out_buffer = scaled_buffer_;
-          hc_fast = true;
-        }
-      }
-    }
-#endif
-    if (!hc_fast) {
-      libyuv::ConvertToI420(frame->data(), 0, i420_buffer_->MutableDataY(),
-                            i420_buffer_->StrideY(), i420_buffer_->MutableDataU(),
-                            i420_buffer_->StrideU(), i420_buffer_->MutableDataV(),
-                            i420_buffer_->StrideV(), x_, y_,
-#ifdef WEBRTC_WIN
-                            rect_.width(), rect_.height(),
+                          rect_.width(), rect_.height(),
 #else
-                            width, height,
+                          width, height,
 #endif
-                            width, height, libyuv::kRotate0, libyuv::FOURCC_ARGB);
+                          width, height, libyuv::kRotate0, libyuv::FOURCC_ARGB);
 
-      // Optional max-resolution clamp (preserves aspect ratio). Required on
-      // Windows where the native DesktopCapturer always emits at monitor
-      // resolution and runtime scaleResolutionDownBy on RTPSender is not
-      // honored for desktop sources. Downscale here via libyuv before the
-      // frame reaches the encoder.
-      out_buffer = i420_buffer_;
-      if (max_width_ > 0 && max_height_ > 0 &&
-          (i420_buffer_->width() > static_cast<int>(max_width_) ||
-           i420_buffer_->height() > static_cast<int>(max_height_))) {
-        double sx = static_cast<double>(max_width_) / i420_buffer_->width();
-        double sy = static_cast<double>(max_height_) / i420_buffer_->height();
-        double scale = sx < sy ? sx : sy;
-        int dst_w = static_cast<int>(i420_buffer_->width() * scale) & ~1;
-        int dst_h = static_cast<int>(i420_buffer_->height() * scale) & ~1;
-        if (!scaled_buffer_ || scaled_buffer_->width() != dst_w ||
-            scaled_buffer_->height() != dst_h) {
-          scaled_buffer_ = webrtc::I420Buffer::Create(dst_w, dst_h);
-        }
-        libyuv::I420Scale(
-            i420_buffer_->DataY(), i420_buffer_->StrideY(),
-            i420_buffer_->DataU(), i420_buffer_->StrideU(),
-            i420_buffer_->DataV(), i420_buffer_->StrideV(),
-            i420_buffer_->width(), i420_buffer_->height(),
-            scaled_buffer_->MutableDataY(), scaled_buffer_->StrideY(),
-            scaled_buffer_->MutableDataU(), scaled_buffer_->StrideU(),
-            scaled_buffer_->MutableDataV(), scaled_buffer_->StrideV(),
-            dst_w, dst_h, libyuv::kFilterBilinear);
-        out_buffer = scaled_buffer_;
+    // Optional max-resolution clamp (preserves aspect ratio). Required on
+    // Windows where the native DesktopCapturer always emits at monitor
+    // resolution and runtime scaleResolutionDownBy on RTPSender is not
+    // honored for desktop sources. Downscale here via libyuv before the
+    // frame reaches the encoder.
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> out_buffer = i420_buffer_;
+    if (max_width_ > 0 && max_height_ > 0 &&
+        (i420_buffer_->width() > static_cast<int>(max_width_) ||
+         i420_buffer_->height() > static_cast<int>(max_height_))) {
+      double sx = static_cast<double>(max_width_) / i420_buffer_->width();
+      double sy = static_cast<double>(max_height_) / i420_buffer_->height();
+      double scale = sx < sy ? sx : sy;
+      int dst_w = static_cast<int>(i420_buffer_->width() * scale) & ~1;
+      int dst_h = static_cast<int>(i420_buffer_->height() * scale) & ~1;
+      if (!scaled_buffer_ || scaled_buffer_->width() != dst_w ||
+          scaled_buffer_->height() != dst_h) {
+        scaled_buffer_ = webrtc::I420Buffer::Create(dst_w, dst_h);
       }
+      libyuv::I420Scale(
+          i420_buffer_->DataY(), i420_buffer_->StrideY(),
+          i420_buffer_->DataU(), i420_buffer_->StrideU(),
+          i420_buffer_->DataV(), i420_buffer_->StrideV(),
+          i420_buffer_->width(), i420_buffer_->height(),
+          scaled_buffer_->MutableDataY(), scaled_buffer_->StrideY(),
+          scaled_buffer_->MutableDataU(), scaled_buffer_->StrideU(),
+          scaled_buffer_->MutableDataV(), scaled_buffer_->StrideV(),
+          dst_w, dst_h, libyuv::kFilterBilinear);
+      out_buffer = scaled_buffer_;
     }
 
     g_hc_conv_ms = static_cast<int>(webrtc::TimeMillis() - hc_tc);

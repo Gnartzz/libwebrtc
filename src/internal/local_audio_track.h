@@ -24,6 +24,12 @@ class LocalAudioSource : public Notifier<AudioSourceInterface>, AudioSender {
 
   const webrtc::AudioOptions options() const override { return options_; }
 
+  // HoneyCord (#62/Windows): Custom-Quellen (kCustom, z. B. Bildschirm-Ton)
+  // werden ohne Audio-Transport erzeugt - sie liefern ihre Abtastwerte selbst
+  // (siehe RTCPeerConnectionFactoryImpl::CreateAudioSourceWithOptions).
+  // Genau daran erkennt der Sendepfad, dass er dafuer kein Mikrofon oeffnen muss.
+  bool IsCustomSource() const override { return audio_transport_ == nullptr; }
+
   void AddSink(AudioTrackSinkInterface* sink) override {
     webrtc::MutexLock lock(&sink_lock_);
     if (std::find(sinks_.begin(), sinks_.end(), sink) != sinks_.end()) {

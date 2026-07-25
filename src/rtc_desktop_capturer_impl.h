@@ -17,6 +17,8 @@
 #ifndef LIBWEBRTC_RTC_DESKTOP_CAPTURER_IMPL_HXX
 #define LIBWEBRTC_RTC_DESKTOP_CAPTURER_IMPL_HXX
 
+#include <vector>
+
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
 #include "include/rtc_desktop_capturer.h"
@@ -99,6 +101,8 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   uint32_t max_width_ = 0;
   uint32_t max_height_ = 0;
   webrtc::scoped_refptr<webrtc::I420Buffer> scaled_buffer_;
+  std::vector<uint8_t> hc_argb_scaled_;  // AMD (#77): ARGB-Scratch fuer
+                                         // Downscale-vor-Umwandlung (Screen)
   bool gpu_mode_ = false;  // Zero-Copy-GPU-Pfad aktiv (Screen+NVIDIA); sonst CPU
   bool show_cursor_ = true;  // fuer die LAZY-Erzeugung des Screen-Capturers in
                              // Start() (Cursor-Variante), siehe .cc-Konstruktor
