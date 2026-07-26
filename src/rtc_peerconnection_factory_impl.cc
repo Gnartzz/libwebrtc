@@ -1,4 +1,5 @@
 #include "rtc_peerconnection_factory_impl.h"
+#include "rtc_base/logging.h"
 
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
@@ -352,12 +353,29 @@ scoped_refptr<RTCVideoTrack> RTCPeerConnectionFactoryImpl::CreateVideoTrack(
 
 scoped_refptr<RTCAudioTrack> RTCPeerConnectionFactoryImpl::CreateAudioTrack(
     scoped_refptr<RTCAudioSource> source, const string track_id) {
+  // honeycord: defensiv. Auf Linux OHNE nutzbares Audiogeraet kam hier ein
+  // Nullzugriff -> SIGSEGV (GEMESSEN auf Fedora 42 in einer VM ohne Soundkarte).
+  // Ein Absturz ist die schlechteste Antwort auf "kein Mikrofon"; lieber eine
+  // leere Spur zurueckgeben und die Anwendung entscheiden lassen.
   RTCAudioSourceImpl* source_impl =
       static_cast<RTCAudioSourceImpl*>(source.get());
+  if (!source_impl || !rtc_peerconnection_factory_) {
+    RTC_LOG(LS_ERROR) << "CreateAudioTrack: keine Audio-Quelle verfuegbar";
+    return scoped_refptr<RTCAudioTrack>();
+  }
+  auto rtc_source = source_impl->rtc_audio_source();
+  if (!rtc_source) {
+    RTC_LOG(LS_ERROR) << "CreateAudioTrack: Audio-Quelle ohne Unterbau";
+    return scoped_refptr<RTCAudioTrack>();
+  }
 
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> audio_track(
-      rtc_peerconnection_factory_->CreateAudioTrack(
-          to_std_string(track_id), source_impl->rtc_audio_source().get()));
+      rtc_peerconnection_factory_->CreateAudioTrack(to_std_string(track_id),
+                                                    rtc_source.get()));
+  if (!audio_track) {
+    RTC_LOG(LS_ERROR) << "CreateAudioTrack: webrtc lieferte keine Spur";
+    return scoped_refptr<RTCAudioTrack>();
+  }
 
   scoped_refptr<AudioTrackImpl> track = scoped_refptr<AudioTrackImpl>(
       new RefCountedObject<AudioTrackImpl>(audio_track));

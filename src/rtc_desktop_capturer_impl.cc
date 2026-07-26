@@ -18,6 +18,7 @@
 
 #include "api/sequence_checker.h"
 #include "rtc_base/checks.h"
+#include "rtc_base/logging.h"
 #include "third_party/libyuv/include/libyuv.h"
 #ifdef WEBRTC_WIN
 #include "modules/desktop_capture/win/window_capture_utils.h"
@@ -44,9 +45,11 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
   options_.set_allow_directx_capturer(true);
 #endif
 #ifdef WEBRTC_LINUX
-  if (type == kScreen) {
-    options_.set_allow_pipewire(true);
-  }
+  // honeycord: PipeWire fuer BEIDE Typen. Unter Wayland ist die X11-Aufzaehlung
+  // nicht erlaubt; fuer Fenster kam deshalb nullptr zurueck -> Absturz weiter
+  // unten. Die Auswahl trifft dort ohnehin der Portal-Dialog des Systems.
+  (void)type;
+  options_.set_allow_pipewire(true);
 #endif
   thread_->BlockingCall([this, type, showCursor] {
     if (type == kScreen) {
@@ -102,7 +105,7 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
   capture_delay_ = interval_ms > 4 ? interval_ms / 2 : 1;
 
   if (source_id_ != -1) {
-    if (!capturer_->SelectSource(source_id_)) {
+    if (!capturer_ || !capturer_->SelectSource(source_id_)) {
       capture_state_ = CS_FAILED;
       return capture_state_;
     }
@@ -114,6 +117,12 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
     }
   }
 
+  // honeycord: ohne Aufnehmer sauber scheitern statt Nullzugriff.
+  if (!capturer_) {
+    RTC_LOG(LS_ERROR) << "RTCDesktopCapturer: kein Aufnehmer verfuegbar";
+    capture_state_ = CS_FAILED;
+    return capture_state_;
+  }
   thread_->BlockingCall([this] { capturer_->Start(this); });
   capture_state_ = CS_RUNNING;
   thread_->PostTask([this] { CaptureFrame(); });
@@ -251,6 +260,7 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
 void RTCDesktopCapturerImpl::CaptureFrame() {
   RTC_DCHECK_RUN_ON(thread_.get());
   if (capture_state_ == CS_RUNNING) {
+    if (!capturer_) return;
     capturer_->CaptureFrame();
     thread_->PostDelayedHighPrecisionTask(
         [this]() { CaptureFrame(); },
