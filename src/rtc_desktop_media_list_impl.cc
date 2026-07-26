@@ -19,6 +19,9 @@
 #include "internal/jpeg_util.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
+
+#include <cstdlib>
+#include <string>
 #include "third_party/libyuv/include/libyuv.h"
 
 #ifdef WEBRTC_WIN
@@ -50,6 +53,23 @@ RTCDesktopMediaListImpl::RTCDesktopMediaListImpl(DesktopType type,
   options_.set_allow_pipewire(true);
 #endif
   callback_ = std::make_unique<CallbackProxy>();
+#ifdef WEBRTC_LINUX
+  // Unter Wayland oeffnet JEDE Aufnehmer-Erzeugung einen Portal-Dialog. Ein
+  // Aufnehmer nur zum Auflisten wuerde den Nutzer also ein zweites Mal fragen -
+  // und die eigentliche Freigabe haengt dann an der falschen Portal-Sitzung
+  // (GEMESSEN auf Fedora 42: erster Versuch liefert null Bilder, erst der zweite
+  // funktioniert). Deshalb hier gar nicht erst auflisten: die Auswahl trifft
+  // ohnehin der Portal-Dialog beim Start der Aufnahme.
+  {
+    const char* session = getenv("XDG_SESSION_TYPE");
+    synth_sources_ = session && std::string(session) == "wayland";
+  }
+  if (synth_sources_) {
+    RTC_LOG(LS_INFO) << "RTCDesktopMediaList: Wayland erkannt - Quellen werden "
+                        "nicht aufgezaehlt (die Auswahl macht das System)";
+    return;
+  }
+#endif
   thread_->BlockingCall([this, type] {
     if (type == kScreen) {
       capturer_ = webrtc::DesktopCapturer::CreateScreenCapturer(options_);
@@ -83,10 +103,19 @@ int32_t RTCDesktopMediaListImpl::UpdateSourceList(bool force_reload,
   }
 
   webrtc::DesktopCapturer::SourceList new_sources;
-  thread_->BlockingCall(
-      [this, &new_sources] {
-        if (capturer_) capturer_->GetSourceList(&new_sources);
-      });
+  if (synth_sources_) {
+    // EINE Sammel-Quelle. Welcher Bildschirm bzw. welches Fenster es wird,
+    // entscheidet der Nutzer gleich darauf im Dialog des Systems.
+    webrtc::DesktopCapturer::Source s;
+    s.id = 0;
+    s.title = (type_ == kScreen) ? "Bildschirm" : "Fenster";
+    new_sources.push_back(s);
+  } else {
+    thread_->BlockingCall(
+        [this, &new_sources] {
+          if (capturer_) capturer_->GetSourceList(&new_sources);
+        });
+  }
 
   typedef std::set<webrtc::DesktopCapturer::SourceId> SourceSet;
   SourceSet new_source_set;

@@ -120,6 +120,9 @@ class RTCDesktopMediaListImpl : public RTCDesktopMediaList {
   std::unique_ptr<CallbackProxy> callback_;
   webrtc::DesktopCaptureOptions options_;
   std::unique_ptr<webrtc::DesktopCapturer> capturer_;
+  // honeycord/Wayland: dort wird KEIN Aufnehmer zum Auflisten erzeugt (jede
+  // Erzeugung oeffnet einen Portal-Dialog) - die Liste wird synthetisiert.
+  bool synth_sources_ = false;
   std::unique_ptr<webrtc::Thread> thread_;
   std::vector<scoped_refptr<MediaSourceImpl>> sources_;
   MediaListObserver* observer_ = nullptr;
