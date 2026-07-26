@@ -109,9 +109,10 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
   options_.set_allow_directx_capturer(true);
 #endif
 #ifdef WEBRTC_LINUX
-  if (type == kScreen) {
-    options_.set_allow_pipewire(true);
-  }
+  // honeycord: PipeWire fuer BEIDE Typen (siehe rtc_desktop_media_list_impl.cc).
+  // Unter Wayland ist der X11-Weg nicht nutzbar und liefert nullptr.
+  (void)type;
+  options_.set_allow_pipewire(true);
 #endif
   show_cursor_ = showCursor;
   thread_->BlockingCall([this, type, showCursor] {
@@ -214,6 +215,14 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
                        : "Start: WGC fehlgeschlagen -> CPU-Window-Capturer");
   }
 #endif
+
+  // honeycord: ohne Aufnehmer (Create*Capturer lieferte nullptr, z.B. Wayland
+  // ohne Portal) sauber scheitern statt in einen Nullzugriff zu laufen.
+  if (!gpu_mode_ && !capturer_) {
+    RTC_LOG(LS_ERROR) << "RTCDesktopCapturer: kein Aufnehmer verfuegbar";
+    capture_state_ = CS_FAILED;
+    return capture_state_;
+  }
 
   if (!gpu_mode_ && source_id_ != -1) {
     if (!capturer_->SelectSource(source_id_)) {
@@ -953,7 +962,7 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
         }
         if (capturer_) {
           if (source_id_ != -1) capturer_->SelectSource(source_id_);
-          capturer_->Start(this);
+          capturer_->Start(this);  // capturer_ oben bereits geprueft
         } else {
           HcCapLog("ACCESS_LOST: CPU-Fallback fehlgeschlagen -> Capture ENDET");
           capture_state_ = CS_FAILED;
@@ -1068,6 +1077,7 @@ void RTCDesktopCapturerImpl::CaptureFrame() {
     // -> 15fps). Subtract the elapsed work so we hit capture_delay_, not
     // delay+work.
     int64_t t0 = webrtc::TimeMillis();
+    if (!capturer_) return;  // Aufnehmer weggefallen -> Schleife beenden
     capturer_->CaptureFrame();
     int64_t elapsed = webrtc::TimeMillis() - t0;
     int64_t next_ms = static_cast<int64_t>(capture_delay_) - elapsed;

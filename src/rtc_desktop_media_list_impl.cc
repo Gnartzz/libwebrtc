@@ -18,6 +18,7 @@
 
 #include "internal/jpeg_util.h"
 #include "rtc_base/checks.h"
+#include "rtc_base/logging.h"
 #include "third_party/libyuv/include/libyuv.h"
 
 #ifdef WEBRTC_WIN
@@ -89,9 +90,11 @@ RTCDesktopMediaListImpl::RTCDesktopMediaListImpl(DesktopType type,
   options_.set_allow_directx_capturer(false);
 #endif
 #ifdef WEBRTC_LINUX
-  if (type == kScreen) {
-    options_.set_allow_pipewire(true);
-  }
+  // honeycord: PipeWire fuer BEIDE Typen. Unter Wayland ist die X11-Aufzaehlung
+  // nicht erlaubt; ohne diese Zeile liefert CreateWindowCapturer dort nullptr und
+  // der ungepruefte Start() unten stuerzt die App ab (GEMESSEN auf Fedora 42:
+  // SIGSEGV beim Bildschirm-Teilen). Die Auswahl trifft dann der Portal-Dialog.
+  options_.set_allow_pipewire(true);
 #endif
   callback_ = std::make_unique<CallbackProxy>();
   thread_->BlockingCall([this, type] {
@@ -99,6 +102,15 @@ RTCDesktopMediaListImpl::RTCDesktopMediaListImpl(DesktopType type,
       capturer_ = webrtc::DesktopCapturer::CreateScreenCapturer(options_);
     } else {
       capturer_ = webrtc::DesktopCapturer::CreateWindowCapturer(options_);
+    }
+    // honeycord: Create*Capturer DARF nullptr liefern (kein Aufnehmer verfuegbar,
+    // z.B. Wayland ohne Portal oder Kopfloser Betrieb). Vorher lief das ungeprueft
+    // in einen Nullzugriff -> SIGSEGV, den kein try/catch der Anwendung faengt.
+    if (!capturer_) {
+      RTC_LOG(LS_ERROR) << "RTCDesktopMediaList: kein Aufnehmer verfuegbar (Typ "
+                        << (type == kScreen ? "Bildschirm" : "Fenster")
+                        << ") - Liste bleibt leer";
+      return;
     }
     capturer_->Start(callback_.get());
   });
@@ -121,7 +133,9 @@ int32_t RTCDesktopMediaListImpl::UpdateSourceList(bool force_reload,
 
   webrtc::DesktopCapturer::SourceList new_sources;
   thread_->BlockingCall(
-      [this, &new_sources] { capturer_->GetSourceList(&new_sources); });
+      [this, &new_sources] {
+        if (capturer_) capturer_->GetSourceList(&new_sources);
+      });
 
   typedef std::set<webrtc::DesktopCapturer::SourceId> SourceSet;
   SourceSet new_source_set;
@@ -207,6 +221,7 @@ bool RTCDesktopMediaListImpl::GetThumbnail(scoped_refptr<MediaSource> source,
                                            bool notify) {
   thread_->PostTask([this, source, notify] {
     MediaSourceImpl* source_impl = static_cast<MediaSourceImpl*>(source.get());
+    if (!capturer_) return false;
     const bool sel = capturer_->SelectSource(source_impl->source_id());
     if (sel) {
       callback_->SetCallback([&](webrtc::DesktopCapturer::Result result,
@@ -244,7 +259,7 @@ bool RTCDesktopMediaListImpl::GetThumbnail(scoped_refptr<MediaSource> source,
           });
         }
       });
-      capturer_->CaptureFrame();
+      if (capturer_) capturer_->CaptureFrame();
     } else {
       PickLog("thumb id=%lld SelectSource=0 (Quelle verloren)",
               (long long)source_impl->source_id());
