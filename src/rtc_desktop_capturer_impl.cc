@@ -188,6 +188,8 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
   // Zero-Copy-GPU-Pfad nur fuer Bildschirm (kScreen). InitGpu() faellt bei
   // Monitor-an-iGPU / kein-NVIDIA sauber durch -> CPU-Capturer uebernimmt.
   if (type_ == kScreen) {
+    gpu_lost_ = false;  // frischer Start = frischer Zustand (kein Alt-Retry)
+    gpu_retry_fails_ = 0;
     thread_->BlockingCall([this] { gpu_mode_ = InitGpu(); });
     if (!gpu_mode_ && !capturer_) {
       // GPU-Pfad inaktiv -> jetzt erst den webrtc-Bildschirm-Capturer bauen
@@ -910,6 +912,25 @@ void RTCDesktopCapturerImpl::ReleaseGpu() {
   g_have_frame_ = false;
 }
 
+// CPU-Bildschirm-Capturer (webrtc) bauen + starten. Gebraucht vom
+// ACCESS_LOST-Fallback und vom Wiederaufbau nach einem gescheiterten
+// Zero-Copy-Retry — vorher stand derselbe Block doppelt im Code. Laeuft auf
+// thread_.
+void RTCDesktopCapturerImpl::BuildCpuScreenCapturer() {
+  if (show_cursor_) {
+    capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
+        webrtc::DesktopCapturer::CreateScreenCapturer(options_), options_);
+  } else {
+    capturer_ =
+        webrtc::DesktopAndCursorComposer::CreateWithoutMouseCursorMonitor(
+            webrtc::DesktopCapturer::CreateScreenCapturer(options_));
+  }
+  if (capturer_) {
+    if (source_id_ != -1) capturer_->SelectSource(source_id_);
+    capturer_->Start(this);
+  }
+}
+
 void RTCDesktopCapturerImpl::GpuCaptureFrame() {
   using Microsoft::WRL::ComPtr;
   bool changed = false;
@@ -939,22 +960,24 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
       // Ohne Nachbau dereferenziert der naechste CaptureFrame()-Tick
       // capturer_ == nullptr -> App-Absturz (okunoku: Monitor angesteckt).
       // Wir laufen hier bereits auf thread_ -> direkt bauen + starten.
+      // ★ 2026-08-15 (okunokus Log, #Screenshare-Selbstansicht): Der Verlust
+      // ist fast immer VORUEBERGEHEND — Modus-/HDR-Wechsel, Spiel schaltet
+      // in den Vollbildmodus. Sein CPU-Fallback lief Sekunden spaeter wieder
+      // mit DXGI-grab=2ms; nur UNSER Zero-Copy-Pfad hat nie wieder probiert,
+      // und die Selbstansicht der App blieb fuer den Rest der Freigabe
+      // schwarz. Deshalb bleibt es nicht beim Fallback: CaptureFrame()
+      // versucht ab jetzt periodisch den Wiederaufbau (gpu_lost_).
       ReleaseGpu();
       gpu_mode_ = false;
+      gpu_lost_ = true;
+      gpu_retry_fails_ = 0;
+      // Erst den Modus-Wechsel ausschwingen lassen — ein sofortiger Versuch
+      // scheitert waehrend des Wechsels ohnehin.
+      gpu_retry_at_ms_ = webrtc::TimeMillis() + 3000;
       if (!capturer_) {
         HcCapLog("ACCESS_LOST: baue CPU-Fallback-Capturer nach (Hotplug)");
-        if (show_cursor_) {
-          capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
-              webrtc::DesktopCapturer::CreateScreenCapturer(options_), options_);
-        } else {
-          capturer_ =
-              webrtc::DesktopAndCursorComposer::CreateWithoutMouseCursorMonitor(
-                  webrtc::DesktopCapturer::CreateScreenCapturer(options_));
-        }
-        if (capturer_) {
-          if (source_id_ != -1) capturer_->SelectSource(source_id_);
-          capturer_->Start(this);
-        } else {
+        BuildCpuScreenCapturer();
+        if (!capturer_) {
           HcCapLog("ACCESS_LOST: CPU-Fallback fehlgeschlagen -> Capture ENDET");
           capture_state_ = CS_FAILED;
         }
@@ -1058,6 +1081,42 @@ void RTCDesktopCapturerImpl::CaptureFrame() {
       thread_->PostDelayedHighPrecisionTask(
           [this]() { CaptureFrame(); }, webrtc::TimeDelta::Millis(gn));
       return;
+    }
+    // ★ Zero-Copy-Rueckkehr nach ACCESS_LOST (2026-08-15). WICHTIG: webrtc
+    // erlaubt EINE Duplication pro Monitor, und der CPU-Capturer HAELT sie
+    // (DxgiDuplicatorController, siehe Konstruktor-Kommentar). Vor dem
+    // Versuch muss er deshalb weg — scheitert InitGpu(), wird er sofort
+    // wieder aufgebaut. Kostet im degradierten Zustand alle 15-60 s einen
+    // Frame; der Gewinn ist der Weg zurueck zu Zero-Copy-Encode UND
+    // GPU-Selbstansicht statt dauerhaftem CPU-Modus.
+    if (gpu_lost_ && type_ == kScreen &&
+        webrtc::TimeMillis() >= gpu_retry_at_ms_) {
+      capturer_.reset();
+      gpu_mode_ = InitGpu();
+      if (gpu_mode_) {
+        HcCapLog(
+            "ACCESS_LOST-Rueckkehr: Zero-Copy wieder aktiv (nach %d "
+            "Fehlversuchen)",
+            gpu_retry_fails_);
+        gpu_lost_ = false;
+        gpu_retry_fails_ = 0;
+        thread_->PostDelayedHighPrecisionTask(
+            [this]() { CaptureFrame(); }, webrtc::TimeDelta::Millis(0));
+        return;
+      }
+      gpu_retry_fails_++;
+      // Backoff: alle 15 s, ab 10 Fehlversuchen nur noch jede Minute — jeder
+      // Versuch reisst den CPU-Capturer kurz ab und ist nicht gratis.
+      gpu_retry_at_ms_ =
+          webrtc::TimeMillis() + (gpu_retry_fails_ >= 10 ? 60000 : 15000);
+      BuildCpuScreenCapturer();
+      if (!capturer_) {
+        HcCapLog(
+            "ACCESS_LOST-Rueckkehr: CPU-Neuaufbau fehlgeschlagen -> Capture "
+            "ENDET");
+        capture_state_ = CS_FAILED;
+        return;
+      }
     }
 #endif
     // honeycord: schedule the NEXT grab at a steady cadence measured from the

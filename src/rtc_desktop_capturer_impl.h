@@ -102,12 +102,21 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   bool gpu_mode_ = false;  // Zero-Copy-GPU-Pfad aktiv (Screen+NVIDIA); sonst CPU
   bool show_cursor_ = true;  // fuer die LAZY-Erzeugung des Screen-Capturers in
                              // Start() (Cursor-Variante), siehe .cc-Konstruktor
+  // Zero-Copy-Rueckkehr nach DXGI_ERROR_ACCESS_LOST (2026-08-15): Der Verlust
+  // ist fast immer voruebergehend; vorher blieb der Stream trotzdem dauerhaft
+  // im CPU-Modus und die Zero-Copy-Selbstansicht der App schwarz.
+  bool gpu_lost_ = false;        // ACCESS_LOST passiert -> Retry erlaubt
+  int64_t gpu_retry_at_ms_ = 0;  // fruehester Zeitpunkt des naechsten Versuchs
+  int gpu_retry_fails_ = 0;      // Backoff-Zaehler (15 s -> 60 s)
 
 #ifdef _WIN32
   // Zero-Copy-GPU-Pfad: DXGI-dup + Shader-Downscale -> kNative D3D11-Textur,
   // alles auf einem NVIDIA-Device. Aktiv, wenn InitGpu() erfolgreich (Screen +
   // Monitor an NVIDIA); sonst Fallback auf den webrtc-CPU-Capturer oben.
   bool InitGpu();
+  // CPU-Bildschirm-Capturer bauen + starten (ACCESS_LOST-Fallback und
+  // Wiederaufbau nach gescheitertem Zero-Copy-Retry).
+  void BuildCpuScreenCapturer();
   // WGC (Windows.Graphics.Capture): GPU-Zero-Copy-Capture eines FENSTERS auf
   // g_dev_ (statt CPU/GDI). Liefert wie InitGpu einen nativen Frame -> Vorschau
   // ueber den GPU-Ring (keine gelbe Kachel) + zero-copy Encode.
