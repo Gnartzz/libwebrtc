@@ -134,6 +134,15 @@ void RTCPeerConnectionFactoryImpl::CreateAudioDeviceModule_w() {
         env_,
         webrtc::AudioDeviceModule::kPlatformDefaultAudio,
         false);
+  // HoneyCord (30.08.2026): das ADM auch INITIALISIEREN. `CreateAudioDeviceModule`
+  // baut nur die plattformspezifischen Objekte; `AudioDeviceModuleImpl` gibt bis
+  // zum `Init()` bei jeder Abfrage -1 zurueck (`CHECKinitialized_`). Auf Windows
+  // fiel das nicht auf, weil dort spaeter ohnehin initialisiert wird — auf macOS
+  // blieben `RecordingDevices()`/`PlayoutDevices()` dauerhaft bei -1, also ohne
+  // Mikrofon und ohne Lautsprecher. `Init()` ist idempotent (0, wenn schon
+  // geschehen) und aendert an anderen Plattformen nichts.
+  if (audio_device_module_ && audio_device_module_->Init() != 0)
+    RTC_LOG(LS_ERROR) << "AudioDeviceModule::Init() fehlgeschlagen";
 }
 
 void RTCPeerConnectionFactoryImpl::DestroyAudioDeviceModule_w() {
