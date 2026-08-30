@@ -2,6 +2,12 @@
 
 #include "modules/video_capture/video_capture_factory.h"
 
+#ifdef WEBRTC_MAC
+// Auf Apple gibt die C++-Fabrik nullptr zurueck (video_capture_factory.cc);
+// Kameras laufen dort ueber AVFoundation. Siehe src/internal/mac_capturer.h.
+#include "src/internal/mac_capturer.h"
+#endif
+
 namespace libwebrtc {
 
 RTCVideoDeviceImpl::RTCVideoDeviceImpl(webrtc::Thread* worker_thread)
@@ -9,10 +15,14 @@ RTCVideoDeviceImpl::RTCVideoDeviceImpl(webrtc::Thread* worker_thread)
       worker_thread_(worker_thread) {}
 
 uint32_t RTCVideoDeviceImpl::NumberOfDevices() {
+#ifdef WEBRTC_MAC
+  return webrtc::internal::MacCapturer::NumberOfDevices();
+#else
   if (!device_info_) {
     return 0;
   }
   return device_info_->NumberOfDevices();
+#endif
 }
 
 int32_t RTCVideoDeviceImpl::GetDeviceName(
@@ -20,6 +30,11 @@ int32_t RTCVideoDeviceImpl::GetDeviceName(
     char* deviceUniqueIdUTF8, uint32_t deviceUniqueIdUTF8Length,
     char* productUniqueIdUTF8 /*= 0*/,
     uint32_t productUniqueIdUTF8Length /*= 0*/) {
+#ifdef WEBRTC_MAC
+  return webrtc::internal::MacCapturer::GetDeviceName(
+      deviceNumber, deviceNameUTF8, deviceNameLength, deviceUniqueIdUTF8,
+      deviceUniqueIdUTF8Length);
+#else
   if (!device_info_) {
     return -1;
   }
@@ -30,6 +45,7 @@ int32_t RTCVideoDeviceImpl::GetDeviceName(
     return 0;
   }
   return 0;
+#endif
 }
 
 scoped_refptr<RTCVideoCapturer> RTCVideoDeviceImpl::Create(const char* name,
@@ -37,6 +53,14 @@ scoped_refptr<RTCVideoCapturer> RTCVideoDeviceImpl::Create(const char* name,
                                                            size_t width,
                                                            size_t height,
                                                            size_t target_fps) {
+#ifdef WEBRTC_MAC
+  auto cap = webrtc::internal::MacCapturer::Create(width, height, target_fps, index);
+  if (cap == nullptr) {
+    return nullptr;
+  }
+  return scoped_refptr<RTCVideoCapturerImpl>(
+      new RefCountedObject<RTCVideoCapturerImpl>(cap));
+#else
   auto vcm = worker_thread_->BlockingCall([&, width, height, target_fps]{
     return webrtc::internal::VcmCapturer::Create(worker_thread_, width, height,
                                                  target_fps, index);
@@ -50,6 +74,7 @@ scoped_refptr<RTCVideoCapturer> RTCVideoDeviceImpl::Create(const char* name,
     return scoped_refptr<RTCVideoCapturerImpl>(
         new RefCountedObject<RTCVideoCapturerImpl>(vcm));
   });
+#endif
 }
 
 }  // namespace libwebrtc

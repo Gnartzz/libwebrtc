@@ -409,6 +409,23 @@ rtc_shared_library("libwebrtc") {
     include_dirs += [ "src/win/hwenc" ]
   }
 
+  # HoneyCord (30.08.2026): Kameraaufnahme auf macOS. Die C++-Fabrik von WebRTC
+  # gibt dort nullptr zurueck, deshalb die Bruecke ueber AVFoundation.
+  # `enable_arc` gilt fuer die ganze Bibliothek — die .mm-Datei braucht es.
+  if (is_mac) {
+    sources += [
+      "src/internal/mac_capturer.h",
+      "src/internal/mac_capturer.mm",
+    ]
+    # enable_arc steht schon im Ziel (der Wrapper hat weitere ObjC-Quellen).
+    deps += [
+      "//sdk:base_objc",
+      "//sdk:native_video",
+      "//sdk:videocapture_objc",
+    ]
+    frameworks = [ "AVFoundation.framework", "CoreMedia.framework" ]
+  }
+
   # screen capture device
   if (libwebrtc_desktop_capture) {
     defines += [ "RTC_DESKTOP_DEVICE" ]
