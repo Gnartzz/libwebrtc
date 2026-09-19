@@ -8,6 +8,7 @@
 
 #include "api/video/i420_buffer.h"
 #include "api/video_codecs/h264_profile_level_id.h"
+#include "media/base/media_constants.h"
 #include "modules/video_coding/codecs/h264/include/h264_globals.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
