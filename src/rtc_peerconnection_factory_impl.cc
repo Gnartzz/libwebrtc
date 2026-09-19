@@ -21,6 +21,9 @@
 #include "src/win/msdkvideodecoderfactory.h"
 #include "src/win/msdkvideoencoderfactory.h"
 #endif
+#if defined(USE_VAAPI_ENCODER)
+#include "src/linux/hwenc/vaapi_encoder_factory.h"
+#endif
 #if defined(WEBRTC_IOS)
 #include "engine/sdk/objc/Framework/Classes/videotoolboxvideocodecfactory.h"
 #endif
@@ -86,6 +89,15 @@ bool RTCPeerConnectionFactoryImpl::Initialize() {
         webrtc::CreateBuiltinAudioDecoderFactory(),
 #if defined(USE_INTEL_MEDIA_SDK)
         CreateIntelVideoEncoderFactory(), CreateIntelVideoDecoderFactory(),
+#elif defined(USE_VAAPI_ENCODER)
+        // Linux: H.264 ueber die Grafikkarte, alles andere unveraendert.
+        // Die Huelle meldet dieselben Formate wie die eingebaute Fabrik und
+        // greift nur beim Erzeugen ein -- ohne brauchbare Hardware bleibt es
+        // bei OpenH264. Dekodiert wird weiter in Software: Das ist die
+        // guenstigere Richtung, und ein halb fertiger Hardware-Decoder waere
+        // ein Risiko ohne Gegenwert.
+        CreateLinuxVideoEncoderFactory(),
+        webrtc::CreateBuiltinVideoDecoderFactory(),
 #else
         webrtc::CreateBuiltinVideoEncoderFactory(),
         webrtc::CreateBuiltinVideoDecoderFactory(),
