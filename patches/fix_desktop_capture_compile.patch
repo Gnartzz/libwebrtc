@@ -1,5 +1,5 @@
 diff --git a/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc b/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
-index 070257f072..61fd0c8f3b 100644
+index 070257f072..870a3b8b1d 100644
 --- a/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
 +++ b/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
 @@ -71,12 +71,25 @@ constexpr int CursorMetaSize(int w, int h) {
@@ -13,20 +13,22 @@ index 070257f072..61fd0c8f3b 100644
 +// -Wexit-time-destructors und -Wglobal-constructors an, die WebRTC als Fehler
 +// wertet (gemessen 19.09.2026 beim Linux-Bau).
 +//
-+// Die Warnungen sind hier gegenstandslos: Es sind zwei unveraenderliche
-+// Versionsnummern, die nur verglichen werden. Sie an dieser einen Stelle
-+// abzuschalten ist kleiner und nachvollziehbarer, als das Muster mit dem
-+// absichtlich geleakten Zeiger einzufuehren.
++// Die Warnungen sind hier gegenstandslos: zwei unveraenderliche Versionsnummern,
++// die nur verglichen werden. Sie an dieser einen Stelle abzuschalten ist kleiner
++// und nachvollziehbarer als das Muster mit dem absichtlich geleakten Zeiger.
 +#pragma clang diagnostic push
 +#pragma clang diagnostic ignored "-Wexit-time-destructors"
 +#pragma clang diagnostic ignored "-Wglobal-constructors"
 +const PipeWireVersion kDmaBufModifierMinVersion = {.major = 0,
-                                                        .minor = 3,
-                                                        .micro = 33};
--constexpr PipeWireVersion kDropSingleModifierMinVersion = {.major = 0,
++                                                   .minor = 3,
++                                                   .micro = 33};
 +const PipeWireVersion kDropSingleModifierMinVersion = {.major = 0,
-                                                            .minor = 3,
-                                                            .micro = 40};
+                                                        .minor = 3,
+-                                                       .micro = 33};
+-constexpr PipeWireVersion kDropSingleModifierMinVersion = {.major = 0,
+-                                                           .minor = 3,
+-                                                           .micro = 40};
++                                                       .micro = 40};
 +#pragma clang diagnostic pop
  
  class SharedScreenCastStreamPrivate {
