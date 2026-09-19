@@ -231,8 +231,8 @@ rtc_shared_library("libwebrtc") {
     include_dirs += [ "src/linux/hwenc/vaapi/ffmpeg/include" ]
     defines += [ "USE_VAAPI_ENCODER" ]
     libs += [ "dl" ]
-    # Der SimulcastEncoderAdapter umhuellt unsere Encoder (Lagen + Rueckfall).
-    deps += [ "../media:rtc_simulcast_encoder_adapter" ]
+    # Die Abhaengigkeit steht weiter unten: `deps` gibt es an dieser Stelle
+    # noch nicht (GN wertet von oben nach unten aus).
   }
 
   if (is_win && is_clang) {
@@ -270,6 +270,12 @@ rtc_shared_library("libwebrtc") {
     "//third_party/boringssl:boringssl",
     "//third_party/libyuv",
   ]
+
+  if (is_linux && libwebrtc_vaapi) {
+    # Der SimulcastEncoderAdapter umhuellt unsere Encoder (Lagen + Rueckfall),
+    # genau wie in der eingebauten Fabrik.
+    deps += [ "../media:rtc_simulcast_encoder_adapter" ]
+  }
 
   # screen capture device
   if (libwebrtc_desktop_capture) {
