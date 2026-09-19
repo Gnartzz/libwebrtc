@@ -274,7 +274,12 @@ int32_t HwH264Encoder::CodecOeffnen() {
   // Verzögerung — in einer Konferenz spürbar, und WebRTCs Paketierung erwartet
   // sie ohnehin nicht.
   ctx_->max_b_frames = 0;
-  ctx_->refs = 1;
+  // ★ `refs = 1` NUR fuer VA-API (Pruefbefund 19.09.2026). NVENC liest alles
+  // ausser 0 als „mehrere Referenzbilder" und verlangt dafuer eine Faehigkeit,
+  // die es erst ab Turing gibt — auf einer GTX 9xx/10xx schlaegt avcodec_open2
+  // damit IMMER fehl. Das Protokoll haette „NVENC verfuegbar" gemeldet und der
+  // Client dauerhaft in Software kodiert.
+  if (!nvenc) ctx_->refs = 1;
   ctx_->profile = profil_;
   if (!nvenc) {
     ctx_->hw_frames_ctx = api.av_buffer_ref(hw_frames_);
@@ -296,6 +301,21 @@ int32_t HwH264Encoder::CodecOeffnen() {
     api.av_opt_set_int(ctx_->priv_data, "delay", 0, 0);
     api.av_opt_set_int(ctx_->priv_data, "rc-lookahead", 0, 0);
     api.av_opt_set_int(ctx_->priv_data, "zerolatency", 1, 0);
+    // ★ OHNE DIES IST EIN ANGEFORDERTES KEYFRAME KEIN IDR (Pruefbefund
+    // 19.09.2026): NVENC macht aus `pict_type = I` ohne `forced-idr` nur ein
+    // I-Bild ohne Wiedereinstiegspunkt, und `AV_PKT_FLAG_KEY` bleibt aus. Mit
+    // unserem sehr grossen gop_size waere nur das allererste Bild ein IDR —
+    // jeder spaeter Hinzukommende saehe nie ein Bild. Das ist das Gegenstueck
+    // zum `idr_interval=0` auf der VA-API-Seite.
+    api.av_opt_set_int(ctx_->priv_data, "forced-idr", 1, 0);
+    // ★ `ctx_->profile` ueberschreibt NVENC mit seiner eigenen Option (Vorgabe
+    // `main`) — das ausgehandelte SDP-Profil ginge also verloren. NVENC kennt
+    // kein Constrained Baseline; `baseline` ist die naechstliegende Abbildung.
+    api.av_opt_set(ctx_->priv_data, "profile",
+                   profil_ == AV_PROFILE_H264_HIGH   ? "high"
+                   : profil_ == AV_PROFILE_H264_MAIN ? "main"
+                                                     : "baseline",
+                   0);
   } else {
     // ★ Private Optionen von h264_vaapi. `async_depth=1` heißt: ein Bild
     // hinein, ein Bild heraus — mehr Tiefe brächte Durchsatz, den wir nicht
@@ -569,19 +589,35 @@ void HwH264Encoder::SetRates(
   const uint32_t neu = bitrate_adjuster_.GetAdjustedBitrateBps();
   if (!ctx_ || neu == 0 || target_bitrate_bps_ == 0) return;
 
-  // ★ `ctx_->bit_rate` NACH dem Öffnen zu beschreiben, bleibt wirkungslos
-  // (Prüfbefund 19.09.2026): h264_vaapi baut seine Ratensteuerung beim Öffnen
-  // einmal auf, und FFmpeg hat für Encoder keine Nachkonfiguration. Die
-  // Staukontrolle würde also auf 400 kbit/s drosseln, während weiter die alte
-  // Rate herausliefe — Warteschlange voll, Verluste, Schätzung sinkt weiter.
+  // ★ Die beiden Wege verhalten sich hier UNTERSCHIEDLICH (Prüfbefund
+  // 19.09.2026):
   //
-  // Also wirklich neu aufsetzen. Das kostet ein Keyframe, deshalb nur bei
-  // echten Sprüngen: mehr als ein Viertel Abweichung UND höchstens alle drei
-  // Sekunden. Kleine Wellen fängt der Ausgleicher ab.
+  //  * NVENC liest `bit_rate` vor jedem Bild neu und stellt sich selbst um.
+  //    Ein Schreiben genügt — den Encoder neu aufzusetzen wäre teurer,
+  //    riskanter (die Sitzung kann beim Öffnen scheitern) und brächte nichts.
+  //  * h264_vaapi baut seine Ratensteuerung beim Öffnen EINMAL auf; ein
+  //    späteres Schreiben bleibt wirkungslos. Die Staukontrolle würde also auf
+  //    400 kbit/s drosseln, während weiter die alte Rate herausliefe —
+  //    Warteschlange voll, Verluste, Schätzung sinkt weiter.
   const uint32_t gross = std::max(neu, target_bitrate_bps_);
   const uint32_t klein = std::min(neu, target_bitrate_bps_);
   const bool sprung = (gross - klein) * 4 > gross;
   const int64_t jetzt = webrtc::TimeMillis();
+
+  if (weg_ == Backend::kNvenc) {
+    target_bitrate_bps_ = neu;
+    if (max_bitrate_bps_ < target_bitrate_bps_) {
+      max_bitrate_bps_ = target_bitrate_bps_ * 2;
+    }
+    ctx_->bit_rate = target_bitrate_bps_;
+    ctx_->rc_max_rate = max_bitrate_bps_;
+    ctx_->rc_buffer_size = static_cast<int>(max_bitrate_bps_ / 2);
+    return;
+  }
+
+  // VA-API: wirklich neu aufsetzen. Das kostet ein Keyframe, deshalb nur bei
+  // echten Sprüngen — mehr als ein Viertel Abweichung UND höchstens alle drei
+  // Sekunden. Kleine Wellen fängt der Ausgleicher ab.
   if (!sprung || jetzt - letztes_aufsetzen_ms_ < 3000) return;
 
   target_bitrate_bps_ = neu;
