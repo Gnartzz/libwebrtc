@@ -44,6 +44,17 @@ extern "C" {
 #include "libavutil/pixfmt.h"
 }
 
+// ★ MERKE, WESSEN HEADER DAS SIND (19.09.2026 gemessen): Als der Include-Pfad
+// nach einer Umbenennung ins Leere zeigte, fand der Compiler klaglos die
+// FFmpeg-Header des Bau-Containers. Hier fiel es nur auf, weil die aelteren
+// Header ein paar Namen nicht kannten — waeren sie zufaellig uebersetzbar
+// gewesen, haetten wir gegen fremde Strukturlagen gebaut und es erst am
+// zerfallenden Bild beim Gegenueber gemerkt. Diese Zusicherung sagt es sofort.
+static_assert(LIBAVCODEC_VERSION_MAJOR == 61 && LIBAVUTIL_VERSION_MAJOR == 59,
+              "Es wurden andere FFmpeg-Header gefunden als die mitgelieferten "
+              "(erwartet avcodec 61 / avutil 59 aus ffmpeg/include). Pruefe "
+              "include_dirs in BUILD.gn.");
+
 namespace libwebrtc {
 namespace ffmpeg {
 
