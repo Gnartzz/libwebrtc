@@ -1,4 +1,4 @@
-#include "src/linux/hwenc/vaapi/vaapi_h264_encoder.h"
+#include "src/linux/hwenc/ffmpeg/hw_h264_encoder.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -17,6 +17,16 @@
 
 namespace libwebrtc {
 namespace {
+
+bool NvidiaKnotenDa() {
+  // ★ Erst nachsehen, ob ueberhaupt eine NVIDIA-Karte da ist. `h264_nvenc`
+  // existiert in jedem FFmpeg-Bau, auch auf Rechnern ohne NVIDIA — ein blinder
+  // Oeffnungsversuch kostet dort nur Zeit und schreibt Fehler ins Protokoll.
+  for (const char* pfad : {"/dev/nvidiactl", "/dev/nvidia0"}) {
+    if (::access(pfad, F_OK) == 0) return true;
+  }
+  return false;
+}
 
 bool RenderKnotenDa() {
   // ★ Ohne Render-Knoten keine VA-API. Das kommt öfter vor, als man denkt: in
@@ -81,61 +91,87 @@ int ProfilAus(const webrtc::SdpVideoFormat& format) {
 }  // namespace
 
 // ── Verfügbar? ──────────────────────────────────────────────────────────────
-bool VaapiH264Encoder::IstVerfuegbar() {
-  static const bool ergebnis = [] {
-    if (!RenderKnotenDa()) {
-      RTC_LOG(LS_INFO) << "[vaapi] kein /dev/dri/renderD* — Software-Encoder";
-      return false;
-    }
-    if (!ffmpeg::Laden()) return false;
-    const auto& api = ffmpeg::Zugriff();
-    if (!api.avcodec_find_encoder_by_name("h264_vaapi")) {
-      RTC_LOG(LS_INFO) << "[vaapi] FFmpeg ohne h264_vaapi — Software-Encoder";
-      return false;
-    }
-    // ★ Eine echte Probe, kein „sieht gut aus": Erst wenn sich ein
-    // VA-API-Gerät wirklich öffnen lässt, ist ein brauchbarer Treiber da. Auf
-    // einem System mit /dev/dri, aber ohne passenden Mesa-Treiber scheitert
-    // genau hier, was sonst erst mitten im Gespräch aufgefallen wäre.
-    AVBufferRef* geraet = nullptr;
-    const int r = api.av_hwdevice_ctx_create(&geraet, AV_HWDEVICE_TYPE_VAAPI,
-                                             nullptr, nullptr, 0);
-    if (r < 0 || !geraet) {
-      RTC_LOG(LS_INFO) << "[vaapi] VA-API-Gerät nicht zu öffnen ("
-                       << ffmpeg::FehlerText(r) << ") — Software-Encoder";
-      return false;
-    }
-    api.av_buffer_unref(&geraet);
-    RTC_LOG(LS_INFO) << "[vaapi] Hardware-Encoder verfügbar ("
-                     << ffmpeg::GeladeneBibliothek() << ")";
-    return true;
-  }();
-  return ergebnis;
+namespace {
+
+// Probiert EINEN Weg wirklich aus: Encoder vorhanden und Gerät zu öffnen.
+//
+// ★ Keine Vermutung, sondern eine Probe. Ein System kann /dev/dri haben und
+// trotzdem keinen brauchbaren Treiber; `h264_nvenc` liegt in jedem FFmpeg,
+// auch ohne NVIDIA-Karte. Was hier nicht aufgeht, fällt sofort auf Software
+// zurück — statt mitten im ersten Gespräch.
+bool WegGeht(const char* encoder, enum AVHWDeviceType typ, const char* name) {
+  const auto& api = ffmpeg::Zugriff();
+  if (!api.avcodec_find_encoder_by_name(encoder)) {
+    RTC_LOG(LS_INFO) << "[hwenc] FFmpeg ohne " << encoder;
+    return false;
+  }
+  AVBufferRef* geraet = nullptr;
+  const int r = api.av_hwdevice_ctx_create(&geraet, typ, nullptr, nullptr, 0);
+  if (r < 0 || !geraet) {
+    RTC_LOG(LS_INFO) << "[hwenc] " << name << "-Gerät nicht zu öffnen ("
+                     << ffmpeg::FehlerText(r) << ")";
+    return false;
+  }
+  api.av_buffer_unref(&geraet);
+  return true;
 }
 
-std::string VaapiH264Encoder::BackendName() {
+// Einmal ermittelt, dann gemerkt: -1 = keiner, sonst der Backend-Wert.
+int WegErmitteln() {
+  if (!ffmpeg::Laden()) return -1;
+  // ★ NVIDIA zuerst: Steckt eine NVIDIA-Karte im Rechner, ist sie fast immer
+  // die kräftigere, und ihr VA-API-Treiber kann ohnehin nur dekodieren.
+  if (NvidiaKnotenDa() &&
+      WegGeht("h264_nvenc", AV_HWDEVICE_TYPE_CUDA, "CUDA")) {
+    RTC_LOG(LS_INFO) << "[hwenc] NVENC verfügbar (" << ffmpeg::GeladeneBibliothek() << ")";
+    return static_cast<int>(HwH264Encoder::Backend::kNvenc);
+  }
+  if (RenderKnotenDa() && WegGeht("h264_vaapi", AV_HWDEVICE_TYPE_VAAPI, "VA-API")) {
+    RTC_LOG(LS_INFO) << "[hwenc] VA-API verfügbar (" << ffmpeg::GeladeneBibliothek() << ")";
+    return static_cast<int>(HwH264Encoder::Backend::kVaapi);
+  }
+  RTC_LOG(LS_INFO) << "[hwenc] kein Hardware-Encoder — Software";
+  return -1;
+}
+
+int GemerkterWeg() {
+  static const int weg = WegErmitteln();
+  return weg;
+}
+
+}  // namespace
+
+bool HwH264Encoder::IstVerfuegbar() { return GemerkterWeg() >= 0; }
+
+HwH264Encoder::Backend HwH264Encoder::GewaehlterWeg() {
+  return static_cast<Backend>(GemerkterWeg() < 0 ? 0 : GemerkterWeg());
+}
+
+std::string HwH264Encoder::BackendName() {
   if (!IstVerfuegbar()) return std::string();
-  return "VA-API (" + ffmpeg::GeladeneBibliothek() + ")";
+  const char* n = GewaehlterWeg() == Backend::kNvenc ? "NVENC" : "VA-API";
+  return std::string(n) + " (" + ffmpeg::GeladeneBibliothek() + ")";
 }
 
 // ── Leben und Sterben ───────────────────────────────────────────────────────
-VaapiH264Encoder::VaapiH264Encoder(const webrtc::SdpVideoFormat& format)
+HwH264Encoder::HwH264Encoder(const webrtc::SdpVideoFormat& format)
     // 0,5 … 0,95: derselbe Rahmen wie im AMF-Encoder unter Windows. Hardware
     // trifft die Zielrate selten genau; der Ausgleicher zieht nach, was
     // wirklich herauskommt.
     : bitrate_adjuster_(0.5, 0.95), profil_(ProfilAus(format)) {
+  if (IstVerfuegbar()) weg_ = GewaehlterWeg();
   const auto it = format.parameters.find(webrtc::kH264FmtpPacketizationMode);
   if (it != format.parameters.end() && it->second == "0") {
     packetization_mode_ = webrtc::H264PacketizationMode::SingleNalUnit;
   }
 }
 
-VaapiH264Encoder::~VaapiH264Encoder() {
+HwH264Encoder::~HwH264Encoder() {
   std::lock_guard<std::mutex> sperre(mutex_);
   CodecSchliessen();
 }
 
-int VaapiH264Encoder::InitEncode(
+int HwH264Encoder::InitEncode(
     const webrtc::VideoCodec* codec_settings,
     const webrtc::VideoEncoder::Settings& /*settings*/) {
   if (!codec_settings || codec_settings->codecType != webrtc::kVideoCodecH264) {
@@ -163,42 +199,50 @@ int VaapiH264Encoder::InitEncode(
   return CodecOeffnen();
 }
 
-int32_t VaapiH264Encoder::CodecOeffnen() {
+int32_t HwH264Encoder::CodecOeffnen() {
   const auto& api = ffmpeg::Zugriff();
   CodecSchliessen();
 
-  const AVCodec* codec = api.avcodec_find_encoder_by_name("h264_vaapi");
+  const bool nvenc = weg_ == Backend::kNvenc;
+  const AVCodec* codec =
+      api.avcodec_find_encoder_by_name(nvenc ? "h264_nvenc" : "h264_vaapi");
   if (!codec) return WEBRTC_VIDEO_CODEC_ERROR;
 
-  int r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI,
-                                     nullptr, nullptr, 0);
-  if (r < 0) {
-    RTC_LOG(LS_ERROR) << "[vaapi] VA-API-Gerät: " << ffmpeg::FehlerText(r);
-    CodecSchliessen();
-    return WEBRTC_VIDEO_CODEC_ERROR;
-  }
+  int r = 0;
+  if (!nvenc) {
+    // ★ NUR VA-API braucht diesen Vorbau. NVENC nimmt Bilder aus dem
+    // Arbeitsspeicher entgegen und lädt sie selbst hoch — ein eigener
+    // Bildspeicher waere dort nur Ballast.
+    r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI,
+                                   nullptr, nullptr, 0);
+    if (r < 0) {
+      RTC_LOG(LS_ERROR) << "[hwenc] VA-API-Gerät: " << ffmpeg::FehlerText(r);
+      CodecSchliessen();
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
 
-  // Bildspeicher der Hardware — der Encoder nimmt nur Bilder an, die aus
-  // seinem eigenen Vorrat stammen; deshalb muss der Vorrat vor dem Öffnen
-  // stehen.
-  hw_frames_ = api.av_hwframe_ctx_alloc(hw_device_);
-  if (!hw_frames_) {
-    CodecSchliessen();
-    return WEBRTC_VIDEO_CODEC_MEMORY;
-  }
-  auto* rahmen = reinterpret_cast<AVHWFramesContext*>(hw_frames_->data);
-  rahmen->format = AV_PIX_FMT_VAAPI;
-  rahmen->sw_format = AV_PIX_FMT_NV12;
-  rahmen->width = width_;
-  rahmen->height = height_;
-  // 8 Bilder: genug, dass Hochladen und Kodieren einander nicht ausbremsen,
-  // klein genug, dass bei großen Auflösungen kein Videospeicher brachliegt.
-  rahmen->initial_pool_size = 8;
-  r = api.av_hwframe_ctx_init(hw_frames_);
-  if (r < 0) {
-    RTC_LOG(LS_ERROR) << "[vaapi] Bildspeicher: " << ffmpeg::FehlerText(r);
-    CodecSchliessen();
-    return WEBRTC_VIDEO_CODEC_ERROR;
+    // Bildspeicher der Hardware — der Encoder nimmt nur Bilder an, die aus
+    // seinem eigenen Vorrat stammen; deshalb muss der Vorrat vor dem Öffnen
+    // stehen.
+    hw_frames_ = api.av_hwframe_ctx_alloc(hw_device_);
+    if (!hw_frames_) {
+      CodecSchliessen();
+      return WEBRTC_VIDEO_CODEC_MEMORY;
+    }
+    auto* rahmen = reinterpret_cast<AVHWFramesContext*>(hw_frames_->data);
+    rahmen->format = AV_PIX_FMT_VAAPI;
+    rahmen->sw_format = AV_PIX_FMT_NV12;
+    rahmen->width = width_;
+    rahmen->height = height_;
+    // 8 Bilder: genug, dass Hochladen und Kodieren einander nicht ausbremsen,
+    // klein genug, dass bei großen Auflösungen kein Videospeicher brachliegt.
+    rahmen->initial_pool_size = 8;
+    r = api.av_hwframe_ctx_init(hw_frames_);
+    if (r < 0) {
+      RTC_LOG(LS_ERROR) << "[hwenc] Bildspeicher: " << ffmpeg::FehlerText(r);
+      CodecSchliessen();
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
   }
 
   ctx_ = api.avcodec_alloc_context3(codec);
@@ -208,7 +252,8 @@ int32_t VaapiH264Encoder::CodecOeffnen() {
   }
   ctx_->width = width_;
   ctx_->height = height_;
-  ctx_->pix_fmt = AV_PIX_FMT_VAAPI;
+  // NVENC bekommt NV12 direkt; VA-API bekommt Oberflächen mit NV12 darin.
+  ctx_->pix_fmt = nvenc ? AV_PIX_FMT_NV12 : AV_PIX_FMT_VAAPI;
   ctx_->sw_pix_fmt = AV_PIX_FMT_NV12;
   // ★ Zeitbasis in Millisekunden. WebRTC rechnet in 90 kHz, FFmpeg braucht nur
   // eine monoton steigende Zahl — den RTP-Stempel setzen wir beim
@@ -231,25 +276,41 @@ int32_t VaapiH264Encoder::CodecOeffnen() {
   ctx_->max_b_frames = 0;
   ctx_->refs = 1;
   ctx_->profile = profil_;
-  ctx_->hw_frames_ctx = api.av_buffer_ref(hw_frames_);
-  if (!ctx_->hw_frames_ctx) {
-    CodecSchliessen();
-    return WEBRTC_VIDEO_CODEC_MEMORY;
+  if (!nvenc) {
+    ctx_->hw_frames_ctx = api.av_buffer_ref(hw_frames_);
+    if (!ctx_->hw_frames_ctx) {
+      CodecSchliessen();
+      return WEBRTC_VIDEO_CODEC_MEMORY;
+    }
   }
 
-  // ★ Private Optionen von h264_vaapi. `async_depth=1` heißt: ein Bild hinein,
-  // ein Bild heraus — mehr Tiefe brächte Durchsatz, den wir nicht brauchen,
-  // und Verzögerung, die wir nicht wollen. Die Ratensteuerung lassen wir
-  // bewusst auf „auto": nicht jeder Treiber kann CBR, und ein abgelehnter
-  // Modus kostet uns den ganzen Hardware-Weg.
-  api.av_opt_set(ctx_->priv_data, "async_depth", "1", 0);
-  // `idr_interval=0`: jedes angeforderte Keyframe wird ein echtes IDR, damit
-  // ein neu hinzugekommener Empfänger wirklich einsteigen kann.
-  api.av_opt_set(ctx_->priv_data, "idr_interval", "0", 0);
+  if (nvenc) {
+    // ★ Private Optionen von h264_nvenc, alle auf Gespräch statt Aufnahme
+    // ausgelegt: `p1` ist die schnellste Voreinstellung, `ull` (ultra low
+    // latency) verzichtet auf Blick nach vorn, `cbr` hält die Rate, und
+    // `delay=0` gibt jedes Bild sofort heraus statt es zu puffern.
+    // Vorausschau abschalten ist Pflicht — sie kostet Bilder Verzögerung.
+    api.av_opt_set(ctx_->priv_data, "preset", "p1", 0);
+    api.av_opt_set(ctx_->priv_data, "tune", "ull", 0);
+    api.av_opt_set(ctx_->priv_data, "rc", "cbr", 0);
+    api.av_opt_set_int(ctx_->priv_data, "delay", 0, 0);
+    api.av_opt_set_int(ctx_->priv_data, "rc-lookahead", 0, 0);
+    api.av_opt_set_int(ctx_->priv_data, "zerolatency", 1, 0);
+  } else {
+    // ★ Private Optionen von h264_vaapi. `async_depth=1` heißt: ein Bild
+    // hinein, ein Bild heraus — mehr Tiefe brächte Durchsatz, den wir nicht
+    // brauchen, und Verzögerung, die wir nicht wollen. Die Ratensteuerung
+    // lassen wir bewusst auf „auto": nicht jeder Treiber kann CBR, und ein
+    // abgelehnter Modus kostet uns den ganzen Hardware-Weg.
+    api.av_opt_set(ctx_->priv_data, "async_depth", "1", 0);
+    // `idr_interval=0`: jedes angeforderte Keyframe wird ein echtes IDR, damit
+    // ein neu hinzugekommener Empfänger wirklich einsteigen kann.
+    api.av_opt_set(ctx_->priv_data, "idr_interval", "0", 0);
+  }
 
   r = api.avcodec_open2(ctx_, codec, nullptr);
   if (r < 0) {
-    RTC_LOG(LS_ERROR) << "[vaapi] h264_vaapi öffnen: " << ffmpeg::FehlerText(r);
+    RTC_LOG(LS_ERROR) << "[hwenc] Encoder öffnen: " << ffmpeg::FehlerText(r);
     CodecSchliessen();
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
@@ -266,7 +327,7 @@ int32_t VaapiH264Encoder::CodecOeffnen() {
   sw_frame_->height = height_;
   r = api.av_frame_get_buffer(sw_frame_, 32);
   if (r < 0) {
-    RTC_LOG(LS_ERROR) << "[vaapi] Zwischenbild: " << ffmpeg::FehlerText(r);
+    RTC_LOG(LS_ERROR) << "[hwenc] Zwischenbild: " << ffmpeg::FehlerText(r);
     CodecSchliessen();
     return WEBRTC_VIDEO_CODEC_MEMORY;
   }
@@ -281,14 +342,15 @@ int32_t VaapiH264Encoder::CodecOeffnen() {
   misslungene_versuche_ = 0;
   letztes_aufsetzen_ms_ = webrtc::TimeMillis();
 
-  RTC_LOG(LS_INFO) << "[vaapi] Encoder offen: " << width_ << "x" << height_
+  RTC_LOG(LS_INFO) << "[hwenc] " << (nvenc ? "NVENC" : "VA-API")
+                   << " offen: " << width_ << "x" << height_
                    << " @" << framerate_ << ", " << (target_bitrate_bps_ / 1000)
                    << " kbit/s, Profil " << profil_
                    << (bildschirm_ ? ", Bildschirm" : "");
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-void VaapiH264Encoder::CodecSchliessen() {
+void HwH264Encoder::CodecSchliessen() {
   if (!ffmpeg::Laden()) return;
   const auto& api = ffmpeg::Zugriff();
   if (packet_) api.av_packet_free(&packet_);
@@ -307,14 +369,14 @@ void VaapiH264Encoder::CodecSchliessen() {
   hw_device_ = nullptr;
 }
 
-int32_t VaapiH264Encoder::Release() {
+int32_t HwH264Encoder::Release() {
   std::lock_guard<std::mutex> sperre(mutex_);
   CodecSchliessen();
   callback_ = nullptr;
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-int32_t VaapiH264Encoder::RegisterEncodeCompleteCallback(
+int32_t HwH264Encoder::RegisterEncodeCompleteCallback(
     webrtc::EncodedImageCallback* callback) {
   std::lock_guard<std::mutex> sperre(mutex_);
   callback_ = callback;
@@ -322,7 +384,7 @@ int32_t VaapiH264Encoder::RegisterEncodeCompleteCallback(
 }
 
 // ── Kodieren ────────────────────────────────────────────────────────────────
-int32_t VaapiH264Encoder::Encode(
+int32_t HwH264Encoder::Encode(
     const webrtc::VideoFrame& frame,
     const std::vector<webrtc::VideoFrameType>* frame_types) {
   std::lock_guard<std::mutex> sperre(mutex_);
@@ -376,7 +438,7 @@ int32_t VaapiH264Encoder::Encode(
 
   int r = api.av_frame_make_writable(sw_frame_);
   if (r < 0) {
-    RTC_LOG(LS_ERROR) << "[vaapi] make_writable: " << ffmpeg::FehlerText(r);
+    RTC_LOG(LS_ERROR) << "[hwenc] make_writable: " << ffmpeg::FehlerText(r);
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
   I420NachNv12(*puffer, sw_frame_);
@@ -395,34 +457,39 @@ int32_t VaapiH264Encoder::Encode(
   // Die Tabelle darf nicht wachsen, wenn ein Bild einmal nicht zurückkommt.
   while (stempel_.size() > 32) stempel_.erase(stempel_.begin());
 
-  // In den Hardware-Speicher hochladen. Das Zielbild wird jedes Mal frisch
-  // geholt; ohne das vorherige Freigeben hielte der Encoder Puffer fest, die
-  // er selbst noch braucht.
-  api.av_frame_unref(hw_frame_);
-  r = api.av_hwframe_get_buffer(hw_frames_, hw_frame_, 0);
-  if (r < 0) {
-    RTC_LOG(LS_ERROR) << "[vaapi] Hardware-Bildpuffer: " << ffmpeg::FehlerText(r);
-    return WEBRTC_VIDEO_CODEC_ERROR;
+  // VA-API will das Bild im Grafikspeicher; NVENC nimmt es aus dem
+  // Arbeitsspeicher und lädt selbst hoch.
+  AVFrame* hinein = sw_frame_;
+  if (weg_ == Backend::kVaapi) {
+    // Das Zielbild wird jedes Mal frisch geholt; ohne das vorherige Freigeben
+    // hielte der Encoder Puffer fest, die er selbst noch braucht.
+    api.av_frame_unref(hw_frame_);
+    r = api.av_hwframe_get_buffer(hw_frames_, hw_frame_, 0);
+    if (r < 0) {
+      RTC_LOG(LS_ERROR) << "[hwenc] Hardware-Bildpuffer: " << ffmpeg::FehlerText(r);
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    r = api.av_hwframe_transfer_data(hw_frame_, sw_frame_, 0);
+    if (r < 0) {
+      RTC_LOG(LS_ERROR) << "[hwenc] Hochladen: " << ffmpeg::FehlerText(r);
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    hw_frame_->pts = sw_frame_->pts;
+    hw_frame_->pict_type = sw_frame_->pict_type;
+    hinein = hw_frame_;
   }
-  r = api.av_hwframe_transfer_data(hw_frame_, sw_frame_, 0);
-  if (r < 0) {
-    RTC_LOG(LS_ERROR) << "[vaapi] Hochladen: " << ffmpeg::FehlerText(r);
-    return WEBRTC_VIDEO_CODEC_ERROR;
-  }
-  hw_frame_->pts = sw_frame_->pts;
-  hw_frame_->pict_type = sw_frame_->pict_type;
 
-  r = api.avcodec_send_frame(ctx_, hw_frame_);
+  r = api.avcodec_send_frame(ctx_, hinein);
   if (r == AVERROR(EAGAIN)) {
     // ★ EAGAIN heißt „nimm erst die Ausgabe ab und schick DASSELBE Bild
     // nochmal" (Prüfbefund 19.09.2026). Es als Erfolg zu behandeln, hätte das
     // Bild stillschweigend verworfen — und mit ihm womöglich ein angefordertes
     // Keyframe.
     PaketeAbholen();
-    r = api.avcodec_send_frame(ctx_, hw_frame_);
+    r = api.avcodec_send_frame(ctx_, hinein);
   }
   if (r < 0) {
-    RTC_LOG(LS_ERROR) << "[vaapi] send_frame: " << ffmpeg::FehlerText(r);
+    RTC_LOG(LS_ERROR) << "[hwenc] send_frame: " << ffmpeg::FehlerText(r);
     stempel_.erase(pts);
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
@@ -431,13 +498,13 @@ int32_t VaapiH264Encoder::Encode(
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-void VaapiH264Encoder::PaketeAbholen() {
+void HwH264Encoder::PaketeAbholen() {
   const auto& api = ffmpeg::Zugriff();
   while (true) {
     const int r = api.avcodec_receive_packet(ctx_, packet_);
     if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return;
     if (r < 0) {
-      RTC_LOG(LS_ERROR) << "[vaapi] receive_packet: " << ffmpeg::FehlerText(r);
+      RTC_LOG(LS_ERROR) << "[hwenc] receive_packet: " << ffmpeg::FehlerText(r);
       return;
     }
     if (packet_->size > 0 && packet_->data) {
@@ -469,7 +536,7 @@ void VaapiH264Encoder::PaketeAbholen() {
         keyframe_angefordert_ = false;
         if (!ist_key && !keyframe_warnung_) {
           keyframe_warnung_ = true;
-          RTC_LOG(LS_WARNING) << "[vaapi] Keyframe angefordert, aber ohne "
+          RTC_LOG(LS_WARNING) << "[hwenc] Keyframe angefordert, aber ohne "
                                  "IDR-Marke zurueck — Treiber ignoriert pict_type";
         }
       }
@@ -491,7 +558,7 @@ void VaapiH264Encoder::PaketeAbholen() {
   }
 }
 
-void VaapiH264Encoder::SetRates(
+void HwH264Encoder::SetRates(
     const webrtc::VideoEncoder::RateControlParameters& parameters) {
   std::lock_guard<std::mutex> sperre(mutex_);
   if (parameters.bitrate.get_sum_bps() == 0) return;
@@ -526,13 +593,14 @@ void VaapiH264Encoder::SetRates(
     // auf, und scheitert auch der, übernimmt der Software-Rückfall.
     oeffnen_scheiterte_ = true;
     ++misslungene_versuche_;
-    RTC_LOG(LS_ERROR) << "[vaapi] Neu-Aufsetzen nach Ratenwechsel misslungen";
+    RTC_LOG(LS_ERROR) << "[hwenc] Neu-Aufsetzen nach Ratenwechsel misslungen";
   }
 }
 
-webrtc::VideoEncoder::EncoderInfo VaapiH264Encoder::GetEncoderInfo() const {
+webrtc::VideoEncoder::EncoderInfo HwH264Encoder::GetEncoderInfo() const {
   webrtc::VideoEncoder::EncoderInfo info;
-  info.implementation_name = "HoneyCord VA-API";
+  info.implementation_name = weg_ == Backend::kNvenc ? "HoneyCord NVENC"
+                                                     : "HoneyCord VA-API";
   info.is_hardware_accelerated = true;
   // ★ Die Hardware braucht gerade Maße — 16 ist die sichere Zahl für H.264
   // (Makroblock). Ohne diese Angabe schickt WebRTC ungerade Größen, und der

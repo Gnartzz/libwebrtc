@@ -1,5 +1,5 @@
-#ifndef LIBWEBRTC_LINUX_HWENC_VAAPI_ENCODER_FACTORY_H_
-#define LIBWEBRTC_LINUX_HWENC_VAAPI_ENCODER_FACTORY_H_
+#ifndef LIBWEBRTC_LINUX_HWENC_HW_ENCODER_FACTORY_H_
+#define LIBWEBRTC_LINUX_HWENC_HW_ENCODER_FACTORY_H_
 
 // Die Encoder-Fabrik für Linux: H.264 über die Grafikkarte, alles andere wie
 // bisher.
@@ -22,10 +22,10 @@
 
 namespace libwebrtc {
 
-class VaapiVideoEncoderFactory : public webrtc::VideoEncoderFactory {
+class HwVideoEncoderFactory : public webrtc::VideoEncoderFactory {
  public:
-  VaapiVideoEncoderFactory();
-  ~VaapiVideoEncoderFactory() override = default;
+  HwVideoEncoderFactory();
+  ~HwVideoEncoderFactory() override = default;
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override;
   std::vector<webrtc::SdpVideoFormat> GetImplementations() const override;
@@ -66,4 +66,4 @@ std::string LinuxEncoderBezeichnung();
 
 }  // namespace libwebrtc
 
-#endif  // LIBWEBRTC_LINUX_HWENC_VAAPI_ENCODER_FACTORY_H_
+#endif  // LIBWEBRTC_LINUX_HWENC_HW_ENCODER_FACTORY_H_

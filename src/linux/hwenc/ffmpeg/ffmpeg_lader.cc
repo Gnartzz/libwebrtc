@@ -1,4 +1,4 @@
-#include "src/linux/hwenc/vaapi/ffmpeg_lader.h"
+#include "src/linux/hwenc/ffmpeg/ffmpeg_lader.h"
 
 #include <dlfcn.h>
 
@@ -27,7 +27,7 @@ template <typename T>
 bool Hole(void* handle, const char* name, T* ziel) {
   void* s = dlsym(handle, name);
   if (!s) {
-    RTC_LOG(LS_WARNING) << "[vaapi] FFmpeg-Symbol fehlt: " << name;
+    RTC_LOG(LS_WARNING) << "[hwenc] FFmpeg-Symbol fehlt: " << name;
     return false;
   }
   *ziel = reinterpret_cast<T>(s);
@@ -40,13 +40,13 @@ void LadenEinmal() {
   // Aufrufe umbiegen.
   void* avcodec = dlopen(kAvcodecName, RTLD_NOW | RTLD_LOCAL);
   if (!avcodec) {
-    RTC_LOG(LS_INFO) << "[vaapi] " << kAvcodecName
+    RTC_LOG(LS_INFO) << "[hwenc] " << kAvcodecName
                      << " nicht gefunden — Software-Encoder";
     return;
   }
   void* avutil = dlopen(kAvutilName, RTLD_NOW | RTLD_LOCAL);
   if (!avutil) {
-    RTC_LOG(LS_INFO) << "[vaapi] " << kAvutilName
+    RTC_LOG(LS_INFO) << "[hwenc] " << kAvutilName
                      << " nicht gefunden — Software-Encoder";
     dlclose(avcodec);
     return;
@@ -82,7 +82,7 @@ void LadenEinmal() {
   ok &= Hole(avutil, "avutil_version", &g_api.avutil_version);
 
   if (!ok) {
-    RTC_LOG(LS_WARNING) << "[vaapi] FFmpeg gefunden, aber unvollständig — Software-Encoder";
+    RTC_LOG(LS_WARNING) << "[hwenc] FFmpeg gefunden, aber unvollständig — Software-Encoder";
     g_api = Api();
     return;
   }
@@ -95,7 +95,7 @@ void LadenEinmal() {
   const unsigned util_haupt = g_api.avutil_version() >> 16;
   if (codec_haupt != LIBAVCODEC_VERSION_MAJOR ||
       util_haupt != LIBAVUTIL_VERSION_MAJOR) {
-    RTC_LOG(LS_WARNING) << "[vaapi] FFmpeg meldet avcodec " << codec_haupt
+    RTC_LOG(LS_WARNING) << "[hwenc] FFmpeg meldet avcodec " << codec_haupt
                         << "/avutil " << util_haupt << ", gebaut gegen "
                         << LIBAVCODEC_VERSION_MAJOR << "/"
                         << LIBAVUTIL_VERSION_MAJOR << " — Software-Encoder";
@@ -105,7 +105,7 @@ void LadenEinmal() {
 
   g_name = kAvcodecName;
   g_geladen = true;
-  RTC_LOG(LS_INFO) << "[vaapi] " << g_name << " geladen";
+  RTC_LOG(LS_INFO) << "[hwenc] " << g_name << " geladen";
   // Die Handles bleiben absichtlich offen: Die Bibliothek lebt, solange der
   // Prozess lebt. Ein dlclose zur Laufzeit schüfe nur Fehlerquellen.
 }

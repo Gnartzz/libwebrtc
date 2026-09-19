@@ -1,5 +1,5 @@
-#ifndef LIBWEBRTC_LINUX_HWENC_VAAPI_H264_ENCODER_H_
-#define LIBWEBRTC_LINUX_HWENC_VAAPI_H264_ENCODER_H_
+#ifndef LIBWEBRTC_LINUX_HWENC_HW_H264_ENCODER_H_
+#define LIBWEBRTC_LINUX_HWENC_HW_H264_ENCODER_H_
 
 // HoneyCords H.264-Encoder für Linux auf Basis von VA-API — über FFmpegs
 // `h264_vaapi`.
@@ -33,23 +33,40 @@
 #include "modules/video_coding/codecs/h264/include/h264_globals.h"
 #include "common_video/h264/h264_bitstream_parser.h"
 #include "common_video/include/bitrate_adjuster.h"
-#include "src/linux/hwenc/vaapi/ffmpeg_lader.h"
+#include "src/linux/hwenc/ffmpeg/ffmpeg_lader.h"
 
 namespace libwebrtc {
 
-class VaapiH264Encoder : public webrtc::VideoEncoder {
+class HwH264Encoder : public webrtc::VideoEncoder {
  public:
-  // Wahr, wenn FFmpeg in der passenden Fassung lädt, `h264_vaapi` existiert
-  // UND sich ein VA-API-Gerät wirklich öffnen lässt. Wird einmal geprüft und
-  // gemerkt — die Antwort kann sich im laufenden Prozess nicht ändern.
+  // Welcher Weg in die Hardware führt.
+  //
+  // ★ EIN ENCODER FÜR ALLE DREI HERSTELLER, weil FFmpeg die Unterschiede
+  // schon gekapselt hat: AMD und Intel über `h264_vaapi`, NVIDIA über
+  // `h264_nvenc`. Der Unterschied im Code beschränkt sich auf den
+  // Encoder-Namen, ein paar Optionen und die Frage, ob wir das Bild selbst in
+  // den Grafikspeicher legen müssen (VA-API: ja; NVENC lädt selbst hoch).
+  //
+  // ★ WARUM NVENC NICHT ÜBER VA-API MITLÄUFT: NVIDIAs VA-API-Treiber kann nur
+  // DEKODIEREN. Wer auf einer NVIDIA-Karte kodieren will, muss NVENC nehmen —
+  // über VA-API käme dort gar nichts.
+  enum class Backend { kVaapi, kNvenc };
+
+  // Wahr, wenn FFmpeg in der passenden Fassung lädt, einer der beiden Encoder
+  // existiert UND sich das zugehörige Gerät wirklich öffnen lässt. Wird einmal
+  // geprüft und gemerkt — die Antwort kann sich im laufenden Prozess nicht
+  // ändern.
   static bool IstVerfuegbar();
 
-  // Was im Fuß des Clients steht, z. B. „VA-API (libavcodec.so.61)".
+  // Der gefundene Weg. Nur gültig, wenn IstVerfuegbar() wahr ist.
+  static Backend GewaehlterWeg();
+
+  // Was im Fuß des Clients steht, z. B. „NVENC (libavcodec.so.61)".
   // Leer, wenn nicht verfügbar.
   static std::string BackendName();
 
-  explicit VaapiH264Encoder(const webrtc::SdpVideoFormat& format);
-  ~VaapiH264Encoder() override;
+  explicit HwH264Encoder(const webrtc::SdpVideoFormat& format);
+  ~HwH264Encoder() override;
 
   int InitEncode(const webrtc::VideoCodec* codec_settings,
                  const webrtc::VideoEncoder::Settings& settings) override;
@@ -96,7 +113,8 @@ class VaapiH264Encoder : public webrtc::VideoEncoder {
   webrtc::BitrateAdjuster bitrate_adjuster_;
   webrtc::EncodedImage encoded_image_;
 
-  int profil_ = 0;  // FF_PROFILE_H264_*, aus dem ausgehandelten SDP-Format
+  Backend weg_ = Backend::kVaapi;
+  int profil_ = 0;  // AV_PROFILE_H264_*, aus dem ausgehandelten SDP-Format
   webrtc::H264PacketizationMode packetization_mode_ =
       webrtc::H264PacketizationMode::NonInterleaved;
 
@@ -133,4 +151,4 @@ class VaapiH264Encoder : public webrtc::VideoEncoder {
 
 }  // namespace libwebrtc
 
-#endif  // LIBWEBRTC_LINUX_HWENC_VAAPI_H264_ENCODER_H_
+#endif  // LIBWEBRTC_LINUX_HWENC_HW_H264_ENCODER_H_

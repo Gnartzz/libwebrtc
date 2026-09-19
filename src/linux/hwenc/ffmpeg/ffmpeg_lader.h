@@ -1,5 +1,5 @@
-#ifndef LIBWEBRTC_LINUX_HWENC_VAAPI_FFMPEG_LADER_H_
-#define LIBWEBRTC_LINUX_HWENC_VAAPI_FFMPEG_LADER_H_
+#ifndef LIBWEBRTC_LINUX_HWENC_FFMPEG_LADER_H_
+#define LIBWEBRTC_LINUX_HWENC_FFMPEG_LADER_H_
 
 // Lädt zur Laufzeit die Handvoll FFmpeg-Funktionen, die der VA-API-Encoder
 // braucht — über den Soname, niemals beim Binden.
@@ -100,4 +100,4 @@ std::string FehlerText(int fehler);
 }  // namespace ffmpeg
 }  // namespace libwebrtc
 
-#endif  // LIBWEBRTC_LINUX_HWENC_VAAPI_FFMPEG_LADER_H_
+#endif  // LIBWEBRTC_LINUX_HWENC_FFMPEG_LADER_H_

@@ -1,11 +1,11 @@
-#include "src/linux/hwenc/vaapi_encoder_factory.h"
+#include "src/linux/hwenc/hw_encoder_factory.h"
 
 #include "absl/strings/match.h"
 #include "media/base/media_constants.h"
 #include "media/engine/internal_encoder_factory.h"
 #include "media/engine/simulcast_encoder_adapter.h"
 #include "rtc_base/logging.h"
-#include "src/linux/hwenc/vaapi/vaapi_h264_encoder.h"
+#include "src/linux/hwenc/ffmpeg/hw_h264_encoder.h"
 
 namespace libwebrtc {
 
@@ -14,44 +14,44 @@ namespace libwebrtc {
 // ★ SIE ERZEUGT NACKTE ENCODER, und das ist der springende Punkt: Der
 // SimulcastEncoderAdapter ruft sie EINMAL JE LAGE auf. Gäbe sie selbst schon
 // wieder einen Adapter zurück, hätten wir Adapter in Adapter.
-std::unique_ptr<webrtc::VideoEncoder> VaapiVideoEncoderFactory::InnenFabrik::Create(
+std::unique_ptr<webrtc::VideoEncoder> HwVideoEncoderFactory::InnenFabrik::Create(
     const webrtc::Environment& env,
     const webrtc::SdpVideoFormat& format) {
   if (absl::EqualsIgnoreCase(format.name, webrtc::kH264CodecName) &&
-      VaapiH264Encoder::IstVerfuegbar()) {
-    return std::make_unique<VaapiH264Encoder>(format);
+      HwH264Encoder::IstVerfuegbar()) {
+    return std::make_unique<HwH264Encoder>(format);
   }
   return intern_->Create(env, format);
 }
 
 std::vector<webrtc::SdpVideoFormat>
-VaapiVideoEncoderFactory::InnenFabrik::GetSupportedFormats() const {
+HwVideoEncoderFactory::InnenFabrik::GetSupportedFormats() const {
   return intern_->GetSupportedFormats();
 }
 
 // ── Die äußere Fabrik ───────────────────────────────────────────────────────
-VaapiVideoEncoderFactory::VaapiVideoEncoderFactory()
+HwVideoEncoderFactory::HwVideoEncoderFactory()
     : intern_(std::make_unique<webrtc::InternalEncoderFactory>()),
       innen_(intern_.get()) {}
 
-std::vector<webrtc::SdpVideoFormat> VaapiVideoEncoderFactory::GetSupportedFormats()
+std::vector<webrtc::SdpVideoFormat> HwVideoEncoderFactory::GetSupportedFormats()
     const {
   return intern_->GetSupportedFormats();
 }
 
-std::vector<webrtc::SdpVideoFormat> VaapiVideoEncoderFactory::GetImplementations()
+std::vector<webrtc::SdpVideoFormat> HwVideoEncoderFactory::GetImplementations()
     const {
   return intern_->GetImplementations();
 }
 
 webrtc::VideoEncoderFactory::CodecSupport
-VaapiVideoEncoderFactory::QueryCodecSupport(
+HwVideoEncoderFactory::QueryCodecSupport(
     const webrtc::SdpVideoFormat& format,
     std::optional<std::string> scalability_mode) const {
   return intern_->QueryCodecSupport(format, scalability_mode);
 }
 
-std::unique_ptr<webrtc::VideoEncoder> VaapiVideoEncoderFactory::Create(
+std::unique_ptr<webrtc::VideoEncoder> HwVideoEncoderFactory::Create(
     const webrtc::Environment& env,
     const webrtc::SdpVideoFormat& format) {
   // ★ GENAU DER AUFBAU DER EINGEBAUTEN FABRIK — nur mit unserer inneren
@@ -79,12 +79,12 @@ std::unique_ptr<webrtc::VideoEncoderFactory> CreateLinuxVideoEncoderFactory() {
   // ★ Die Probe einmal beim Aufbau, nicht beim ersten Anruf: So steht im
   // Protokoll VOR dem ersten Gespräch, woran es lag — und nicht erst, wenn
   // sich jemand fragt, warum die Last hoch ist.
-  RTC_LOG(LS_INFO) << "[vaapi] Video-Encoder: " << LinuxEncoderBezeichnung();
-  return std::make_unique<VaapiVideoEncoderFactory>();
+  RTC_LOG(LS_INFO) << "[hwenc] Video-Encoder: " << LinuxEncoderBezeichnung();
+  return std::make_unique<HwVideoEncoderFactory>();
 }
 
 std::string LinuxEncoderBezeichnung() {
-  const std::string name = VaapiH264Encoder::BackendName();
+  const std::string name = HwH264Encoder::BackendName();
   return name.empty() ? "Software (OpenH264)" : name;
 }
 

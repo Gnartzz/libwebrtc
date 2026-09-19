@@ -4,12 +4,12 @@ declare_args() {
   libwebrtc_intel_media_sdk = false
   libwebrtc_desktop_capture = true
 
-  # Hardware-Encoder unter Linux (VA-API ueber FFmpegs h264_vaapi, zur Laufzeit
-  # geladen). Standardmaessig an: Fehlt die Bibliothek, der Treiber oder
-  # /dev/dri, faellt der Client von selbst auf OpenH264 zurueck -- es gibt also
-  # keinen Grund, das beim Bauen abzuwaehlen. Der Schalter bleibt fuer
-  # Fehlersuche und fuer Bauten ohne Grafikanteil.
-  libwebrtc_vaapi = true
+  # Hardware-Encoder unter Linux ueber FFmpeg, zur Laufzeit geladen: VA-API
+  # (AMD/Intel) und NVENC (NVIDIA). Standardmaessig an: Fehlt die Bibliothek,
+  # der Treiber oder das Geraet, faellt der Client von selbst auf OpenH264
+  # zurueck -- es gibt also keinen Grund, das beim Bauen abzuwaehlen. Der
+  # Schalter bleibt fuer Fehlersuche und fuer Bauten ohne Grafikanteil.
+  libwebrtc_hwenc = true
 }
 
 if (is_android) {
@@ -216,20 +216,20 @@ rtc_shared_library("libwebrtc") {
     ]
   }
 
-  # Hardware-Encoder Linux (VA-API)
-  if (is_linux && libwebrtc_vaapi) {
+  # Hardware-Encoder Linux (VA-API fuer AMD/Intel, NVENC fuer NVIDIA)
+  if (is_linux && libwebrtc_hwenc) {
     sources += [
-      "src/linux/hwenc/vaapi/ffmpeg_lader.cc",
-      "src/linux/hwenc/vaapi/ffmpeg_lader.h",
-      "src/linux/hwenc/vaapi/vaapi_h264_encoder.cc",
-      "src/linux/hwenc/vaapi/vaapi_h264_encoder.h",
-      "src/linux/hwenc/vaapi_encoder_factory.cc",
-      "src/linux/hwenc/vaapi_encoder_factory.h",
+      "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
+      "src/linux/hwenc/ffmpeg/ffmpeg_lader.h",
+      "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
+      "src/linux/hwenc/ffmpeg/hw_h264_encoder.h",
+      "src/linux/hwenc/hw_encoder_factory.cc",
+      "src/linux/hwenc/hw_encoder_factory.h",
     ]
     # Die oeffentlichen FFmpeg-Header liegen im Baum (siehe ffmpeg_lader.h).
     # NICHT gegen libavcodec binden -- geladen wird zur Laufzeit per dlopen.
-    include_dirs += [ "src/linux/hwenc/vaapi/ffmpeg/include" ]
-    defines += [ "USE_VAAPI_ENCODER" ]
+    include_dirs += [ "src/linux/hwenc/ffmpeg/include" ]
+    defines += [ "USE_LINUX_HWENC" ]
     libs += [ "dl" ]
     # Die Abhaengigkeit steht weiter unten: `deps` gibt es an dieser Stelle
     # noch nicht (GN wertet von oben nach unten aus).
@@ -271,7 +271,7 @@ rtc_shared_library("libwebrtc") {
     "//third_party/libyuv",
   ]
 
-  if (is_linux && libwebrtc_vaapi) {
+  if (is_linux && libwebrtc_hwenc) {
     # Der SimulcastEncoderAdapter umhuellt unsere Encoder (Lagen + Rueckfall),
     # genau wie in der eingebauten Fabrik.
     deps += [ "../media:rtc_simulcast_encoder_adapter" ]
