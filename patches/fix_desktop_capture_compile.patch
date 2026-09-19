@@ -2,11 +2,24 @@ diff --git a/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc b
 index 070257f072..61fd0c8f3b 100644
 --- a/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
 +++ b/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
-@@ -71,10 +71,10 @@ constexpr int CursorMetaSize(int w, int h) {
+@@ -71,12 +71,25 @@ constexpr int CursorMetaSize(int w, int h) {
            w * h * kCursorBpp);
  }
  
 -constexpr PipeWireVersion kDmaBufModifierMinVersion = {.major = 0,
++// HoneyCord: `constexpr` geht hier nicht — PipeWireVersion traegt ein
++// std::string-Feld (`full_version`), und eine constexpr-Variable darf keinen
++// nichttrivialen Destruktor haben. Mit `const` uebersetzt es, dafuer schlagen
++// -Wexit-time-destructors und -Wglobal-constructors an, die WebRTC als Fehler
++// wertet (gemessen 19.09.2026 beim Linux-Bau).
++//
++// Die Warnungen sind hier gegenstandslos: Es sind zwei unveraenderliche
++// Versionsnummern, die nur verglichen werden. Sie an dieser einen Stelle
++// abzuschalten ist kleiner und nachvollziehbarer, als das Muster mit dem
++// absichtlich geleakten Zeiger einzufuehren.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wexit-time-destructors"
++#pragma clang diagnostic ignored "-Wglobal-constructors"
 +const PipeWireVersion kDmaBufModifierMinVersion = {.major = 0,
                                                         .minor = 3,
                                                         .micro = 33};
@@ -14,4 +27,7 @@ index 070257f072..61fd0c8f3b 100644
 +const PipeWireVersion kDropSingleModifierMinVersion = {.major = 0,
                                                             .minor = 3,
                                                             .micro = 40};
++#pragma clang diagnostic pop
  
+ class SharedScreenCastStreamPrivate {
+  public:
