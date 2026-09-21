@@ -325,8 +325,19 @@ int32_t HwH264Encoder::CodecOeffnen() {
   // Für ein Gespräch ist eine gleichmäßige Rate mehr wert als eine hohe
   // Spitze. Also: Spitzenrate = Ziel (knapp darüber, damit die Steuerung Luft
   // hat), Puffer eine halbe Sekunde AM ZIEL statt am Deckel.
-  ctx_->rc_max_rate = static_cast<int64_t>(target_bitrate_bps_) * 11 / 10;
+  // ★★ GEMESSEN 21.09.2026, 22:23 (2.6.233 mit „Spitze = Ziel + 10 %"): Der
+  // AMD-Treiber lieferte trotzdem das DOPPELTE — 2024 kbit/s vorgegeben,
+  // 3300–4200 gesendet; der Ausgleicher halbierte deshalb sein Ziel
+  // („fordert 1492 → nach Ausgleich 712"). Im VBR-Modus nimmt radeonsi die
+  // Spitzenrate offenbar als Empfehlung. Also ausdrücklich CBR: Spitze =
+  // Ziel, Modus benannt, Puffer eine halbe Sekunde, zu drei Vierteln
+  // vorgefüllt, damit der Start nicht mit einem Loch beginnt.
+  ctx_->rc_max_rate = target_bitrate_bps_;
   ctx_->rc_buffer_size = static_cast<int>(target_bitrate_bps_ / 2);
+  ctx_->rc_initial_buffer_occupancy = ctx_->rc_buffer_size * 3 / 4;
+  if (!nvenc) {
+    api.av_opt_set(ctx_->priv_data, "rc_mode", "CBR", 0);
+  }
   // ★ KEINE periodischen Keyframes. WebRTC fordert sie an, wenn ein Empfänger
   // eines braucht; von selbst gesendete kosten nur Bandbreite. `gop_size`
   // lässt sich nicht abschalten, also setzen wir ihn außer Reichweite.
@@ -428,9 +439,11 @@ int32_t HwH264Encoder::CodecOeffnen() {
                    << " @" << framerate_ << ", " << (target_bitrate_bps_ / 1000)
                    << " kbit/s, Profil " << profil_
                    << (bildschirm_ ? ", Bildschirm" : "");
-  Protokoll("offen: %s %ux%u @%u  ziel %u kbit/s  max %u kbit/s  Profil %d%s",
+  Protokoll("offen: %s %ux%u @%u  ziel %u kbit/s  spitze %lld  puffer %d kbit  %s  Profil %d%s",
             nvenc ? "NVENC" : "VA-API", width_, height_, framerate_,
-            target_bitrate_bps_ / 1000, max_bitrate_bps_ / 1000, profil_,
+            target_bitrate_bps_ / 1000,
+            static_cast<long long>(ctx_->rc_max_rate / 1000), ctx_->rc_buffer_size / 1000,
+            nvenc ? "nvenc-rc" : "CBR", profil_,
             bildschirm_ ? "  Bildschirm" : "");
   return WEBRTC_VIDEO_CODEC_OK;
 }
@@ -710,7 +723,7 @@ void HwH264Encoder::SetRates(
     }
     // Dieselbe Rechnung wie beim Öffnen: Spitze am Ziel, nicht am Deckel.
     ctx_->bit_rate = target_bitrate_bps_;
-    ctx_->rc_max_rate = static_cast<int64_t>(target_bitrate_bps_) * 11 / 10;
+    ctx_->rc_max_rate = target_bitrate_bps_;
     ctx_->rc_buffer_size = static_cast<int>(target_bitrate_bps_ / 2);
     return;
   }
