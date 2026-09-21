@@ -643,8 +643,24 @@ webrtc::VideoEncoder::EncoderInfo HwH264Encoder::GetEncoderInfo() const {
   // Treiber schneidet stillschweigend ab.
   info.requested_resolution_alignment = 16;
   info.supports_native_handle = false;
-  info.has_trusted_rate_controller = false;
-  info.scaling_settings = webrtc::VideoEncoder::ScalingSettings(24, 37);
+  // ★★ GEMESSEN 21.09.2026 auf dem UM890 (drei Läufe, Netz gut wie schlecht):
+  // Der Bildschirm-Capturer lieferte 54–57 Bilder/s, dieser Encoder brauchte
+  // 6–9 ms je Bild — und kodiert wurden 7 bis 9. Die Bilder verwarf WebRTC
+  // SELBST, zwischen Capturer und Encoder: Mit `has_trusted_rate_controller =
+  // false` schaltet es seinen eigenen Frame-Dropper vor, der Bilder wegwirft,
+  // sobald der Encoder mehr Bytes liefert, als die geschätzte Bandbreite
+  // hergibt. Die Schätzung hing bei 16–336 kbit/s bei erlaubten 24 000 — das
+  // Henne-Ei aus #102: Wer nichts sendet, dem wird nichts zugestanden.
+  //
+  // Der Windows-Encoder des Forks (`src/win/msdkvideoencoder.cc`) meldet
+  // `true` und `ScalingSettings::kOff` — dort gehen 99 % der Bilder durch.
+  // Beim Bau am 19.09. hatte ich die vorsichtige Einstellung gewählt, ohne
+  // das Vorbild anzusehen. `true` ist hier auch WAHR: VA-API und NVENC regeln
+  // die Rate selbst (CBR/VBR im Treiber), und `SetRates` reicht Bitrate und
+  // Bildrate an sie durch. Den Qualitäts-Skalierer braucht es ebenso nicht —
+  // die Auflösungsstufen wählt der Client (Stufe 1080p60 usw.), nicht WebRTC.
+  info.has_trusted_rate_controller = true;
+  info.scaling_settings = webrtc::VideoEncoder::ScalingSettings::kOff;
   return info;
 }
 
