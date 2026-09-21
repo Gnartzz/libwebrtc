@@ -5,6 +5,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <sys/stat.h>
 
 #include "api/video/i420_buffer.h"
 #include "api/video_codecs/h264_profile_level_id.h"
@@ -16,6 +21,51 @@
 #include "rtc_base/time_utils.h"
 
 namespace libwebrtc {
+
+namespace {
+
+// ★★ EIGENE PROTOKOLLDATEI `hwenc.log` (21.09.2026): `RTC_LOG` aus diesem
+// Encoder erreicht das Protokoll des Clients NICHT — gemessen an Tims
+// Bündeln, null Treffer für „[hwenc]". Damit war die Frage „was gibt WebRTC
+// dem Encoder vor, und was macht er daraus?" nicht zu beantworten, obwohl
+// genau sie zwischen Bandbreitenschätzung und Encoder entscheidet. Die Datei
+// liegt neben `send.log` (dieselbe Regel wie `log_ort.dart` im Client) und
+// geht mit dem Diagnose-Bündel automatisch mit hoch.
+void Protokoll(const char* format, ...) {
+  static std::string pfad;
+  if (pfad.empty()) {
+    const char* xdg = std::getenv("XDG_STATE_HOME");
+    const char* home = std::getenv("HOME");
+    std::string dir = (xdg && *xdg) ? std::string(xdg) + "/honeycord"
+                    : (home && *home) ? std::string(home) + "/.local/state/honeycord"
+                    : std::string("/tmp/honeycord");
+    ::mkdir(dir.c_str(), 0700);
+    pfad = dir + "/hwenc.log";
+  }
+  FILE* f = std::fopen(pfad.c_str(), "a");
+  if (!f) return;
+  // Gedeckelt wie diag.log: ab 512 KB von vorn (die letzte Sitzung zählt).
+  struct stat st;
+  if (::stat(pfad.c_str(), &st) == 0 && st.st_size > 512 * 1024) {
+    std::fclose(f);
+    f = std::fopen(pfad.c_str(), "w");
+    if (!f) return;
+  }
+  std::time_t t = std::time(nullptr);
+  std::tm tm{};
+  localtime_r(&t, &tm);
+  std::fprintf(f, "[%02d-%02d %02d:%02d:%02d] ", tm.tm_mon + 1, tm.tm_mday,
+               tm.tm_hour, tm.tm_min, tm.tm_sec);
+  va_list args;
+  va_start(args, format);
+  std::vfprintf(f, format, args);
+  va_end(args);
+  std::fputc('\n', f);
+  std::fclose(f);
+}
+
+}  // namespace
+
 namespace {
 
 bool NvidiaKnotenDa() {
@@ -367,6 +417,10 @@ int32_t HwH264Encoder::CodecOeffnen() {
                    << " @" << framerate_ << ", " << (target_bitrate_bps_ / 1000)
                    << " kbit/s, Profil " << profil_
                    << (bildschirm_ ? ", Bildschirm" : "");
+  Protokoll("offen: %s %ux%u @%u  ziel %u kbit/s  max %u kbit/s  Profil %d%s",
+            nvenc ? "NVENC" : "VA-API", width_, height_, framerate_,
+            target_bitrate_bps_ / 1000, max_bitrate_bps_ / 1000, profil_,
+            bildschirm_ ? "  Bildschirm" : "");
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -587,6 +641,25 @@ void HwH264Encoder::SetRates(
   }
   bitrate_adjuster_.SetTargetBitrateBps(parameters.bitrate.get_sum_bps());
   const uint32_t neu = bitrate_adjuster_.GetAdjustedBitrateBps();
+  // ★ Messung (21.09.2026): jede Vorgabe, die sich um mehr als ein Zehntel
+  // vom letzten Eintrag unterscheidet, sonst höchstens alle fünf Sekunden.
+  {
+    static uint32_t zuletzt_gefordert = 0;
+    static int64_t zuletzt_ms = 0;
+    const uint32_t gefordert = parameters.bitrate.get_sum_bps();
+    const int64_t jetzt_ms = webrtc::TimeMillis();
+    const uint32_t g = std::max(gefordert, zuletzt_gefordert);
+    const uint32_t k = std::min(gefordert, zuletzt_gefordert);
+    if ((g - k) * 10 > g || jetzt_ms - zuletzt_ms >= 5000) {
+      Protokoll("SetRates: WebRTC fordert %u kbit/s @%.1f fps  -> nach Ausgleich %u  "
+                "(Encoder steht auf %u, max %u)%s",
+                gefordert / 1000, parameters.framerate_fps, neu / 1000,
+                target_bitrate_bps_ / 1000, max_bitrate_bps_ / 1000,
+                ctx_ ? "" : "  [kein Kontext]");
+      zuletzt_gefordert = gefordert;
+      zuletzt_ms = jetzt_ms;
+    }
+  }
   if (!ctx_ || neu == 0 || target_bitrate_bps_ == 0) return;
 
   // ★ Die beiden Wege verhalten sich hier UNTERSCHIEDLICH (Prüfbefund
@@ -620,6 +693,9 @@ void HwH264Encoder::SetRates(
   // Sekunden. Kleine Wellen fängt der Ausgleicher ab.
   if (!sprung || jetzt - letztes_aufsetzen_ms_ < 3000) return;
 
+  Protokoll("VA-API neu aufsetzen: %u -> %u kbit/s (Sprung, %lld ms seit dem letzten)",
+            target_bitrate_bps_ / 1000, neu / 1000,
+            static_cast<long long>(jetzt - letztes_aufsetzen_ms_));
   target_bitrate_bps_ = neu;
   if (max_bitrate_bps_ < target_bitrate_bps_) {
     max_bitrate_bps_ = target_bitrate_bps_ * 2;
@@ -630,6 +706,8 @@ void HwH264Encoder::SetRates(
     oeffnen_scheiterte_ = true;
     ++misslungene_versuche_;
     RTC_LOG(LS_ERROR) << "[hwenc] Neu-Aufsetzen nach Ratenwechsel misslungen";
+    Protokoll("FEHLER: Neu-Aufsetzen nach Ratenwechsel misslungen (Versuch %d)",
+              misslungene_versuche_);
   }
 }
 
