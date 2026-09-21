@@ -311,11 +311,22 @@ int32_t HwH264Encoder::CodecOeffnen() {
   ctx_->time_base = AVRational{1, 1000};
   ctx_->framerate = AVRational{static_cast<int>(framerate_), 1};
   ctx_->bit_rate = target_bitrate_bps_;
-  ctx_->rc_max_rate = max_bitrate_bps_;
-  // Puffer so groß wie eine halbe Sekunde: größer glättet stärker, kostet aber
-  // Verzögerung — und Verzögerung ist in einem Gespräch teurer als eine
-  // schwankende Rate.
-  ctx_->rc_buffer_size = static_cast<int>(max_bitrate_bps_ / 2);
+  // ★★ GEMESSEN 21.09.2026 (Tim: „alle 2–5 Sekunden scheint das Bild kurz zu
+  // stehen", bei 7,8 Mbit/s Ziel und 60 Bildern/s):
+  //
+  // Die Spitzenrate hing am DECKEL der Qualitätsstufe (24 Mbit/s), nicht am
+  // tatsächlichen Ziel. Der Encoder durfte also jederzeit auf das Dreifache
+  // ausbrechen, und der Puffer (halber Deckel = 12 Mbit) reichte für rund
+  // ANDERTHALB SEKUNDEN dieser Spitze. Genau das kam in den Zahlen an: 9677
+  // kbit/s gemessen, wo 7825 vorgegeben waren. Ein solcher Ausbruch muss über
+  // die Leitung geschoben werden, und solange das läuft, wartet der Empfänger
+  // — das Bild steht kurz und holt dann auf.
+  //
+  // Für ein Gespräch ist eine gleichmäßige Rate mehr wert als eine hohe
+  // Spitze. Also: Spitzenrate = Ziel (knapp darüber, damit die Steuerung Luft
+  // hat), Puffer eine halbe Sekunde AM ZIEL statt am Deckel.
+  ctx_->rc_max_rate = static_cast<int64_t>(target_bitrate_bps_) * 11 / 10;
+  ctx_->rc_buffer_size = static_cast<int>(target_bitrate_bps_ / 2);
   // ★ KEINE periodischen Keyframes. WebRTC fordert sie an, wenn ein Empfänger
   // eines braucht; von selbst gesendete kosten nur Bandbreite. `gop_size`
   // lässt sich nicht abschalten, also setzen wir ihn außer Reichweite.
@@ -697,9 +708,10 @@ void HwH264Encoder::SetRates(
     if (max_bitrate_bps_ < target_bitrate_bps_) {
       max_bitrate_bps_ = target_bitrate_bps_ * 2;
     }
+    // Dieselbe Rechnung wie beim Öffnen: Spitze am Ziel, nicht am Deckel.
     ctx_->bit_rate = target_bitrate_bps_;
-    ctx_->rc_max_rate = max_bitrate_bps_;
-    ctx_->rc_buffer_size = static_cast<int>(max_bitrate_bps_ / 2);
+    ctx_->rc_max_rate = static_cast<int64_t>(target_bitrate_bps_) * 11 / 10;
+    ctx_->rc_buffer_size = static_cast<int>(target_bitrate_bps_ / 2);
     return;
   }
 
