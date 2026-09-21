@@ -674,7 +674,22 @@ void HwH264Encoder::SetRates(
   //    Warteschlange voll, Verluste, Schätzung sinkt weiter.
   const uint32_t gross = std::max(neu, target_bitrate_bps_);
   const uint32_t klein = std::min(neu, target_bitrate_bps_);
-  const bool sprung = (gross - klein) * 4 > gross;
+  // ★★ GEMESSEN 21.09.2026 (Tims Freigabe am Kabel, `hwenc.log` + `send.log`):
+  // Mit „ein Viertel Abweichung, alle drei Sekunden" setzte sich der Encoder in
+  // 80 Sekunden FÜNFMAL neu auf (1244 → 1859 → 930 → 495 → 285 → 703 kbit/s).
+  // Jedes Neu-Aufsetzen kostet ein Vollbild, und bei 3840×1072 ist das bei
+  // einem Budget von 200 kbit/s die Arbeit mehrerer Sekunden. Das frisst genau
+  // die Bandbreite, die die Schätzung bräuchte, um wieder zu steigen — der
+  // Strom kam mit 17–40 kbit/s an, obwohl die Leitung (2,5 Gbit, 11 ms, 0 %
+  // Verlust) nichts hergab, woran es liegen könnte. Ein Kreis, der sich selbst
+  // am Leben hält.
+  //
+  // Darum jetzt: erst bei DOPPELTER Abweichung und höchstens alle zehn
+  // Sekunden. Zwischen den Vollbildern hat die Ratensteuerung damit Zeit, sich
+  // einzuschwingen, und die Schätzung bekommt Luft zum Wachsen. Kleine Wellen
+  // fängt weiterhin der Ausgleicher ab; was er nicht auffängt, kostet
+  // Bildqualität — aber Bildqualität, die überhaupt ankommt.
+  const bool sprung = gross > klein * 2;
   const int64_t jetzt = webrtc::TimeMillis();
 
   if (weg_ == Backend::kNvenc) {
@@ -691,9 +706,9 @@ void HwH264Encoder::SetRates(
   // VA-API: wirklich neu aufsetzen. Das kostet ein Keyframe, deshalb nur bei
   // echten Sprüngen — mehr als ein Viertel Abweichung UND höchstens alle drei
   // Sekunden. Kleine Wellen fängt der Ausgleicher ab.
-  if (!sprung || jetzt - letztes_aufsetzen_ms_ < 3000) return;
+  if (!sprung || jetzt - letztes_aufsetzen_ms_ < 10000) return;
 
-  Protokoll("VA-API neu aufsetzen: %u -> %u kbit/s (Sprung, %lld ms seit dem letzten)",
+  Protokoll("VA-API neu aufsetzen: %u -> %u kbit/s (doppelte Abweichung, %lld ms seit dem letzten)",
             target_bitrate_bps_ / 1000, neu / 1000,
             static_cast<long long>(jetzt - letztes_aufsetzen_ms_));
   target_bitrate_bps_ = neu;
