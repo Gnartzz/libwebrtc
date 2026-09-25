@@ -121,6 +121,28 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   uint32_t target_bitrate_bps_ = 0;
   uint32_t max_bitrate_bps_ = 0;
   uint32_t framerate_ = 30;
+  // ★ 25.09.2026: die Bildrate, mit der der Encoder GEÖFFNET wurde. VA-API
+  // verteilt die CBR-Rate auf genau diese Bildrate — kommen weniger Bilder,
+  // geht nur ein Bruchteil der Rate raus (Haltoan: 947 kbit/s bei @60
+  // geöffnet, ~22 fps geliefert → 300–400 kbit/s gesendet).
+  uint32_t framerate_offen_ = 30;
+  // maxFramerate aus InitEncode — Obergrenze der Klemme, damit eine 15-fps-
+  // Kamera nicht auf 20 hochgezogen wird (Prüfbefund M3).
+  uint32_t max_fps_ = 30;
+  // Die ROHE Forderung von WebRTC beim letzten Öffnen. Der Ausgleicher
+  // schwankt von selbst zwischen 0,5× und 0,95× — auf ihn bezogen wäre eine
+  // 1,5×-Schwelle ein neuer Kreis (Prüfbefund M1).
+  uint32_t gefordert_offen_ = 0;
+  // Wie viele SetRates in Folge die Bildrate in DIESELBE Richtung abwich
+  // (+ = höher, − = niedriger). Erst ab drei gilt es (Prüfbefund M2).
+  int bildrate_folge_ = 0;
+  // Zeitmessung je Phase (Mikrosekunden), alle fünf Sekunden ins hwenc.log.
+  int64_t zeit_i420_us_ = 0;
+  int64_t zeit_nv12_us_ = 0;
+  int64_t zeit_hoch_us_ = 0;
+  int64_t zeit_kod_us_ = 0;
+  int zeit_bilder_ = 0;
+  int64_t zeit_start_ms_ = 0;
   int width_ = 0;
   int height_ = 0;
   bool bildschirm_ = false;

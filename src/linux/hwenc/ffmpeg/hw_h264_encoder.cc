@@ -92,6 +92,41 @@ bool RenderKnotenDa() {
   return false;
 }
 
+// ★ 25.09.2026: Welche Grafikkarte steckt hinter dem Render-Knoten? Ohne
+// diese Zeile war bei Haltoans 40–55 ms je Bild nicht zu sagen, ob eine
+// schwache iGPU, ein fremder Treiber oder unser Weg die Zeit kostet.
+std::string SysfsZeile(const std::string& pfad) {
+  FILE* f = std::fopen(pfad.c_str(), "r");
+  if (!f) return "?";
+  char puffer[128] = {0};
+  if (!std::fgets(puffer, sizeof(puffer), f)) puffer[0] = 0;
+  std::fclose(f);
+  std::string s(puffer);
+  while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+  return s.empty() ? "?" : s;
+}
+
+std::string GpuBeschreibung() {
+  std::string text;
+  for (const char* knoten : {"renderD128", "renderD129"}) {
+    const std::string basis = std::string("/sys/class/drm/") + knoten + "/device/";
+    const std::string hersteller = SysfsZeile(basis + "vendor");
+    if (hersteller == "?") continue;
+    char ziel[256] = {0};
+    const ssize_t n = ::readlink((basis + "driver").c_str(), ziel, sizeof(ziel) - 1);
+    std::string treiber = "?";
+    if (n > 0) {
+      treiber = std::string(ziel, static_cast<size_t>(n));
+      const size_t pos = treiber.rfind('/');
+      if (pos != std::string::npos) treiber = treiber.substr(pos + 1);
+    }
+    if (!text.empty()) text += ", ";
+    text += std::string(knoten) + "=" + hersteller + ":" + SysfsZeile(basis + "device") +
+            " (" + treiber + ")";
+  }
+  return text.empty() ? "keine Angabe" : text;
+}
+
 // ★ WebRTC liefert I420, die Hardware will NV12. Die Wandlung kostet einen
 // Durchlauf über das Bild — sie ist der Preis dafür, dass dieser Encoder mit
 // JEDEM Aufnehmer zusammenarbeitet (Kamera, PipeWire, Testbild). Ein echter
@@ -236,9 +271,12 @@ int HwH264Encoder::InitEncode(
   width_ = codec_settings->width;
   height_ = codec_settings->height;
   framerate_ = codec_settings->maxFramerate ? codec_settings->maxFramerate : 30;
+  max_fps_ = framerate_;
+  bildrate_folge_ = 0;
   target_bitrate_bps_ = codec_settings->startBitrate * 1000;
   max_bitrate_bps_ = codec_settings->maxBitrate * 1000;
   if (target_bitrate_bps_ == 0) target_bitrate_bps_ = 1000000;
+  gefordert_offen_ = target_bitrate_bps_;
   if (max_bitrate_bps_ < target_bitrate_bps_) {
     max_bitrate_bps_ = target_bitrate_bps_ * 2;
   }
@@ -309,6 +347,17 @@ int32_t HwH264Encoder::CodecOeffnen() {
   // eine monoton steigende Zahl — den RTP-Stempel setzen wir beim
   // Weiterreichen ohnehin selbst.
   ctx_->time_base = AVRational{1, 1000};
+  // ★ 25.09.2026: Bildrate in einen vernünftigen Bereich zwingen — sie kommt
+  // seit heute auch aus `SetRates` (gemessene Eingangsrate), und 0 oder
+  // Ausreißer würden die Ratensteuerung des Treibers verbiegen.
+  // Untergrenze 20: Ein ruhender Bildschirm meldet 1–5 fps; mit 5 geöffnet,
+  // liefe bei plötzlicher Bewegung (60 fps) das Zwölffache der Rate heraus.
+  // Nur VA-API (NVENC bleibt wie gehabt), und nie über maxFramerate hinaus —
+  // eine 15-fps-Kamera bleibt bei 15 (Prüfbefund M3).
+  if (!nvenc) {
+    framerate_ = std::clamp<uint32_t>(framerate_, std::min<uint32_t>(20, max_fps_),
+                                      std::max<uint32_t>(max_fps_, 20));
+  }
   ctx_->framerate = AVRational{static_cast<int>(framerate_), 1};
   ctx_->bit_rate = target_bitrate_bps_;
   // ★★ GEMESSEN 21.09.2026 (Tim: „alle 2–5 Sekunden scheint das Bild kurz zu
@@ -433,6 +482,14 @@ int32_t HwH264Encoder::CodecOeffnen() {
   oeffnen_scheiterte_ = false;
   misslungene_versuche_ = 0;
   letztes_aufsetzen_ms_ = webrtc::TimeMillis();
+  framerate_offen_ = framerate_;
+  {
+    static bool gpu_genannt = false;
+    if (!gpu_genannt) {
+      gpu_genannt = true;
+      Protokoll("Grafik: %s", GpuBeschreibung().c_str());
+    }
+  }
 
   RTC_LOG(LS_INFO) << "[hwenc] " << (nvenc ? "NVENC" : "VA-API")
                    << " offen: " << width_ << "x" << height_
@@ -531,8 +588,10 @@ int32_t HwH264Encoder::Encode(
   // Empfänger nichts, worauf er aufsetzen kann.
   if (frame_index_ == 0) keyframe = true;
 
+  const int64_t t0 = webrtc::TimeMicros();
   auto puffer = frame.video_frame_buffer()->ToI420();
   if (!puffer) return WEBRTC_VIDEO_CODEC_ERROR;
+  const int64_t t1 = webrtc::TimeMicros();
 
   int r = api.av_frame_make_writable(sw_frame_);
   if (r < 0) {
@@ -540,6 +599,7 @@ int32_t HwH264Encoder::Encode(
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
   I420NachNv12(*puffer, sw_frame_);
+  const int64_t t2 = webrtc::TimeMicros();
   const int64_t pts = frame_index_++;
   sw_frame_->pts = pts;
   sw_frame_->pict_type = keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
@@ -576,6 +636,7 @@ int32_t HwH264Encoder::Encode(
     hw_frame_->pict_type = sw_frame_->pict_type;
     hinein = hw_frame_;
   }
+  const int64_t t3 = webrtc::TimeMicros();
 
   r = api.avcodec_send_frame(ctx_, hinein);
   if (r == AVERROR(EAGAIN)) {
@@ -593,6 +654,30 @@ int32_t HwH264Encoder::Encode(
   }
 
   PaketeAbholen();
+
+  // ★ 25.09.2026 (Haltoan: 40–55 ms je Bild, 90 % CPU und GPU): Wohin geht
+  // die Zeit? Alle fünf Sekunden die Mittelwerte je Phase.
+  const int64_t t4 = webrtc::TimeMicros();
+  zeit_i420_us_ += t1 - t0;
+  zeit_nv12_us_ += t2 - t1;
+  zeit_hoch_us_ += t3 - t2;
+  zeit_kod_us_ += t4 - t3;
+  ++zeit_bilder_;
+  const int64_t jetzt_ms = t4 / 1000;
+  if (zeit_start_ms_ == 0) zeit_start_ms_ = jetzt_ms;
+  if (jetzt_ms - zeit_start_ms_ >= 5000 && zeit_bilder_ > 0) {
+    const double n = zeit_bilder_;
+    Protokoll("Zeiten je Bild (%d Bilder, %dx%d, %s): I420 %.1f ms · NV12 %.1f ms · "
+              "hochladen %.1f ms · kodieren+abholen %.1f ms",
+              zeit_bilder_, width_, height_,
+              frame.video_frame_buffer()->type() == webrtc::VideoFrameBuffer::Type::kI420
+                  ? "kam als I420" : "musste gewandelt werden",
+              zeit_i420_us_ / n / 1000.0, zeit_nv12_us_ / n / 1000.0,
+              zeit_hoch_us_ / n / 1000.0, zeit_kod_us_ / n / 1000.0);
+    zeit_i420_us_ = zeit_nv12_us_ = zeit_hoch_us_ = zeit_kod_us_ = 0;
+    zeit_bilder_ = 0;
+    zeit_start_ms_ = jetzt_ms;
+  }
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -701,19 +786,44 @@ void HwH264Encoder::SetRates(
   // ★★ GEMESSEN 21.09.2026 (Tims Freigabe am Kabel, `hwenc.log` + `send.log`):
   // Mit „ein Viertel Abweichung, alle drei Sekunden" setzte sich der Encoder in
   // 80 Sekunden FÜNFMAL neu auf (1244 → 1859 → 930 → 495 → 285 → 703 kbit/s).
-  // Jedes Neu-Aufsetzen kostet ein Vollbild, und bei 3840×1072 ist das bei
-  // einem Budget von 200 kbit/s die Arbeit mehrerer Sekunden. Das frisst genau
-  // die Bandbreite, die die Schätzung bräuchte, um wieder zu steigen — der
-  // Strom kam mit 17–40 kbit/s an, obwohl die Leitung (2,5 Gbit, 11 ms, 0 %
-  // Verlust) nichts hergab, woran es liegen könnte. Ein Kreis, der sich selbst
-  // am Leben hält.
-  //
-  // Darum jetzt: erst bei DOPPELTER Abweichung und höchstens alle zehn
-  // Sekunden. Zwischen den Vollbildern hat die Ratensteuerung damit Zeit, sich
-  // einzuschwingen, und die Schätzung bekommt Luft zum Wachsen. Kleine Wellen
-  // fängt weiterhin der Ausgleicher ab; was er nicht auffängt, kostet
-  // Bildqualität — aber Bildqualität, die überhaupt ankommt.
-  const bool sprung = gross > klein * 2;
+  // Jedes Neu-Aufsetzen kostet ein Vollbild — das fraß genau die Bandbreite,
+  // die die Schätzung zum Wachsen brauchte. Seitdem ABWÄRTS erst bei doppelter
+  // Abweichung (auf den ausgeglichenen Wert bezogen, wie bisher).
+  const bool runter = neu < target_bitrate_bps_ && gross > klein * 2;
+  // ★★ 25.09.2026 (Haltoan, Linux-Stream matschig, hwenc.log): VA-API startete
+  // mit 947 kbit/s, WebRTC forderte danach 1689 — das 1,78-Fache, also KEIN
+  // doppelter Sprung, und der Encoder blieb für immer auf 947. AUFWÄRTS jetzt
+  // ab dem 1,5-Fachen — aber gemessen an der ROHEN Forderung gegen die rohe
+  // Forderung beim letzten Öffnen. Der Ausgleicher schwankt von selbst
+  // zwischen 0,5× und 0,95× (ein Vollbild drückt ihn nach unten); auf ihn
+  // bezogen hätte 1,5× den Kreis vom 21.09. wieder geöffnet (Prüfbefund M1).
+  const uint32_t gefordert = parameters.bitrate.get_sum_bps();
+  const bool hoch = static_cast<uint64_t>(gefordert) * 2 >=
+                    static_cast<uint64_t>(gefordert_offen_) * 3;
+  // ★★ Und die BILDRATE: VA-API verteilt die CBR-Rate auf die Bildrate beim
+  // Öffnen. Geöffnet mit 60, geliefert ~22 → gesendet ein Drittel (gemessen
+  // 204–411 kbit/s bei 947 Ziel). Weicht die gemeldete Eingangsrate um das
+  // 1,5-Fache ab — und das DREI Meldungen in Folge in dieselbe Richtung, sonst
+  // setzte ein Bildschirm zwischen Ruhe, Tippen und Scrollen laufend neu auf
+  // (Prüfbefund M2) —, mit der echten neu aufsetzen.
+  const uint32_t fz = std::clamp<uint32_t>(framerate_, std::min<uint32_t>(20, max_fps_),
+                                           std::max<uint32_t>(max_fps_, 20));
+  const uint32_t fg = std::max(fz, framerate_offen_);
+  const uint32_t fk = std::max<uint32_t>(1, std::min(fz, framerate_offen_));
+  const bool abweichung = fg * 2 >= fk * 3;
+  const int richtung = !abweichung ? 0 : (fz > framerate_offen_ ? 1 : -1);
+  if (richtung == 0) {
+    bildrate_folge_ = 0;
+  } else if ((richtung > 0) == (bildrate_folge_ > 0) && bildrate_folge_ != 0) {
+    bildrate_folge_ += richtung;
+  } else {
+    bildrate_folge_ = richtung;
+  }
+  const bool bildrate = bildrate_folge_ >= 3 || bildrate_folge_ <= -3;
+  // Steigt die Bildrate, schießt die Rate über — dann nicht zehn, sondern
+  // höchstens drei Sekunden warten.
+  const bool bildrate_hoch = bildrate && bildrate_folge_ > 0;
+  const bool sprung = hoch || runter || bildrate;
   const int64_t jetzt = webrtc::TimeMillis();
 
   if (weg_ == Backend::kNvenc) {
@@ -729,14 +839,22 @@ void HwH264Encoder::SetRates(
   }
 
   // VA-API: wirklich neu aufsetzen. Das kostet ein Keyframe, deshalb nur bei
-  // echten Sprüngen — mehr als ein Viertel Abweichung UND höchstens alle drei
-  // Sekunden. Kleine Wellen fängt der Ausgleicher ab.
-  if (!sprung || jetzt - letztes_aufsetzen_ms_ < 10000) return;
+  // echten Sprüngen (s. oben: hoch ab 1,5×, runter ab 2×, Bildrate ab 1,5×)
+  // UND höchstens alle zehn Sekunden. Kleine Wellen fängt der Ausgleicher ab.
+  const int64_t sperrzeit_ms = bildrate_hoch ? 3000 : 10000;
+  if (!sprung || jetzt - letztes_aufsetzen_ms_ < sperrzeit_ms) return;
 
-  Protokoll("VA-API neu aufsetzen: %u -> %u kbit/s (doppelte Abweichung, %lld ms seit dem letzten)",
-            target_bitrate_bps_ / 1000, neu / 1000,
+  // Nur ABWÄRTS darf die Rate sinken. Löst „hoch" oder „bildrate" aus,
+  // während der Ausgleicher gerade von einem Überschuss gedrückt ist, bliebe
+  // sonst weniger als vorher (Prüfbefunde M1/M2).
+  const uint32_t soll = runter ? neu : std::max(neu, target_bitrate_bps_);
+  Protokoll("VA-API neu aufsetzen: %u -> %u kbit/s, @%u -> @%u fps (%s%s%s, %lld ms seit dem letzten)",
+            target_bitrate_bps_ / 1000, soll / 1000, framerate_offen_, fz,
+            hoch ? "hoch " : "", runter ? "runter " : "", bildrate ? "bildrate" : "",
             static_cast<long long>(jetzt - letztes_aufsetzen_ms_));
-  target_bitrate_bps_ = neu;
+  target_bitrate_bps_ = soll;
+  gefordert_offen_ = gefordert;
+  bildrate_folge_ = 0;
   if (max_bitrate_bps_ < target_bitrate_bps_) {
     max_bitrate_bps_ = target_bitrate_bps_ * 2;
   }
