@@ -1,0 +1,2 @@
+# Patch-Dateien nie in CRLF umwandeln -- sonst scheitert git apply auf Windows (07.10.2026)
+*.patch -text

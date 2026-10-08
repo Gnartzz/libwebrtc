@@ -1,0 +1,72 @@
+--- a/audio/audio_state.cc
++++ b/audio/audio_state.cc
+@@ -116,7 +116,28 @@
+   RTC_DCHECK_EQ(1, count);
+   config_.audio_mixer->RemoveSource(stream->source());
+   if (receiving_streams_.empty()) {
++#if defined(WEBRTC_WIN) && defined(HONEYCORD_PLAYOUT_HALTEN)
++    // HoneyCord #101 (07.10.2026): Mit der Windows-Echounterdrueckung (DMO)
++    // liefert die Aufnahme nur, solange die Wiedergabe laeuft ("DMO won't
++    // provide captured data unless we give it render data"). Ging der letzte
++    // andere Teilnehmer, stoppte die Wiedergabe hier bedingungslos, und das
++    // eigene Mikrofon verstummte, waehrend alles "an" meldete. Solange eine
++    // Mikrofonspur veroeffentlicht ist, bleibt die Wiedergabe deshalb an (sie
++    // spielt Stille); RemoveSendingStream stoppt sie, wenn auch das endet.
++    // Bewusst OHNE adm->Recording(): Stummschalten stoppt die Aufnahme
++    // (IsStopOnMuteModeEnabled), und ohne laufende Wiedergabe lehnt der DMO
++    // das spaetere StartRecording beim Entstummen ab (Pruefbefund M1).
++    // Gegenstueck zu webrtc-sdk c344898578/880640803d in AddSendingStream.
++    auto* adm = config_.audio_device_module.get();
++    if (!sending_streams_.empty() && adm->BuiltInAECIsAvailable()) {
++      RTC_LOG(LS_WARNING) << "HoneyCord #101: letzte Empfangsspur weg, "
++                             "Wiedergabe bleibt fuer die Aufnahme an";
++    } else {
++      adm->StopPlayout();
++    }
++#else
+     config_.audio_device_module->StopPlayout();
++#endif
+   }
+   UpdateNullAudioPollerState();
+ }
+@@ -177,6 +198,14 @@
+   UpdateAudioTransportWithSendingStreams();
+   if (sending_streams_.empty()) {
+     config_.audio_device_module->StopRecording();
++#if defined(WEBRTC_WIN) && defined(HONEYCORD_PLAYOUT_HALTEN)
++    // HoneyCord #101: Die fuer die Aufnahme offen gehaltene Wiedergabe endet
++    // hier, wenn auch nichts mehr empfangen wird -- erst Aufnahme, dann
++    // Wiedergabe (Reihenfolge, die der DMO verlangt).
++    if (receiving_streams_.empty() && config_.audio_device_module->Playing()) {
++      config_.audio_device_module->StopPlayout();
++    }
++#endif
+   }
+ }
+ 
+--- a/audio/BUILD.gn
++++ b/audio/BUILD.gn
+@@ -13,6 +13,10 @@
+ }
+ 
+ rtc_library("audio") {
++  # HoneyCord #101 (siehe webrtc.gni, audio_state.cc).
++  if (rtc_honeycord_playout_halten) {
++    defines = [ "HONEYCORD_PLAYOUT_HALTEN" ]
++  }
+   sources = [
+     "audio_level.cc",
+     "audio_level.h",
+--- a/webrtc.gni
++++ b/webrtc.gni
+@@ -1287,3 +1287,10 @@
+     }
+   }
+ }
++
++declare_args() {
++  # HoneyCord #101: Windows-Wiedergabe offen halten, solange ein Mikrofon
++  # sendet (sonst verhungert die Aufnahme ueber die Windows-Echounterdrueckung,
++  # wenn der letzte andere Teilnehmer geht). Nur im Alpha-Bau eingeschaltet.
++  rtc_honeycord_playout_halten = false
++}
