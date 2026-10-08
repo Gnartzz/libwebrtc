@@ -1,0 +1,735 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index 4f54d90..391995a 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -38,7 +38,7 @@ if (!build_with_chromium) {
+   # 'ninja default' and then 'ninja all', the second build should do no work.
+   group("default") {
+     testonly = true
+-    deps = [ ":webrtc" ]
++    deps = [ ":webrtc","//libwebrtc", ]
+     if (rtc_build_examples) {
+       deps += [ "examples" ]
+     }
+diff --git a/api/audio/audio_device_defines.h b/api/audio/audio_device_defines.h
+index 63eca2a..88f8463 100644
+--- a/api/audio/audio_device_defines.h
++++ b/api/audio/audio_device_defines.h
+@@ -21,6 +21,8 @@
+ 
+ namespace webrtc {
+ 
++class AudioSender;
++
+ static const int kAdmMaxDeviceNameSize = 128;
+ static const int kAdmMaxFileNameSize = 512;
+ static const int kAdmMaxGuidSize = 128;
+@@ -86,7 +88,12 @@ class AudioTransport {
+                               int64_t* elapsed_time_ms,
+                               int64_t* ntp_time_ms) = 0;
+ 
+- protected:
++  virtual void UpdateAudioSenders(std::vector<AudioSender*> senders,
++                                  int send_sample_rate_hz,
++                                  size_t send_num_channels) {}
++
++  virtual void SetStereoChannelSwapping(bool enable) {}
++
+   virtual ~AudioTransport() {}
+ };
+ 
+diff --git a/api/create_peerconnection_factory.cc b/api/create_peerconnection_factory.cc
+index c64828e..dd260f1 100644
+--- a/api/create_peerconnection_factory.cc
++++ b/api/create_peerconnection_factory.cc
+@@ -44,7 +44,8 @@ scoped_refptr<PeerConnectionFactoryInterface> CreatePeerConnectionFactory(
+     scoped_refptr<AudioMixer> audio_mixer,
+     scoped_refptr<AudioProcessing> audio_processing,
+     std::unique_ptr<AudioFrameProcessor> audio_frame_processor,
+-    std::unique_ptr<FieldTrialsView> field_trials) {
++    std::unique_ptr<FieldTrialsView> field_trials,
++    scoped_refptr<AudioTransportFactory> audio_transport_factory) {
+   PeerConnectionFactoryDependencies dependencies;
+   dependencies.network_thread = network_thread;
+   dependencies.worker_thread = worker_thread;
+@@ -69,6 +70,9 @@ scoped_refptr<PeerConnectionFactoryInterface> CreatePeerConnectionFactory(
+         std::make_unique<BuiltinAudioProcessingBuilder>();
+ #endif
+   }
++  if(audio_transport_factory != nullptr) {
++    dependencies.audio_transport_factory = std::move(audio_transport_factory);
++  }
+   dependencies.audio_mixer = std::move(audio_mixer);
+   dependencies.video_encoder_factory = std::move(video_encoder_factory);
+   dependencies.video_decoder_factory = std::move(video_decoder_factory);
+diff --git a/api/create_peerconnection_factory.h b/api/create_peerconnection_factory.h
+index 6831100..5c66f47 100644
+--- a/api/create_peerconnection_factory.h
++++ b/api/create_peerconnection_factory.h
+@@ -46,7 +46,8 @@ CreatePeerConnectionFactory(
+     scoped_refptr<AudioMixer> audio_mixer,
+     scoped_refptr<AudioProcessing> audio_processing,
+     std::unique_ptr<AudioFrameProcessor> audio_frame_processor = nullptr,
+-    std::unique_ptr<FieldTrialsView> field_trials = nullptr);
++    std::unique_ptr<FieldTrialsView> field_trials = nullptr,
++    scoped_refptr<AudioTransportFactory> audio_transport_factory = nullptr);
+ 
+ }  // namespace webrtc
+ 
+diff --git a/api/enable_media.cc b/api/enable_media.cc
+index 81cb890..be62c5d 100644
+--- a/api/enable_media.cc
++++ b/api/enable_media.cc
+@@ -17,6 +17,7 @@
+ #include "api/environment/environment.h"
+ #include "api/peer_connection_interface.h"
+ #include "api/scoped_refptr.h"
++#include "audio/audio_transport_impl.h"
+ #include "call/call.h"
+ #include "call/call_config.h"
+ #include "media/base/media_engine.h"
+@@ -49,7 +50,8 @@ class MediaFactoryImpl : public MediaFactory {
+     auto audio_engine = std::make_unique<WebRtcVoiceEngine>(
+         env, std::move(deps.adm), std::move(deps.audio_encoder_factory),
+         std::move(deps.audio_decoder_factory), std::move(deps.audio_mixer),
+-        std::move(audio_processing), std::move(deps.audio_frame_processor));
++        std::move(audio_processing), std::move(deps.audio_frame_processor),
++        std::move(deps.audio_transport_factory));
+     auto video_engine = std::make_unique<WebRtcVideoEngine>(
+         std::move(deps.video_encoder_factory),
+         std::move(deps.video_decoder_factory), env.field_trials());
+diff --git a/api/media_stream_interface.h b/api/media_stream_interface.h
+index 510b930..05afcdf 100644
+--- a/api/media_stream_interface.h
++++ b/api/media_stream_interface.h
+@@ -268,6 +268,10 @@ class RTC_EXPORT AudioSourceInterface : public MediaSourceInterface {
+   // (for some of the settings this approach is broken, e.g. setting
+   // audio network adaptation on the source is the wrong layer of abstraction).
+   virtual const AudioOptions options() const;
++
++  // HoneyCord (#62/Windows): true bei Quellen, die ihre Abtastwerte selbst
++  // liefern (Bildschirm-Ton). Standard false -> Mikrofon-Quellen unveraendert.
++  virtual bool IsCustomSource() const { return false; }
+ };
+ 
+ // Interface of the audio processor used by the audio track to collect
+diff --git a/api/peer_connection_interface.h b/api/peer_connection_interface.h
+index 5a6fb58..ab13dca 100644
+--- a/api/peer_connection_interface.h
++++ b/api/peer_connection_interface.h
+@@ -125,6 +125,7 @@
+ #include "api/video/video_bitrate_allocator_factory.h"
+ #include "api/video_codecs/video_decoder_factory.h"
+ #include "api/video_codecs/video_encoder_factory.h"
++#include "audio/audio_transport_impl.h"
+ #include "media/base/media_config.h"
+ // TODO(bugs.webrtc.org/7447): We plan to provide a way to let applications
+ // inject a PacketSocketFactory and/or NetworkManager, and not expose
+@@ -1475,6 +1476,7 @@ struct RTC_EXPORT PeerConnectionFactoryDependencies final {
+   scoped_refptr<AudioEncoderFactory> audio_encoder_factory;
+   scoped_refptr<AudioDecoderFactory> audio_decoder_factory;
+   scoped_refptr<AudioMixer> audio_mixer;
++  scoped_refptr<AudioTransportFactory> audio_transport_factory;
+   std::unique_ptr<AudioProcessingBuilderInterface> audio_processing_builder;
+   std::unique_ptr<AudioFrameProcessor> audio_frame_processor;
+   std::unique_ptr<VideoEncoderFactory> video_encoder_factory;
+diff --git a/audio/audio_receive_stream.cc b/audio/audio_receive_stream.cc
+index be8adc0..7f23111 100644
+--- a/audio/audio_receive_stream.cc
++++ b/audio/audio_receive_stream.cc
+@@ -465,8 +465,8 @@ const std::string& AudioReceiveStreamImpl::sync_group() const {
+   return config_.sync_group;
+ }
+ 
+-internal::AudioState* AudioReceiveStreamImpl::audio_state() const {
+-  auto* audio_state = static_cast<internal::AudioState*>(audio_state_.get());
++webrtc::AudioState* AudioReceiveStreamImpl::audio_state() const {
++  auto* audio_state = static_cast<webrtc::AudioState*>(audio_state_.get());
+   RTC_DCHECK(audio_state);
+   return audio_state;
+ }
+diff --git a/audio/audio_receive_stream.h b/audio/audio_receive_stream.h
+index ef4d74f..965b027 100644
+--- a/audio/audio_receive_stream.h
++++ b/audio/audio_receive_stream.h
+@@ -149,7 +149,7 @@ class AudioReceiveStreamImpl final : public webrtc::AudioReceiveStreamInterface,
+       const webrtc::AudioReceiveStreamInterface::Config& config);
+ 
+  private:
+-  internal::AudioState* audio_state() const;
++  webrtc::AudioState* audio_state() const;
+ 
+   const Environment env_;
+   RTC_NO_UNIQUE_ADDRESS SequenceChecker worker_thread_checker_;
+diff --git a/audio/audio_send_stream.cc b/audio/audio_send_stream.cc
+index 76156ce..068ecfc 100644
+--- a/audio/audio_send_stream.cc
++++ b/audio/audio_send_stream.cc
+@@ -373,8 +373,21 @@ void AudioSendStream::Start() {
+   }
+   channel_send_->StartSend();
+   sending_ = true;
+-  audio_state()->AddSendingStream(this, encoder_sample_rate_hz_,
+-                                  encoder_num_channels_);
++  // HoneyCord (#62): Custom-Quellen ueberspringen den AudioTransport-Router
++  // -> AddSendingStream startet fuer sie keine Mikrofon-Aufnahme.
++  if (!exclude_from_audio_transport_) {
++    audio_state()->AddSendingStream(this, encoder_sample_rate_hz_,
++                                    encoder_num_channels_);
++  }
++}
++
++void AudioSendStream::SetExcludeFromAudioTransport(bool exclude) {
++  RTC_DCHECK_RUN_ON(&worker_thread_checker_);
++  exclude_from_audio_transport_ = exclude;
++}
++
++bool AudioSendStream::exclude_from_audio_transport() const {
++  return exclude_from_audio_transport_;
+ }
+ 
+ void AudioSendStream::Stop() {
+@@ -577,7 +590,7 @@ void AudioSendStream::StoreEncoderProperties(int sample_rate_hz,
+                                              size_t num_channels) {
+   encoder_sample_rate_hz_ = sample_rate_hz;
+   encoder_num_channels_ = num_channels;
+-  if (sending_) {
++  if (sending_ && !exclude_from_audio_transport_) {
+     // Update AudioState's information about the stream.
+     audio_state()->AddSendingStream(this, sample_rate_hz, num_channels);
+   }
+diff --git a/audio/audio_send_stream.h b/audio/audio_send_stream.h
+index 9bac560..c7bc1c5 100644
+--- a/audio/audio_send_stream.h
++++ b/audio/audio_send_stream.h
+@@ -93,6 +93,8 @@ class AudioSendStream final : public webrtc::AudioSendStream,
+                    SetParametersCallback callback) override;
+   void Start() override;
+   void Stop() override;
++  void SetExcludeFromAudioTransport(bool exclude) override;
++  bool exclude_from_audio_transport() const override;
+   void SendAudioData(std::unique_ptr<AudioFrame> audio_frame) override;
+   bool SendTelephoneEvent(int payload_type,
+                           int payload_frequency,
+@@ -181,6 +183,9 @@ class AudioSendStream final : public webrtc::AudioSendStream,
+   int encoder_sample_rate_hz_ RTC_GUARDED_BY(worker_thread_checker_) = 0;
+   size_t encoder_num_channels_ RTC_GUARDED_BY(worker_thread_checker_) = 0;
+   bool sending_ RTC_GUARDED_BY(worker_thread_checker_) = false;
++  // HoneyCord (#62): Custom-Quelle (Bildschirm-Ton) -> nicht in den Router.
++  bool exclude_from_audio_transport_
++      RTC_GUARDED_BY(worker_thread_checker_) = false;
+   mutable Mutex audio_level_lock_;
+   // Keeps track of audio level, total audio energy and total samples duration.
+   // https://w3c.github.io/webrtc-stats/#dom-rtcaudiohandlerstats-totalaudioenergy
+diff --git a/audio/audio_state.cc b/audio/audio_state.cc
+index aab979f..59f7386 100644
+--- a/audio/audio_state.cc
++++ b/audio/audio_state.cc
+@@ -37,9 +37,16 @@ namespace internal {
+ 
+ AudioState::AudioState(const AudioState::Config& config)
+     : config_(config),
+-      audio_transport_(config_.audio_mixer.get(),
+-                       config_.audio_processing.get(),
+-                       config_.async_audio_processing_factory.get()) {
++      audio_transport_(
++          config_.audio_transport_factory
++              ? config_.audio_transport_factory->Create(
++                    config_.audio_mixer.get(),
++                    config_.audio_processing.get(),
++                    config_.async_audio_processing_factory.get())
++              : std::make_unique<AudioTransportImpl>(
++                    config_.audio_mixer.get(),
++                    config_.audio_processing.get(),
++                    config_.async_audio_processing_factory.get())) {
+   RTC_DCHECK(config_.audio_mixer);
+   RTC_DCHECK(config_.audio_device_module);
+ }
+@@ -56,7 +63,7 @@ AudioProcessing* AudioState::audio_processing() {
+ }
+ 
+ AudioTransport* AudioState::audio_transport() {
+-  return &audio_transport_;
++  return audio_transport_.get();
+ }
+ 
+ void AudioState::SetPlayout(bool enabled) {
+@@ -175,7 +182,7 @@ void AudioState::RemoveSendingStream(webrtc::AudioSendStream* stream) {
+ 
+ void AudioState::SetStereoChannelSwapping(bool enable) {
+   RTC_DCHECK(thread_checker_.IsCurrent());
+-  audio_transport_.SetStereoChannelSwapping(enable);
++  audio_transport_->SetStereoChannelSwapping(enable);
+ }
+ 
+ void AudioState::UpdateAudioTransportWithSendingStreams() {
+@@ -188,7 +195,7 @@ void AudioState::UpdateAudioTransportWithSendingStreams() {
+     max_sample_rate_hz = std::max(max_sample_rate_hz, kv.second.sample_rate_hz);
+     max_num_channels = std::max(max_num_channels, kv.second.num_channels);
+   }
+-  audio_transport_.UpdateAudioSenders(std::move(audio_senders),
++  audio_transport_->UpdateAudioSenders(std::move(audio_senders),
+                                       max_sample_rate_hz, max_num_channels);
+ }
+ 
+@@ -197,7 +204,7 @@ void AudioState::UpdateNullAudioPollerState() {
+   // disabled.
+   if (!receiving_streams_.empty() && !playout_enabled_) {
+     if (!null_audio_poller_.Running()) {
+-      AudioTransport* audio_transport = &audio_transport_;
++      AudioTransport* audio_transport = audio_transport_.get();
+       null_audio_poller_ = RepeatingTaskHandle::Start(
+           TaskQueueBase::Current(), [audio_transport] {
+             static constexpr size_t kNumChannels = 1;
+diff --git a/audio/audio_state.h b/audio/audio_state.h
+index bfac44f..e65cbd0 100644
+--- a/audio/audio_state.h
++++ b/audio/audio_state.h
+@@ -55,13 +55,13 @@ class AudioState : public webrtc::AudioState {
+     return config_.audio_device_module.get();
+   }
+ 
+-  void AddReceivingStream(webrtc::AudioReceiveStreamInterface* stream);
+-  void RemoveReceivingStream(webrtc::AudioReceiveStreamInterface* stream);
++  void AddReceivingStream(webrtc::AudioReceiveStreamInterface* stream) override;
++  void RemoveReceivingStream(webrtc::AudioReceiveStreamInterface* stream) override;
+ 
+   void AddSendingStream(webrtc::AudioSendStream* stream,
+                         int sample_rate_hz,
+-                        size_t num_channels);
+-  void RemoveSendingStream(webrtc::AudioSendStream* stream);
++                        size_t num_channels) override;
++  void RemoveSendingStream(webrtc::AudioSendStream* stream) override;
+ 
+  private:
+   void UpdateAudioTransportWithSendingStreams();
+@@ -77,7 +77,7 @@ class AudioState : public webrtc::AudioState {
+ 
+   // Transports mixed audio from the mixer to the audio device and
+   // recorded audio to the sending streams.
+-  AudioTransportImpl audio_transport_;
++  std::unique_ptr<AudioTransport> audio_transport_;
+ 
+   // Null audio poller is used to continue polling the audio streams if audio
+   // playout is disabled so that audio processing still happens and the audio
+diff --git a/audio/audio_transport_impl.h b/audio/audio_transport_impl.h
+index 53f1935..da57475 100644
+--- a/audio/audio_transport_impl.h
++++ b/audio/audio_transport_impl.h
+@@ -87,8 +87,8 @@ class AudioTransportImpl : public AudioTransport {
+ 
+   void UpdateAudioSenders(std::vector<AudioSender*> senders,
+                           int send_sample_rate_hz,
+-                          size_t send_num_channels);
+-  void SetStereoChannelSwapping(bool enable);
++                          size_t send_num_channels) override;
++  void SetStereoChannelSwapping(bool enable) override;
+ 
+  private:
+   void SendProcessedData(std::unique_ptr<AudioFrame> audio_frame);
+@@ -115,6 +115,15 @@ class AudioTransportImpl : public AudioTransport {
+   // Converts mixed audio to the audio device output rate.
+   PushResampler<int16_t> render_resampler_;
+ };
++
++class AudioTransportFactory : public RefCountInterface {
++ public:
++  virtual std::unique_ptr<AudioTransport> Create(
++      AudioMixer* mixer,
++      AudioProcessing* audio_processing,
++      AsyncAudioProcessing::Factory* async_audio_processing_factory) = 0;
++};
++
+ }  // namespace webrtc
+ 
+ #endif  // AUDIO_AUDIO_TRANSPORT_IMPL_H_
+diff --git a/call/audio_send_stream.h b/call/audio_send_stream.h
+index 84341b5..80d3074 100644
+--- a/call/audio_send_stream.h
++++ b/call/audio_send_stream.h
+@@ -195,6 +195,15 @@ class AudioSendStream : public AudioSender {
+   // When a stream is stopped, it can't receive, process or deliver packets.
+   virtual void Stop() = 0;
+ 
++  // HoneyCord (#62): Sendestreams aus einer Custom-Quelle (z. B. Bildschirm-
++  // Ton) werden nicht in den AudioTransport-Router aufgenommen, damit das ADM
++  // nicht parallel Mikrofon-Daten in deren Encoder pumpt -- und vor allem, damit
++  // AudioState::AddSendingStream fuer sie NICHT die Mikrofon-Aufnahme startet
++  // (sonst oeffnet reiner Bildschirm-Ton das Mikrofon -> Windows-Ducking).
++  // Default: false (= bestehende Mikrofon-/Track-Streams unveraendert).
++  virtual void SetExcludeFromAudioTransport(bool exclude) {}
++  virtual bool exclude_from_audio_transport() const { return false; }
++
+   // TODO(solenberg): Make payload_type a config property instead.
+   virtual bool SendTelephoneEvent(int payload_type,
+                                   int payload_frequency,
+diff --git a/call/audio_state.h b/call/audio_state.h
+index d58b7ff..817a418 100644
+--- a/call/audio_state.h
++++ b/call/audio_state.h
+@@ -15,11 +15,13 @@
+ #include "api/audio/audio_processing.h"
+ #include "api/ref_count.h"
+ #include "api/scoped_refptr.h"
++#include "audio/audio_transport_impl.h"
+ #include "modules/async_audio_processing/async_audio_processing.h"
+ 
+ namespace webrtc {
+ 
+-class AudioTransport;
++class AudioReceiveStreamInterface;
++class AudioSendStream;
+ 
+ // AudioState holds the state which must be shared between multiple instances of
+ // webrtc::Call for audio processing purposes.
+@@ -40,6 +42,8 @@ class AudioState : public RefCountInterface {
+     scoped_refptr<webrtc::AudioDeviceModule> audio_device_module;
+ 
+     scoped_refptr<AsyncAudioProcessing::Factory> async_audio_processing_factory;
++
++    scoped_refptr<webrtc::AudioTransportFactory> audio_transport_factory;
+   };
+ 
+   virtual AudioProcessing* audio_processing() = 0;
+@@ -58,6 +62,16 @@ class AudioState : public RefCountInterface {
+ 
+   virtual void SetStereoChannelSwapping(bool enable) = 0;
+ 
++  virtual void AddReceivingStream(AudioReceiveStreamInterface* stream) = 0;
++
++  virtual void RemoveReceivingStream(AudioReceiveStreamInterface* stream) = 0;
++
++  virtual void AddSendingStream(AudioSendStream* stream,
++                        int sample_rate_hz,
++                        size_t num_channels) = 0;
++
++  virtual void RemoveSendingStream(AudioSendStream* stream) = 0;
++
+   static scoped_refptr<AudioState> Create(const AudioState::Config& config);
+ 
+   ~AudioState() override {}
+diff --git a/media/base/audio_source.h b/media/base/audio_source.h
+index 04a7d19..57830bb 100644
+--- a/media/base/audio_source.h
++++ b/media/base/audio_source.h
+@@ -49,6 +49,12 @@ class AudioSource {
+   // to the source at a time.
+   virtual void SetSink(Sink* sink) = 0;
+ 
++  // HoneyCord (#62/Windows): Marker fuer Quellen, die ihre Abtastwerte selbst
++  // liefern (z. B. Bildschirm-Ton per WASAPI-Loopback). Solche Streams duerfen
++  // die Mikrofon-Aufnahme des ADM NICHT hochfahren. Standard false -> alle
++  // bestehenden, mikrofon-gespeisten Streams bleiben unveraendert.
++  virtual bool IsCustomSource() const { return false; }
++
+  protected:
+   virtual ~AudioSource() {}
+ };
+diff --git a/media/engine/webrtc_voice_engine.cc b/media/engine/webrtc_voice_engine.cc
+index b033376..a2385ec 100644
+--- a/media/engine/webrtc_voice_engine.cc
++++ b/media/engine/webrtc_voice_engine.cc
+@@ -473,7 +473,8 @@ WebRtcVoiceEngine::WebRtcVoiceEngine(
+     scoped_refptr<AudioDecoderFactory> decoder_factory,
+     scoped_refptr<AudioMixer> audio_mixer,
+     scoped_refptr<AudioProcessing> audio_processing,
+-    std::unique_ptr<AudioFrameProcessor> audio_frame_processor)
++    std::unique_ptr<AudioFrameProcessor> audio_frame_processor,
++    scoped_refptr<AudioTransportFactory> audio_transport_factory)
+     : env_(env),
+       minimized_resampling_on_mobile_trial_enabled_(
+           env_.field_trials().IsEnabled(
+@@ -484,6 +485,7 @@ WebRtcVoiceEngine::WebRtcVoiceEngine(
+       encoder_factory_(std::move(encoder_factory)),
+       decoder_factory_(std::move(decoder_factory)),
+       apm_(std::move(audio_processing)),
++      audio_transport_factory_(std::move(audio_transport_factory)),
+       legacy_send_codecs_(
+           LegacyCollectCodecs(encoder_factory_->GetSupportedEncoders(),
+                               !payload_types_in_transport_trial_enabled_)),
+@@ -503,6 +505,9 @@ WebRtcVoiceEngine::WebRtcVoiceEngine(
+     } else {
+       config.audio_mixer = AudioMixerImpl::Create();
+     }
++    if(audio_transport_factory_){
++      config.audio_transport_factory = audio_transport_factory_;
++    }
+     config.audio_processing = apm_;
+     config.audio_device_module = adm_;
+     if (audio_frame_processor) {
+@@ -1006,6 +1011,13 @@ class WebRtcVoiceSendChannel::WebRtcAudioSendStream : public AudioSource::Sink {
+     }
+     source->SetSink(this);
+     source_ = source;
++    // HoneyCord (#62): Custom-Quelle (Bildschirm-Ton) aus dem AudioTransport-
++    // Router nehmen, BEVOR UpdateSendState den Stream startet. Sonst startet
++    // AudioState::AddSendingStream fuer reinen Bildschirm-Ton die Mikrofon-
++    // Aufnahme (Windows senkt dann alle anderen Apps ab, "Ducking").
++    if (source->IsCustomSource() && stream_ != nullptr) {
++      stream_->SetExcludeFromAudioTransport(true);
++    }
+     UpdateSendState();
+   }
+ 
+@@ -1014,6 +1026,16 @@ class WebRtcVoiceSendChannel::WebRtcAudioSendStream : public AudioSource::Sink {
+     return source_ != nullptr;
+   }
+ 
++  // HoneyCord (#62): true nur bei einer ECHTEN Mikrofon-Quelle. Custom-
++  // Quellen (Bildschirm-Ton) zaehlen NICHT - sie liefern ihre Abtastwerte
++  // selbst und brauchen die ADM-Aufnahme nicht. Steuert, ob das Mikrofon
++  // hochgefahren wird, damit reiner Bildschirm-Ton es nicht ungewollt
++  // oeffnet (Windows senkt sonst alle anderen Apps ab; macOS: A2DP->HFP).
++  bool HasRealMicSource() const {
++    RTC_DCHECK_RUN_ON(&worker_thread_checker_);
++    return source_ != nullptr && !source_->IsCustomSource();
++  }
++
+   // Stops sending by setting the sink of the AudioSource to nullptr. No data
+   // callback will be received after this method.
+   // This method is called on the libjingle worker thread.
+@@ -1556,7 +1578,13 @@ void WebRtcVoiceSendChannel::SetSend(bool send) {
+ 
+     // Initialize the ADM for recording (this may take time on some platforms,
+     // e.g. Android).
+-    if (options_.init_recording_on_send.value_or(true) &&
++    // HoneyCord (#62): nur hochfahren, wenn wirklich ein Mikrofon-Track
++    // sendet - nicht bei reinem Bildschirm-Ton (Custom-Quelle).
++    const bool has_real_mic_source =
++        std::any_of(send_streams_.begin(), send_streams_.end(),
++                    [](const auto& kv) { return kv.second->HasRealMicSource(); });
++    if (has_real_mic_source &&
++        options_.init_recording_on_send.value_or(true) &&
+         // InitRecording() may return an error if the ADM is already recording.
+         !engine()->adm()->RecordingIsInitialized() &&
+         !engine()->adm()->Recording()) {
+@@ -1769,10 +1797,25 @@ bool WebRtcVoiceSendChannel::MuteStream(uint32_t ssrc, bool muted) {
+         std::none_of(send_streams_.begin(), send_streams_.end(),
+                      [](const auto& kv) { return kv.second->HasSource(); });
+ 
++    // HoneyCord (#62): wie is_all_no_source, aber Custom-Quellen (Bildschirm-
++    // Ton) zaehlen als "kein Mikrofon".
++    bool is_all_no_mic_source =
++        std::none_of(send_streams_.begin(), send_streams_.end(),
++                     [](const auto& kv) { return kv.second->HasRealMicSource(); });
++
+     bool is_all_muted =
+         std::all_of(send_streams_.begin(), send_streams_.end(),
+                     [](const auto& kv) { return kv.second->IsMuted(); });
+ 
++    // HoneyCord (#62): Stummschalt-Zustand NUR ueber echte Mikrofon-Streams.
++    // Ein laufender Bildschirm-Ton-Stream ist nie stumm und wuerde sonst das
++    // Mikrofon aufreissen, obwohl der Nutzer stumm ist. Ohne Custom-Quellen
++    // ist dieser Wert identisch mit is_all_muted -> Verhalten unveraendert.
++    bool is_all_mic_muted = std::all_of(
++        send_streams_.begin(), send_streams_.end(), [](const auto& kv) {
++          return !kv.second->HasRealMicSource() || kv.second->IsMuted();
++        });
++
+     // Only mute the microphone if we're not in cleanup state
+     // (i.e. if we have active send streams)
+     webrtc::AudioProcessing* ap = engine()->apm();
+@@ -1782,25 +1825,32 @@ bool WebRtcVoiceSendChannel::MuteStream(uint32_t ssrc, bool muted) {
+       ap->set_output_will_be_muted(v);
+     }
+ 
+-    if (!is_all_no_source) {
++    // HoneyCord (#62): reiner Bildschirm-Ton (nur Custom-Quellen, kein echtes
++    // Mikrofon) zaehlt hier wie "cleanup" -> die Aufnahme bleibt aus.
++    if (!is_all_no_mic_source) {
+       // We don't mute when ClearSend() is called.
+       webrtc::AudioDeviceModule* adm = engine()->adm();
+       if (adm) {
+-        RTC_LOG(LS_INFO) << "WebRtcVoiceSendChannel::MuteStream: ADM:"
+-                         << is_all_muted;
++        RTC_LOG(LS_WARNING) << "HoneyCord MuteStream: mic_muted="
++                            << is_all_mic_muted << " all_muted=" << is_all_muted
++                            << " streams=" << send_streams_.size();
+ 
+         if (adm->IsStopOnMuteModeEnabled()) {
+-          if (!is_all_muted && !adm->Recording()) {
++          if (!is_all_mic_muted && !adm->Recording()) {
+             if (adm->InitRecording() == 0) {
+               adm->StartRecording();
+             }
+-          } else if (is_all_muted && adm->Recording()) {
++          } else if (is_all_mic_muted && adm->Recording()) {
+             adm->StopRecording();
+           }
+         } else {
+-          adm->SetMicrophoneMute(is_all_muted);
++          adm->SetMicrophoneMute(is_all_mic_muted);
+         }
+       }
++    } else {
++      RTC_LOG(LS_WARNING) << "HoneyCord MuteStream: kein Mikrofon-Stream - "
++                             "Aufnahme bleibt aus (streams="
++                          << send_streams_.size() << ")";
+     }
+   }
+ 
+diff --git a/media/engine/webrtc_voice_engine.h b/media/engine/webrtc_voice_engine.h
+index 0376e5f..c6a87bb 100644
+--- a/media/engine/webrtc_voice_engine.h
++++ b/media/engine/webrtc_voice_engine.h
+@@ -84,7 +84,8 @@ class WebRtcVoiceEngine final : public VoiceEngineInterface {
+                     scoped_refptr<AudioDecoderFactory> decoder_factory,
+                     scoped_refptr<AudioMixer> audio_mixer,
+                     scoped_refptr<AudioProcessing> audio_processing,
+-                    std::unique_ptr<AudioFrameProcessor> audio_frame_processor);
++                    std::unique_ptr<AudioFrameProcessor> audio_frame_processor,
++                    scoped_refptr<AudioTransportFactory> audio_transport_factory);
+ 
+   WebRtcVoiceEngine() = delete;
+   WebRtcVoiceEngine(const WebRtcVoiceEngine&) = delete;
+@@ -162,6 +163,8 @@ class WebRtcVoiceEngine final : public VoiceEngineInterface {
+   const scoped_refptr<AudioDecoderFactory> decoder_factory_;
+   // The audio processing module.
+   scoped_refptr<AudioProcessing> apm_ RTC_GUARDED_BY(worker_thread_checker_);
++  // The audio transport factory.
++  scoped_refptr<AudioTransportFactory> audio_transport_factory_;
+   // The primary instance of WebRtc VoiceEngine.
+   scoped_refptr<AudioState> audio_state_ RTC_GUARDED_BY(worker_thread_checker_);
+   const std::vector<Codec> legacy_send_codecs_;
+diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
+index f21f7aa..babcdf8 100644
+--- a/modules/audio_device/win/audio_device_core_win.cc
++++ b/modules/audio_device/win/audio_device_core_win.cc
+@@ -24,6 +24,7 @@
+ #include <strsafe.h>
+ #include <uuids.h>
+ #include <windows.h>
++#include <audiopolicy.h>  // HoneyCord: IAudioSessionControl2 (Ducking-Opt-out)
+ 
+ #include <iomanip>
+ 
+@@ -2006,6 +2007,27 @@ int32_t AudioDeviceWindowsCore::InitPlayout() {
+   hr = _ptrClientOut->SetEventHandle(_hRenderSamplesReadyEvent);
+   EXIT_ON_ERROR(hr);
+ 
++  // HoneyCord: Opt-out aus der Windows-Kommunikations-Absenkung ("Ducking").
++  // Ohne dies senkt Windows beim Oeffnen einer Kommunikations-Session ALLE
++  // anderen Apps (z. B. Spotify) um 80 % ab und stellt das beim Beenden nicht
++  // zurueck. Muss gesetzt sein, BEVOR die Session aktiv wird (MSDN).
++  {
++    IAudioSessionControl* pSessionCtrl = NULL;
++    if (SUCCEEDED(_ptrClientOut->GetService(__uuidof(IAudioSessionControl),
++                                             (void**)&pSessionCtrl)) &&
++        pSessionCtrl != NULL) {
++      IAudioSessionControl2* pSessionCtrl2 = NULL;
++      if (SUCCEEDED(pSessionCtrl->QueryInterface(
++              __uuidof(IAudioSessionControl2), (void**)&pSessionCtrl2)) &&
++          pSessionCtrl2 != NULL) {
++        HRESULT hrDuck = pSessionCtrl2->SetDuckingPreference(TRUE);
++        RTC_LOG(LS_INFO) << "HoneyCord: SetDuckingPreference(TRUE) hr=" << hrDuck;
++        SAFE_RELEASE(pSessionCtrl2);
++      }
++      SAFE_RELEASE(pSessionCtrl);
++    }
++  }
++
+   // Get an IAudioRenderClient interface.
+   SAFE_RELEASE(_ptrRenderClient);
+   hr = _ptrClientOut->GetService(__uuidof(IAudioRenderClient),
+@@ -2295,6 +2317,27 @@ int32_t AudioDeviceWindowsCore::InitRecording() {
+   hr = _ptrClientIn->SetEventHandle(_hCaptureSamplesReadyEvent);
+   EXIT_ON_ERROR(hr);
+ 
++  // HoneyCord: Opt-out aus der Windows-Kommunikations-Absenkung ("Ducking").
++  // Ohne dies senkt Windows beim Oeffnen einer Kommunikations-Session ALLE
++  // anderen Apps (z. B. Spotify) um 80 % ab und stellt das beim Beenden nicht
++  // zurueck. Muss gesetzt sein, BEVOR die Session aktiv wird (MSDN).
++  {
++    IAudioSessionControl* pSessionCtrl = NULL;
++    if (SUCCEEDED(_ptrClientIn->GetService(__uuidof(IAudioSessionControl),
++                                             (void**)&pSessionCtrl)) &&
++        pSessionCtrl != NULL) {
++      IAudioSessionControl2* pSessionCtrl2 = NULL;
++      if (SUCCEEDED(pSessionCtrl->QueryInterface(
++              __uuidof(IAudioSessionControl2), (void**)&pSessionCtrl2)) &&
++          pSessionCtrl2 != NULL) {
++        HRESULT hrDuck = pSessionCtrl2->SetDuckingPreference(TRUE);
++        RTC_LOG(LS_INFO) << "HoneyCord: SetDuckingPreference(TRUE) hr=" << hrDuck;
++        SAFE_RELEASE(pSessionCtrl2);
++      }
++      SAFE_RELEASE(pSessionCtrl);
++    }
++  }
++
+   // Get an IAudioCaptureClient interface.
+   SAFE_RELEASE(_ptrCaptureClient);
+   hr = _ptrClientIn->GetService(__uuidof(IAudioCaptureClient),
+diff --git a/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc b/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
+index 070257f..61fd0c8 100644
+--- a/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
++++ b/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
+@@ -71,10 +71,10 @@ constexpr int CursorMetaSize(int w, int h) {
+           w * h * kCursorBpp);
+ }
+ 
+-constexpr PipeWireVersion kDmaBufModifierMinVersion = {.major = 0,
++const PipeWireVersion kDmaBufModifierMinVersion = {.major = 0,
+                                                        .minor = 3,
+                                                        .micro = 33};
+-constexpr PipeWireVersion kDropSingleModifierMinVersion = {.major = 0,
++const PipeWireVersion kDropSingleModifierMinVersion = {.major = 0,
+                                                            .minor = 3,
+                                                            .micro = 40};
+ 
+diff --git a/modules/desktop_capture/win/window_capture_utils.cc b/modules/desktop_capture/win/window_capture_utils.cc
+index fcfa927..3664af4 100644
+--- a/modules/desktop_capture/win/window_capture_utils.cc
++++ b/modules/desktop_capture/win/window_capture_utils.cc
+@@ -470,8 +470,7 @@ bool WindowCaptureHelperWin::EnumerateCapturableWindows(
+     DesktopCapturer::SourceList* results,
+     bool enumerate_current_process_windows,
+     LONG ex_style_filters) {
+-  int flags = (GetWindowListFlags::kIgnoreUntitled |
+-               GetWindowListFlags::kIgnoreUnresponsive);
++  int flags = (GetWindowListFlags::kIgnoreUntitled /* HoneyCord id28: kIgnoreUnresponsive entfernt -> rendernde Spiele im Picker */);
+   if (!enumerate_current_process_windows) {
+     flags |= GetWindowListFlags::kIgnoreCurrentProcessWindows;
+   }
+diff --git a/pc/rtp_sender.cc b/pc/rtp_sender.cc
+index d5edbbf..19559c2 100644
+--- a/pc/rtp_sender.cc
++++ b/pc/rtp_sender.cc
+@@ -754,6 +754,14 @@ void AudioRtpSender::DetachTrack() {
+ void AudioRtpSender::AttachTrack() {
+   RTC_DCHECK(track_);
+   cached_track_enabled_ = track_->enabled();
++  // HoneyCord (#62/Windows): Quellen, die ihre Abtastwerte selbst liefern
++  // (Bildschirm-Ton), am Sink-Adapter markieren. WebRtcVoiceSendChannel nutzt
++  // die Markierung, damit reiner Bildschirm-Ton nicht die Mikrofon-Aufnahme
++  // hochfaehrt (Windows senkt sonst alle anderen Apps ab, "Ducking").
++  // Bei jedem Anhaengen neu bestimmt -> ein wiederverwendeter Sender behaelt
++  // die Markierung eines alten Tracks nicht.
++  sink_adapter_->SetCustomSource(audio_track()->GetSource() != nullptr &&
++                                 audio_track()->GetSource()->IsCustomSource());
+   audio_track()->AddSink(sink_adapter_.get());
+ }
+ 
+diff --git a/pc/rtp_sender.h b/pc/rtp_sender.h
+index eaffd4e..13e2e96 100644
+--- a/pc/rtp_sender.h
++++ b/pc/rtp_sender.h
+@@ -332,11 +332,19 @@ class LocalAudioSinkAdapter : public AudioTrackSinkInterface,
+ 
+   // webrtc::AudioSource implementation.
+   void SetSink(AudioSource::Sink* sink) override;
++  bool IsCustomSource() const override { return custom_source_; }
+ 
++ public:
++  // HoneyCord (#62/Windows): wird vom AudioRtpSender gesetzt, wenn der Track
++  // aus einer Custom-Quelle (Bildschirm-Ton) gespeist wird.
++  void SetCustomSource(bool custom) { custom_source_ = custom; }
++
++ private:
+   AudioSource::Sink* sink_;
+   // Critical section protecting `sink_`.
+   Mutex lock_;
+   int num_preferred_channels_ = -1;
++  bool custom_source_ = false;
+ };
+ 
+ class AudioRtpSender : public DtmfProviderInterface, public RtpSenderBase {
