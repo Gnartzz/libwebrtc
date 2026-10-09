@@ -181,10 +181,10 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   // Vollbildspiel-Umschaltung (2026-10-09, jimtonics): Ein Vollbildspiel im
   // Vordergrund praesentiert per Independent Flip direkt, DWM komponiert das
   // Fenster nicht -> die WGC-FENSTER-Aufnahme bekommt keine neuen Bilder
-  // (Standbild beim Empfaenger). Solange das Fenster vorn ist UND seinen
-  // Monitor vollstaendig bedeckt, nimmt der Capturer den MONITOR auf (zweites
-  // WGC-Item, eigener Pool + Session); sonst wieder das Fenster. Alles auf
-  // thread_ (wie die uebrigen WGC-Aufrufe).
+  // (Standbild beim Empfaenger). Solange das Fenster vorn ist, seinen Monitor
+  // vollstaendig bedeckt UND seine Aufnahme >= 1 s stockt, nimmt der Capturer
+  // den MONITOR auf (zweites WGC-Item, eigener Pool + Session); sonst wieder
+  // das Fenster. Alles auf thread_ (wie die uebrigen WGC-Aufrufe).
   void WgcVollbildPruefen();
   bool WgcMonStart(HMONITOR mon);
   void WgcMonStop(const char* grund);  // grund=nullptr -> ohne Protokollzeile

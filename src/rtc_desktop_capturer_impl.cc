@@ -102,6 +102,12 @@ struct RTCDesktopCapturerImpl::WgcState {
   int64_t pruef_ms = 0;       // letzte volle Bedingungspruefung
   int treffer = 0;            // Pruefungen in Folge mit erfuellter Bedingung
   int64_t sperre_bis_ms = 0;  // nach Fehlschlag kein neuer Versuch bis dahin
+  // Stock-Erkennung der Fensteraufnahme (nur ausserhalb des Teilmodus gefuehrt):
+  // Zeitpunkt des letzten neuen Fensterbilds und Takte seitdem. Beim Start und
+  // nach jedem Zurueckschalten neu gesetzt -> erneutes Umschalten erst, wenn
+  // das Fenster wieder >= 1 s stockt (kein Pendeln).
+  int64_t fenster_neu_ms = 0;
+  int fenster_stock_takte = 0;
 };
 
 // WinRT-Objekt schliessen (IClosable) und freigeben; leer -> nichts.
@@ -849,10 +855,86 @@ bool RTCDesktopCapturerImpl::InitGpuWindow(intptr_t hwnd) {
 
   wgc_w_ = static_cast<uint32_t>(isize.Width);
   wgc_h_ = static_cast<uint32_t>(isize.Height);
+  wgc_->fenster_neu_ms = webrtc::TimeMillis();  // Stock-Erkennung ab jetzt
+  wgc_->fenster_stock_takte = 0;
   wgc_mode_ = true;
   if (!InitGpuPipeline(wgc_w_, wgc_h_)) return false;  // ReleaseGpu schon drin
   HcCapLog("InitGpuWindow OK: Fenster %ux%u (WGC Zero-Copy aktiv)", wgc_w_, wgc_h_);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Vollbildspiel-Umschaltung im WGC-Fenster-Modus (2026-10-09, jimtonics, RTX
+// 3070): Fensterfreigabe eines Vollbildspiels (Fenster = Monitorgroesse) zeigte
+// beim Empfaenger ein Standbild, solange das Spiel vorn war; Bildschirmfreigabe
+// lief. Ein Vollbildspiel im Vordergrund praesentiert per Independent Flip
+// direkt, DWM komponiert das Fenster nicht -> die WGC-FENSTER-Aufnahme bekommt
+// keine neuen Bilder, die MONITOR-Aufnahme schon. Deshalb: solange das Fenster
+// vorn ist, seinen Monitor vollstaendig bedeckt UND die Fensteraufnahme
+// tatsaechlich stockt (>= 1 s kein neues Fensterbild bei laufendem Takt),
+// Monitor aufnehmen. Randlose Spiele, deren Fensteraufnahme normal laeuft,
+// bleiben beim Fenster (Tims Linie "Vertraulichkeit vor Verfuegbarkeit").
+// DATENSCHUTZ (Tims bewusste Entscheidung): Im Monitor-Teilmodus sind auch
+// Benachrichtigungen/Overlays sichtbar, die ueber dem Spiel erscheinen. Damit
+// nicht mehr durchrutscht, wird im Teilmodus die VOLLE Bedingung (vorn, nicht
+// minimiert, gleicher Monitor, deckt rcMonitor) JEDEN Takt geprueft und nach
+// dem Abholen jedes Monitorbilds noch einmal (je wenige Mikrosekunden); beim
+// ersten Fehlschlag wird das Bild verworfen und sofort aufs Fenster zurueck-
+// geschaltet. Nur das EINschalten laeuft gedrosselt (<= 2x/s, Hysterese).
+static constexpr int64_t kVollbildPruefMs = 500;  // Einschalt-Pruefung <= 2x/s
+static constexpr int kVollbildTreffer = 2;        // Hysterese: 2 in Folge
+static constexpr LONG kVollbildToleranzPx = 2;    // Randtoleranz je Kante
+static constexpr int64_t kVollbildSperreMs = 30000;  // nach Fehlschlag
+static constexpr int64_t kVollbildStockMs = 1000;  // Fenster stockt seit ...
+static constexpr int kVollbildStockTakte = 10;     // ... und >= so vielen Takten
+                                                   // (Takt lief wirklich weiter)
+
+// Ist das freigegebene Fenster (oder sein Wurzelfenster) im Vordergrund?
+static bool HcFensterVorn(HWND hwnd) {
+  HWND fg = GetForegroundWindow();
+  if (!fg) return false;
+  if (fg == hwnd) return true;
+  HWND root = GetAncestor(hwnd, GA_ROOT);
+  return root && GetAncestor(fg, GA_ROOT) == root;
+}
+
+// Bedeckt das Fenster seinen Monitor vollstaendig (rcMonitor, nicht rcWork)?
+// Sichtbare Grenzen per DWMWA_EXTENDED_FRAME_BOUNDS (ohne unsichtbare
+// Resize-Raender), sonst GetWindowRect. Beide in physischen Pixeln, da der
+// Prozess Per-Monitor-DPI-aware ist (wie rcMonitor).
+static bool HcFensterDecktMonitor(HWND hwnd, HMONITOR* mon_out) {
+  *mon_out = nullptr;
+  if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
+  HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+  if (!mon) return false;
+  MONITORINFO mi = {};
+  mi.cbSize = sizeof(mi);
+  if (!GetMonitorInfoW(mon, &mi)) return false;
+  RECT wr = {};
+  if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &wr,
+                                   sizeof(wr))) &&
+      !::GetWindowRect(hwnd, &wr)) {
+    return false;
+  }
+  const RECT& m = mi.rcMonitor;
+  if (std::labs(wr.left - m.left) > kVollbildToleranzPx ||
+      std::labs(wr.top - m.top) > kVollbildToleranzPx ||
+      std::labs(wr.right - m.right) > kVollbildToleranzPx ||
+      std::labs(wr.bottom - m.bottom) > kVollbildToleranzPx) {
+    return false;
+  }
+  *mon_out = mon;
+  return true;
+}
+
+// Teilmodus noch zulaessig? nullptr = ja, sonst der Grund fuers Zurueckschalten.
+static const char* HcTeilmodusVerletzt(HWND hwnd, HMONITOR mon) {
+  if (!HcFensterVorn(hwnd)) return "Fenster nicht mehr vorn";
+  HMONITOR jetzt = nullptr;
+  if (!HcFensterDecktMonitor(hwnd, &jetzt))
+    return "Fenster deckt den Monitor nicht mehr";
+  if (jetzt != mon) return "Fenster auf anderem Monitor";
+  return nullptr;
 }
 
 // Naechsten WGC-Frame -> g_cached_ (Zero-Copy, kein CPU-Readback). *changed=false
@@ -869,10 +951,23 @@ bool RTCDesktopCapturerImpl::WgcAcquire(bool* changed) {
     // wird derweil nicht geleert (er bekommt im Independent Flip ohnehin
     // nichts); nach dem Zurueckschalten zeigt er hoechstens kurz ein aelteres
     // Spielbild, aber nie den Desktop.
-    if (!wgc_->mon_pool) { WgcMonStop("Monitor-Pool fehlt"); return true; }
+    if (!wgc_->mon_pool) {
+      WgcMonStop("Monitor-Pool fehlt");
+      wgc_->sperre_bis_ms = webrtc::TimeMillis() + kVollbildSperreMs;
+      return true;
+    }
     ComPtr<WGC::IDirect3D11CaptureFrame> mframe;
     if (FAILED(wgc_->mon_pool->TryGetNextFrame(&mframe)) || !mframe)
       return true;
+    // Nachpruefung NACH dem Abholen (Datenschutz): hat sich seit der Pruefung
+    // am Taktanfang etwas geaendert (Alt+Tab, Alt+Enter, anderer Monitor,
+    // Minimieren), wird dieses Monitorbild verworfen, nicht kopiert.
+    if (const char* grund = HcTeilmodusVerletzt(
+            reinterpret_cast<HWND>(source_id_), wgc_->mon)) {
+      HcWinRtSchliessen(mframe);
+      WgcMonStop(grund);
+      return true;
+    }
     ABI::Windows::Graphics::SizeInt32 msize = {};
     mframe->get_ContentSize(&msize);
     if (static_cast<uint32_t>(msize.Width) != wgc_w_ ||
@@ -883,6 +978,7 @@ bool RTCDesktopCapturerImpl::WgcAcquire(bool* changed) {
       HcCapLog("Vollbild: Monitorbild %dx%d passt nicht zur Pipeline %ux%u",
                msize.Width, msize.Height, wgc_w_, wgc_h_);
       WgcMonStop("Monitorgroesse geaendert");
+      wgc_->sperre_bis_ms = webrtc::TimeMillis() + kVollbildSperreMs;
       return true;
     }
     ComPtr<WGDX::Direct3D11::IDirect3DSurface> msurf;
@@ -899,6 +995,13 @@ bool RTCDesktopCapturerImpl::WgcAcquire(bool* changed) {
         g_ctx_->CopyResource(g_cached_.Get(), mtex.Get());
         g_have_frame_ = true;
         *changed = true;
+      } else {
+        HcWinRtSchliessen(mframe);
+        HcCapLog("Vollbild: Monitor-Textur %ux%u passt nicht zu g_cached_ %ux%u",
+                 sd.Width, sd.Height, dd.Width, dd.Height);
+        WgcMonStop("Monitor-Textur passt nicht");
+        wgc_->sperre_bis_ms = webrtc::TimeMillis() + kVollbildSperreMs;
+        return true;
       }
     }
     HcWinRtSchliessen(mframe);
@@ -943,89 +1046,28 @@ bool RTCDesktopCapturerImpl::WgcAcquire(bool* changed) {
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Vollbildspiel-Umschaltung im WGC-Fenster-Modus (2026-10-09, jimtonics, RTX
-// 3070): Fensterfreigabe eines Vollbildspiels (Fenster = Monitorgroesse) zeigte
-// beim Empfaenger ein Standbild, solange das Spiel vorn war; Bildschirmfreigabe
-// lief. Ein Vollbildspiel im Vordergrund praesentiert per Independent Flip
-// direkt, DWM komponiert das Fenster nicht -> die WGC-FENSTER-Aufnahme bekommt
-// keine neuen Bilder, die MONITOR-Aufnahme schon. Deshalb: solange das Fenster
-// vorn ist UND seinen Monitor vollstaendig bedeckt, Monitor aufnehmen.
-// DATENSCHUTZ (Tims bewusste Entscheidung): Im Monitor-Teilmodus sind auch
-// Benachrichtigungen/Overlays sichtbar, die ueber dem Spiel erscheinen. Damit
-// nicht mehr durchrutscht, wird "vorn" im Teilmodus JEDEN Takt geprueft (ein
-// GetForegroundWindow-Aufruf) und beim ersten Fehlschlag sofort zurueck aufs
-// Fenster geschaltet; nur die volle Pruefung laeuft gedrosselt.
-static constexpr int64_t kVollbildPruefMs = 500;  // volle Pruefung <= 2x/s
-static constexpr int kVollbildTreffer = 2;        // Hysterese: 2 in Folge
-static constexpr LONG kVollbildToleranzPx = 2;    // Randtoleranz je Kante
-static constexpr int64_t kVollbildSperreMs = 30000;  // nach Fehlschlag
-
-// Ist das freigegebene Fenster (oder sein Wurzelfenster) im Vordergrund?
-static bool HcFensterVorn(HWND hwnd) {
-  HWND fg = GetForegroundWindow();
-  if (!fg) return false;
-  if (fg == hwnd) return true;
-  HWND root = GetAncestor(hwnd, GA_ROOT);
-  return root && GetAncestor(fg, GA_ROOT) == root;
-}
-
-// Bedeckt das Fenster seinen Monitor vollstaendig (rcMonitor, nicht rcWork)?
-// Sichtbare Grenzen per DWMWA_EXTENDED_FRAME_BOUNDS (ohne unsichtbare
-// Resize-Raender), sonst GetWindowRect. Beide in physischen Pixeln, da der
-// Prozess Per-Monitor-DPI-aware ist (wie rcMonitor).
-static bool HcFensterDecktMonitor(HWND hwnd, HMONITOR* mon_out) {
-  *mon_out = nullptr;
-  if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
-  HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
-  if (!mon) return false;
-  MONITORINFO mi = {};
-  mi.cbSize = sizeof(mi);
-  if (!GetMonitorInfoW(mon, &mi)) return false;
-  RECT wr = {};
-  if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &wr,
-                                   sizeof(wr))) &&
-      !::GetWindowRect(hwnd, &wr)) {
-    return false;
-  }
-  const RECT& m = mi.rcMonitor;
-  if (std::labs(wr.left - m.left) > kVollbildToleranzPx ||
-      std::labs(wr.top - m.top) > kVollbildToleranzPx ||
-      std::labs(wr.right - m.right) > kVollbildToleranzPx ||
-      std::labs(wr.bottom - m.bottom) > kVollbildToleranzPx) {
-    return false;
-  }
-  *mon_out = mon;
-  return true;
-}
-
 // Laeuft je Takt aus GpuCaptureFrame (thread_), nur im WGC-Fenster-Modus.
 void RTCDesktopCapturerImpl::WgcVollbildPruefen() {
   if (!wgc_ || !wgc_->pool) return;
   HWND hwnd = reinterpret_cast<HWND>(source_id_);
-  // Schnellweg im Teilmodus (Datenschutz, s. o.): Fenster nicht mehr vorn ->
-  // sofort zurueck, ohne Hysterese und ohne Drossel.
-  if (wgc_->mon_aktiv && !HcFensterVorn(hwnd)) {
-    WgcMonStop("Fenster nicht mehr vorn");
+  if (wgc_->mon_aktiv) {
+    // Teilmodus (Datenschutz, s. o.): VOLLE Bedingung jeden Takt, ohne
+    // Hysterese und ohne Drossel -> beim ersten Fehlschlag sofort zurueck.
+    if (const char* grund = HcTeilmodusVerletzt(hwnd, wgc_->mon))
+      WgcMonStop(grund);
     return;
   }
   const int64_t now = webrtc::TimeMillis();
   if (now - wgc_->pruef_ms < kVollbildPruefMs) return;
   wgc_->pruef_ms = now;
 
+  // Erst die billige Stock-Bedingung (keine Systemaufrufe): liefert das Fenster
+  // noch Bilder, bleibt es beim Fenster.
+  const bool stockt =
+      now - wgc_->fenster_neu_ms >= kVollbildStockMs &&
+      wgc_->fenster_stock_takte >= kVollbildStockTakte;
   HMONITOR mon = nullptr;
-  const bool bedingung = HcFensterVorn(hwnd) && HcFensterDecktMonitor(hwnd, &mon);
-  if (wgc_->mon_aktiv) {
-    if (!bedingung) {
-      WgcMonStop("Fenster deckt den Monitor nicht mehr");
-    } else if (mon != wgc_->mon) {
-      // Spiel auf einen anderen Monitor gewandert -> erst zurueck aufs Fenster;
-      // die naechsten Pruefungen schalten ggf. auf den neuen Monitor.
-      WgcMonStop("Fenster auf anderem Monitor");
-    }
-    return;
-  }
-  if (!bedingung) {
+  if (!stockt || !HcFensterVorn(hwnd) || !HcFensterDecktMonitor(hwnd, &mon)) {
     wgc_->treffer = 0;
     return;
   }
@@ -1131,8 +1173,20 @@ void RTCDesktopCapturerImpl::WgcMonStop(const char* grund) {
   wgc_->mon = nullptr;
   wgc_->mon_aktiv = false;
   wgc_->treffer = 0;
-  if (war_aktiv && grund)
-    HcCapLog("Vollbild: %s -> zurueck auf Fenster-Aufnahme", grund);
+  // Stock-Erkennung neu beginnen: erneut umgeschaltet wird erst, wenn das
+  // Fenster wieder >= 1 s stockt (kein Pendeln Fenster <-> Monitor).
+  wgc_->fenster_neu_ms = webrtc::TimeMillis();
+  wgc_->fenster_stock_takte = 0;
+  if (war_aktiv) {
+    // g_cached_ und g_out_[g_last_out_idx_] halten noch das letzte MONITOR-
+    // Bild. Das darf nach dem Zurueckschalten nicht weiter gesendet werden
+    // (auch nicht als Wiederholung/Keyframe): GpuCaptureFrame sendet erst
+    // wieder, wenn das erste Fensterbild in g_cached_ liegt.
+    g_last_out_idx_ = -1;
+    g_have_frame_ = false;
+    if (grund)
+      HcCapLog("Vollbild: %s -> zurueck auf Fenster-Aufnahme", grund);
+  }
 }
 
 void RTCDesktopCapturerImpl::ReleaseGpu() {
@@ -1201,6 +1255,17 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
     // Vorher: Vollbildspiel vorn? -> Quelle Monitor statt Fenster (und zurueck).
     WgcVollbildPruefen();
     if (!WgcAcquire(&changed)) return;
+    // Stock-Erkennung der Fensteraufnahme (Voraussetzung fuers Umschalten):
+    // nur im Fenster-Teil gefuehrt; im Teilmodus liefert das Fenster ohnehin
+    // nichts.
+    if (wgc_ && !wgc_->mon_aktiv) {
+      if (changed) {
+        wgc_->fenster_neu_ms = webrtc::TimeMillis();
+        wgc_->fenster_stock_takte = 0;
+      } else {
+        ++wgc_->fenster_stock_takte;
+      }
+    }
     if (!changed && !g_have_frame_) return;  // noch kein Frame
     // Messpunkt fuer die "gpu cap"-Zeile: neues Bild oder Wiederholung.
     if (changed) {
