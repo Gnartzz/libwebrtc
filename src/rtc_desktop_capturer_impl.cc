@@ -18,6 +18,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #ifdef WEBRTC_WIN
 #include <windows.h>
 #endif
@@ -33,6 +34,7 @@
 #include <dxgi1_5.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
+#include <dwmapi.h>  // DWMWA_EXTENDED_FRAME_BOUNDS (dwmapi.lib steht im BUILD.gn)
 #include "win/honeycord_d3d11_frame.h"
 // WGC (Windows.Graphics.Capture) fuer GPU-Zero-Copy-Fenster-Capture. Die WinRT-
 // Header + webrtc-Helfer (gleiche, die webrtcs eigener WGC-Capturer nutzt -> im
@@ -89,7 +91,27 @@ struct RTCDesktopCapturerImpl::WgcState {
   Microsoft::WRL::ComPtr<WGC::IDirect3D11CaptureFramePool> pool;
   Microsoft::WRL::ComPtr<WGC::IGraphicsCaptureSession> session;
   Microsoft::WRL::ComPtr<WGC::IGraphicsCaptureItem> item;
+  // Monitor-Teilmodus (Vollbildspiel vorn, s. WgcVollbildPruefen): zweites
+  // WGC-Item fuer den Monitor des Fensters, eigener Pool + eigene Session auf
+  // demselben device. Leer, solange der Teilmodus aus ist.
+  Microsoft::WRL::ComPtr<WGC::IGraphicsCaptureItem> mon_item;
+  Microsoft::WRL::ComPtr<WGC::IDirect3D11CaptureFramePool> mon_pool;
+  Microsoft::WRL::ComPtr<WGC::IGraphicsCaptureSession> mon_session;
+  HMONITOR mon = nullptr;     // Monitor, der gerade aufgenommen wird
+  bool mon_aktiv = false;     // Quelle = Monitor statt Fenster
+  int64_t pruef_ms = 0;       // letzte volle Bedingungspruefung
+  int treffer = 0;            // Pruefungen in Folge mit erfuellter Bedingung
+  int64_t sperre_bis_ms = 0;  // nach Fehlschlag kein neuer Versuch bis dahin
 };
+
+// WinRT-Objekt schliessen (IClosable) und freigeben; leer -> nichts.
+template <typename T>
+static void HcWinRtSchliessen(Microsoft::WRL::ComPtr<T>& obj) {
+  if (!obj) return;
+  Microsoft::WRL::ComPtr<ABI::Windows::Foundation::IClosable> cl;
+  if (SUCCEEDED(obj.As(&cl))) cl->Close();
+  obj.Reset();
+}
 #endif
 
 RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
@@ -752,6 +774,9 @@ bool RTCDesktopCapturerImpl::InitGpuWindow(intptr_t hwnd) {
   using Microsoft::WRL::ComPtr;
   HcCapLog("InitGpuWindow Versuch (WGC) hwnd=%p", (void*)hwnd);
   if (!hwnd) return false;
+  // Neustart nach Stop(): einen evtl. noch laufenden Monitor-Teilmodus des
+  // vorigen Laufs sauber schliessen, bevor wgc_ unten ersetzt wird.
+  WgcMonStop(nullptr);
 
   // --- NVIDIA-Device (wie InitGpu) ---
   HRESULT hr;
@@ -837,6 +862,48 @@ bool RTCDesktopCapturerImpl::WgcAcquire(bool* changed) {
   using Microsoft::WRL::ComPtr;
   *changed = false;
   if (!wgc_ || !wgc_->pool) return false;
+  if (wgc_->mon_aktiv) {
+    // Monitor-Teilmodus: Bild aus dem Monitor-Pool. Solange noch keins da ist
+    // (gerade umgeschaltet), bleibt changed=false -> der Aufrufer wiederholt
+    // das letzte Bild, es geht nichts Schwarzes/Leeres raus. Der Fenster-Pool
+    // wird derweil nicht geleert (er bekommt im Independent Flip ohnehin
+    // nichts); nach dem Zurueckschalten zeigt er hoechstens kurz ein aelteres
+    // Spielbild, aber nie den Desktop.
+    if (!wgc_->mon_pool) { WgcMonStop("Monitor-Pool fehlt"); return true; }
+    ComPtr<WGC::IDirect3D11CaptureFrame> mframe;
+    if (FAILED(wgc_->mon_pool->TryGetNextFrame(&mframe)) || !mframe)
+      return true;
+    ABI::Windows::Graphics::SizeInt32 msize = {};
+    mframe->get_ContentSize(&msize);
+    if (static_cast<uint32_t>(msize.Width) != wgc_w_ ||
+        static_cast<uint32_t>(msize.Height) != wgc_h_) {
+      // Monitor-Modus gewechselt o. ae. -> die Pipeline (Fenstergroesse) passt
+      // nicht mehr; zurueck aufs Fenster statt Pipeline umzubauen.
+      HcWinRtSchliessen(mframe);
+      HcCapLog("Vollbild: Monitorbild %dx%d passt nicht zur Pipeline %ux%u",
+               msize.Width, msize.Height, wgc_w_, wgc_h_);
+      WgcMonStop("Monitorgroesse geaendert");
+      return true;
+    }
+    ComPtr<WGDX::Direct3D11::IDirect3DSurface> msurf;
+    ComPtr<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess> macc;
+    ComPtr<ID3D11Texture2D> mtex;
+    if (g_cached_ && SUCCEEDED(mframe->get_Surface(&msurf)) && msurf &&
+        SUCCEEDED(msurf.As(&macc)) &&
+        SUCCEEDED(macc->GetInterface(IID_PPV_ARGS(&mtex))) && mtex) {
+      // CopyResource verlangt gleiche Masse: Pool-Textur gegen g_cached_ pruefen.
+      D3D11_TEXTURE2D_DESC sd = {}, dd = {};
+      mtex->GetDesc(&sd);
+      g_cached_->GetDesc(&dd);
+      if (sd.Width == dd.Width && sd.Height == dd.Height) {
+        g_ctx_->CopyResource(g_cached_.Get(), mtex.Get());
+        g_have_frame_ = true;
+        *changed = true;
+      }
+    }
+    HcWinRtSchliessen(mframe);
+    return true;
+  }
   ComPtr<WGC::IDirect3D11CaptureFrame> frame;
   if (FAILED(wgc_->pool->TryGetNextFrame(&frame))) return true;  // transient
   if (!frame) return true;  // kein neuer Frame -> Stillstand
@@ -876,6 +943,198 @@ bool RTCDesktopCapturerImpl::WgcAcquire(bool* changed) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Vollbildspiel-Umschaltung im WGC-Fenster-Modus (2026-10-09, jimtonics, RTX
+// 3070): Fensterfreigabe eines Vollbildspiels (Fenster = Monitorgroesse) zeigte
+// beim Empfaenger ein Standbild, solange das Spiel vorn war; Bildschirmfreigabe
+// lief. Ein Vollbildspiel im Vordergrund praesentiert per Independent Flip
+// direkt, DWM komponiert das Fenster nicht -> die WGC-FENSTER-Aufnahme bekommt
+// keine neuen Bilder, die MONITOR-Aufnahme schon. Deshalb: solange das Fenster
+// vorn ist UND seinen Monitor vollstaendig bedeckt, Monitor aufnehmen.
+// DATENSCHUTZ (Tims bewusste Entscheidung): Im Monitor-Teilmodus sind auch
+// Benachrichtigungen/Overlays sichtbar, die ueber dem Spiel erscheinen. Damit
+// nicht mehr durchrutscht, wird "vorn" im Teilmodus JEDEN Takt geprueft (ein
+// GetForegroundWindow-Aufruf) und beim ersten Fehlschlag sofort zurueck aufs
+// Fenster geschaltet; nur die volle Pruefung laeuft gedrosselt.
+static constexpr int64_t kVollbildPruefMs = 500;  // volle Pruefung <= 2x/s
+static constexpr int kVollbildTreffer = 2;        // Hysterese: 2 in Folge
+static constexpr LONG kVollbildToleranzPx = 2;    // Randtoleranz je Kante
+static constexpr int64_t kVollbildSperreMs = 30000;  // nach Fehlschlag
+
+// Ist das freigegebene Fenster (oder sein Wurzelfenster) im Vordergrund?
+static bool HcFensterVorn(HWND hwnd) {
+  HWND fg = GetForegroundWindow();
+  if (!fg) return false;
+  if (fg == hwnd) return true;
+  HWND root = GetAncestor(hwnd, GA_ROOT);
+  return root && GetAncestor(fg, GA_ROOT) == root;
+}
+
+// Bedeckt das Fenster seinen Monitor vollstaendig (rcMonitor, nicht rcWork)?
+// Sichtbare Grenzen per DWMWA_EXTENDED_FRAME_BOUNDS (ohne unsichtbare
+// Resize-Raender), sonst GetWindowRect. Beide in physischen Pixeln, da der
+// Prozess Per-Monitor-DPI-aware ist (wie rcMonitor).
+static bool HcFensterDecktMonitor(HWND hwnd, HMONITOR* mon_out) {
+  *mon_out = nullptr;
+  if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
+  HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+  if (!mon) return false;
+  MONITORINFO mi = {};
+  mi.cbSize = sizeof(mi);
+  if (!GetMonitorInfoW(mon, &mi)) return false;
+  RECT wr = {};
+  if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &wr,
+                                   sizeof(wr))) &&
+      !::GetWindowRect(hwnd, &wr)) {
+    return false;
+  }
+  const RECT& m = mi.rcMonitor;
+  if (std::labs(wr.left - m.left) > kVollbildToleranzPx ||
+      std::labs(wr.top - m.top) > kVollbildToleranzPx ||
+      std::labs(wr.right - m.right) > kVollbildToleranzPx ||
+      std::labs(wr.bottom - m.bottom) > kVollbildToleranzPx) {
+    return false;
+  }
+  *mon_out = mon;
+  return true;
+}
+
+// Laeuft je Takt aus GpuCaptureFrame (thread_), nur im WGC-Fenster-Modus.
+void RTCDesktopCapturerImpl::WgcVollbildPruefen() {
+  if (!wgc_ || !wgc_->pool) return;
+  HWND hwnd = reinterpret_cast<HWND>(source_id_);
+  // Schnellweg im Teilmodus (Datenschutz, s. o.): Fenster nicht mehr vorn ->
+  // sofort zurueck, ohne Hysterese und ohne Drossel.
+  if (wgc_->mon_aktiv && !HcFensterVorn(hwnd)) {
+    WgcMonStop("Fenster nicht mehr vorn");
+    return;
+  }
+  const int64_t now = webrtc::TimeMillis();
+  if (now - wgc_->pruef_ms < kVollbildPruefMs) return;
+  wgc_->pruef_ms = now;
+
+  HMONITOR mon = nullptr;
+  const bool bedingung = HcFensterVorn(hwnd) && HcFensterDecktMonitor(hwnd, &mon);
+  if (wgc_->mon_aktiv) {
+    if (!bedingung) {
+      WgcMonStop("Fenster deckt den Monitor nicht mehr");
+    } else if (mon != wgc_->mon) {
+      // Spiel auf einen anderen Monitor gewandert -> erst zurueck aufs Fenster;
+      // die naechsten Pruefungen schalten ggf. auf den neuen Monitor.
+      WgcMonStop("Fenster auf anderem Monitor");
+    }
+    return;
+  }
+  if (!bedingung) {
+    wgc_->treffer = 0;
+    return;
+  }
+  if (++wgc_->treffer < kVollbildTreffer) return;
+  if (now < wgc_->sperre_bis_ms) return;
+  if (!WgcMonStart(mon)) {
+    wgc_->treffer = 0;
+    wgc_->sperre_bis_ms = now + kVollbildSperreMs;
+  }
+}
+
+// Zweites WGC-Item fuer den Monitor + eigener FreeThreaded-Pool + Session auf
+// wgc_->device. Umgeschaltet wird NUR, wenn der Monitor genau so gross ist wie
+// die laufende Pipeline (wgc_w_ x wgc_h_ = Fenstergroesse) — dann passt alles
+// unveraendert (g_cached_, Downscale, Ring, Encoder-Aufloesung). Sonst und bei
+// jedem Fehler: protokollieren, beim Fenster bleiben (Aufrufer sperrt 30 s).
+bool RTCDesktopCapturerImpl::WgcMonStart(HMONITOR mon) {
+  using Microsoft::WRL::ComPtr;
+  if (!wgc_ || !wgc_->device || !mon) return false;
+  HRESULT hr;
+  ComPtr<IGraphicsCaptureItemInterop> interop;
+  hr = webrtc::GetActivationFactory<
+      IGraphicsCaptureItemInterop,
+      RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem>(&interop);
+  if (FAILED(hr)) {
+    HcCapLog("Vollbild: Monitor-Aufnahme FAIL @ ItemInterop: 0x%08X -> bleibe beim Fenster",
+             (unsigned)hr);
+    return false;
+  }
+  ComPtr<WGC::IGraphicsCaptureItem> item;
+  hr = interop->CreateForMonitor(mon, IID_PPV_ARGS(&item));
+  if (FAILED(hr) || !item) {
+    HcCapLog("Vollbild: Monitor-Aufnahme FAIL @ CreateForMonitor: 0x%08X -> bleibe beim Fenster",
+             (unsigned)hr);
+    return false;
+  }
+  ABI::Windows::Graphics::SizeInt32 msize = {};
+  item->get_Size(&msize);
+  if (static_cast<uint32_t>(msize.Width) != wgc_w_ ||
+      static_cast<uint32_t>(msize.Height) != wgc_h_) {
+    HcCapLog("Vollbild: Monitor %dx%d != Fenster-Pipeline %ux%u -> bleibe beim Fenster",
+             msize.Width, msize.Height, wgc_w_, wgc_h_);
+    return false;
+  }
+  ComPtr<WGC::IDirect3D11CaptureFramePoolStatics> fps;
+  hr = webrtc::GetActivationFactory<
+      WGC::IDirect3D11CaptureFramePoolStatics,
+      RuntimeClass_Windows_Graphics_Capture_Direct3D11CaptureFramePool>(&fps);
+  ComPtr<WGC::IDirect3D11CaptureFramePoolStatics2> fps2;
+  if (FAILED(hr) || FAILED(fps.As(&fps2))) {
+    HcCapLog("Vollbild: Monitor-Aufnahme FAIL @ FramePoolStatics -> bleibe beim Fenster");
+    return false;
+  }
+  ComPtr<WGC::IDirect3D11CaptureFramePool> pool;
+  hr = fps2->CreateFreeThreaded(wgc_->device.Get(),
+       WGDX::DirectXPixelFormat_B8G8R8A8UIntNormalized, 2, msize, &pool);
+  if (FAILED(hr) || !pool) {
+    HcCapLog("Vollbild: Monitor-Aufnahme FAIL @ CreateFreeThreaded: 0x%08X -> bleibe beim Fenster",
+             (unsigned)hr);
+    return false;
+  }
+  ComPtr<WGC::IGraphicsCaptureSession> session;
+  hr = pool->CreateCaptureSession(item.Get(), &session);
+  if (FAILED(hr) || !session) {
+    HcCapLog("Vollbild: Monitor-Aufnahme FAIL @ CreateCaptureSession: 0x%08X -> bleibe beim Fenster",
+             (unsigned)hr);
+    HcWinRtSchliessen(pool);
+    return false;
+  }
+  // Wie beim Fenster: gelber WGC-Rahmen weg (Win11), Cursor wie gewuenscht.
+  ComPtr<WGC::IGraphicsCaptureSession3> s3;
+  if (SUCCEEDED(session.As(&s3))) s3->put_IsBorderRequired(false);
+  ComPtr<WGC::IGraphicsCaptureSession2> s2;
+  if (SUCCEEDED(session.As(&s2)))
+    s2->put_IsCursorCaptureEnabled(show_cursor_ ? TRUE : FALSE);
+  hr = session->StartCapture();
+  if (FAILED(hr)) {
+    HcCapLog("Vollbild: Monitor-Aufnahme FAIL @ StartCapture: 0x%08X -> bleibe beim Fenster",
+             (unsigned)hr);
+    HcWinRtSchliessen(session);
+    HcWinRtSchliessen(pool);
+    return false;
+  }
+  wgc_->mon_item = item;
+  wgc_->mon_pool = pool;
+  wgc_->mon_session = session;
+  wgc_->mon = mon;
+  wgc_->mon_aktiv = true;
+  HcCapLog("Vollbild: Fenster deckt Monitor und ist vorn -> Monitor-Aufnahme (%dx%d)",
+           msize.Width, msize.Height);
+  return true;
+}
+
+// Monitor-Teilmodus beenden (zurueck aufs Fenster). Idempotent; auch aus
+// ReleaseGpu/InitGpuWindow und nach Stop() (letzter Takt) gerufen. Der Fenster-
+// Pool und seine Session laufen die ganze Zeit weiter -> sofort wieder bereit.
+void RTCDesktopCapturerImpl::WgcMonStop(const char* grund) {
+  if (!wgc_) return;
+  const bool war_aktiv = wgc_->mon_aktiv;
+  HcWinRtSchliessen(wgc_->mon_session);
+  HcWinRtSchliessen(wgc_->mon_pool);
+  wgc_->mon_item.Reset();
+  wgc_->mon = nullptr;
+  wgc_->mon_aktiv = false;
+  wgc_->treffer = 0;
+  if (war_aktiv && grund)
+    HcCapLog("Vollbild: %s -> zurueck auf Fenster-Aufnahme", grund);
+}
+
 void RTCDesktopCapturerImpl::ReleaseGpu() {
   g_dup_.Reset();
   for (auto& r : g_rtv_) r.Reset();
@@ -893,8 +1152,10 @@ void RTCDesktopCapturerImpl::ReleaseGpu() {
   g_share_cur_handle_ = nullptr;
   g_share_last_ms_ = 0;
   g_last_out_idx_ = -1;
-  // WGC-Fenster-Capture beenden (haelt Refs auf g_dev_).
+  // WGC-Fenster-Capture beenden (haelt Refs auf g_dev_). Zuerst einen evtl.
+  // laufenden Monitor-Teilmodus (eigene Session + Pool auf demselben device).
   if (wgc_) {
+    WgcMonStop(nullptr);
     if (wgc_->session) {
       Microsoft::WRL::ComPtr<ABI::Windows::Foundation::IClosable> cl;
       if (SUCCEEDED(wgc_->session.As(&cl))) cl->Close();
@@ -937,8 +1198,16 @@ void RTCDesktopCapturerImpl::GpuCaptureFrame() {
   if (wgc_mode_) {
     // WGC-Fenster: naechste GPU-Textur -> g_cached_ (Zero-Copy). changed=false bei
     // Stillstand (-> Steady-Cadence-Wiederholung). false = diesen Frame skippen.
+    // Vorher: Vollbildspiel vorn? -> Quelle Monitor statt Fenster (und zurueck).
+    WgcVollbildPruefen();
     if (!WgcAcquire(&changed)) return;
     if (!changed && !g_have_frame_) return;  // noch kein Frame
+    // Messpunkt fuer die "gpu cap"-Zeile: neues Bild oder Wiederholung.
+    if (changed) {
+      ++cap_neu_;
+    } else if (g_last_out_idx_ >= 0) {
+      ++cap_wdh_;
+    }
   } else if (g_dup_) {
     ComPtr<IDXGIResource> res;
     DXGI_OUTDUPL_FRAME_INFO fi;
@@ -1074,10 +1343,24 @@ void RTCDesktopCapturerImpl::CaptureFrame() {
       int64_t gn = static_cast<int64_t>(capture_delay_) - gel;
       if (gn < 0) gn = 0;
       static int s_gpu_dbg = 0;
-      if ((s_gpu_dbg++ % 120) == 0)
-        HcCapLog("gpu cap: total=%lldms next=%lldms %ux%u->%ux%u",
-                 (long long)gel, (long long)gn, g_desk_w_, g_desk_h_,
-                 g_target_w_, g_target_h_);
+      if ((s_gpu_dbg++ % 120) == 0) {
+        if (wgc_mode_) {
+          // Fenster-Modus mit Messpunkt: neu = echte neue WGC-Bilder seit der
+          // letzten Zeile, wiederholt = Takte mit dem letzten Bild (Standbild
+          // => neu=0). "fenster->monitor" = Vollbild-Teilmodus aktiv.
+          HcCapLog("gpu cap (%s): neu=%u wiederholt=%u total=%lldms next=%lldms "
+                   "%ux%u->%ux%u",
+                   (wgc_ && wgc_->mon_aktiv) ? "fenster->monitor" : "fenster",
+                   cap_neu_, cap_wdh_, (long long)gel, (long long)gn,
+                   g_desk_w_, g_desk_h_, g_target_w_, g_target_h_);
+        } else {
+          HcCapLog("gpu cap: total=%lldms next=%lldms %ux%u->%ux%u",
+                   (long long)gel, (long long)gn, g_desk_w_, g_desk_h_,
+                   g_target_w_, g_target_h_);
+        }
+        cap_neu_ = 0;
+        cap_wdh_ = 0;
+      }
       thread_->PostDelayedHighPrecisionTask(
           [this]() { CaptureFrame(); }, webrtc::TimeDelta::Millis(gn));
       return;
@@ -1143,6 +1426,14 @@ void RTCDesktopCapturerImpl::CaptureFrame() {
         [this]() { CaptureFrame(); },
         webrtc::TimeDelta::Millis(next_ms));
   }
+#ifdef _WIN32
+  else if (wgc_ && wgc_->mon_aktiv) {
+    // Letzter Takt nach Stop(): Stop() laeuft auf einem fremden Thread und
+    // fasst WGC nicht an; die Monitor-Aufnahme hier (thread_) beenden, damit
+    // sie nicht bis zum Destruktor weiterlaeuft.
+    WgcMonStop("Freigabe beendet");
+  }
+#endif
 }
 
 }  // namespace libwebrtc

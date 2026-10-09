@@ -178,6 +178,19 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   std::unique_ptr<WgcState> wgc_;
   bool wgc_mode_ = false;
   uint32_t wgc_w_ = 0, wgc_h_ = 0;
+  // Vollbildspiel-Umschaltung (2026-10-09, jimtonics): Ein Vollbildspiel im
+  // Vordergrund praesentiert per Independent Flip direkt, DWM komponiert das
+  // Fenster nicht -> die WGC-FENSTER-Aufnahme bekommt keine neuen Bilder
+  // (Standbild beim Empfaenger). Solange das Fenster vorn ist UND seinen
+  // Monitor vollstaendig bedeckt, nimmt der Capturer den MONITOR auf (zweites
+  // WGC-Item, eigener Pool + Session); sonst wieder das Fenster. Alles auf
+  // thread_ (wie die uebrigen WGC-Aufrufe).
+  void WgcVollbildPruefen();
+  bool WgcMonStart(HMONITOR mon);
+  void WgcMonStop(const char* grund);  // grund=nullptr -> ohne Protokollzeile
+  // Messpunkt: neue bzw. wiederholte Bilder seit der letzten "gpu cap"-Zeile
+  // (nur im Fenster-Modus ausgegeben).
+  uint32_t cap_neu_ = 0, cap_wdh_ = 0;
 #endif
 };
 
