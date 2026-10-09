@@ -273,6 +273,7 @@ int HwH264Encoder::InitEncode(
   framerate_ = codec_settings->maxFramerate ? codec_settings->maxFramerate : 30;
   max_fps_ = framerate_;
   bildrate_folge_ = 0;
+  aufsetzen_ausstehend_ = false;
   target_bitrate_bps_ = codec_settings->startBitrate * 1000;
   max_bitrate_bps_ = codec_settings->maxBitrate * 1000;
   if (target_bitrate_bps_ == 0) target_bitrate_bps_ = 1000000;
@@ -578,6 +579,20 @@ int32_t HwH264Encoder::Encode(
     }
   }
 
+  // ★★ 09.10.2026: einen in die Sperrzeit gefallenen Ratensprung nachholen
+  // (s. `aufsetzen_ausstehend_`). Nur VA-API — NVENC stellt sich in SetRates
+  // selbst um und merkt nie etwas vor.
+  if (aufsetzen_ausstehend_ && weg_ != Backend::kNvenc) {
+    const int64_t jetzt = webrtc::TimeMillis();
+    if (jetzt - letztes_aufsetzen_ms_ >= ausstehend_sperre_ms_) {
+      aufsetzen_ausstehend_ = false;
+      VaapiNeuAufsetzen(bitrate_adjuster_.GetAdjustedBitrateBps(), ausstehend_gefordert_,
+                        ausstehend_hoch_, ausstehend_runter_, ausstehend_bildrate_,
+                        ausstehend_fz_, jetzt, "nachgeholt ");
+      if (!ctx_) return WEBRTC_VIDEO_CODEC_ERROR;   // Wiederanlauf oben greift
+    }
+  }
+
   bool keyframe = false;
   if (frame_types) {
     for (const auto& t : *frame_types) {
@@ -842,14 +857,35 @@ void HwH264Encoder::SetRates(
   // echten Sprüngen (s. oben: hoch ab 1,5×, runter ab 2×, Bildrate ab 1,5×)
   // UND höchstens alle zehn Sekunden. Kleine Wellen fängt der Ausgleicher ab.
   const int64_t sperrzeit_ms = bildrate_hoch ? 3000 : 10000;
-  if (!sprung || jetzt - letztes_aufsetzen_ms_ < sperrzeit_ms) return;
+  if (!sprung) {
+    // Die Lage hat sich beruhigt: ein gemerkter Sprung gilt nicht mehr.
+    aufsetzen_ausstehend_ = false;
+    return;
+  }
+  if (jetzt - letztes_aufsetzen_ms_ < sperrzeit_ms) {
+    // ★★ 09.10.2026: merken statt verwerfen — `Encode` holt es nach.
+    aufsetzen_ausstehend_ = true;
+    ausstehend_gefordert_ = gefordert;
+    ausstehend_fz_ = fz;
+    ausstehend_hoch_ = hoch;
+    ausstehend_runter_ = runter;
+    ausstehend_bildrate_ = bildrate;
+    ausstehend_sperre_ms_ = sperrzeit_ms;
+    return;
+  }
+  aufsetzen_ausstehend_ = false;
+  VaapiNeuAufsetzen(neu, gefordert, hoch, runter, bildrate, fz, jetzt, "");
+}
 
+void HwH264Encoder::VaapiNeuAufsetzen(uint32_t neu, uint32_t gefordert, bool hoch,
+                                      bool runter, bool bildrate, uint32_t fz,
+                                      int64_t jetzt, const char* wie) {
   // Nur ABWÄRTS darf die Rate sinken. Löst „hoch" oder „bildrate" aus,
   // während der Ausgleicher gerade von einem Überschuss gedrückt ist, bliebe
   // sonst weniger als vorher (Prüfbefunde M1/M2).
   const uint32_t soll = runter ? neu : std::max(neu, target_bitrate_bps_);
-  Protokoll("VA-API neu aufsetzen: %u -> %u kbit/s, @%u -> @%u fps (%s%s%s, %lld ms seit dem letzten)",
-            target_bitrate_bps_ / 1000, soll / 1000, framerate_offen_, fz,
+  Protokoll("VA-API %sneu aufsetzen: %u -> %u kbit/s, @%u -> @%u fps (%s%s%s, %lld ms seit dem letzten)",
+            wie, target_bitrate_bps_ / 1000, soll / 1000, framerate_offen_, fz,
             hoch ? "hoch " : "", runter ? "runter " : "", bildrate ? "bildrate" : "",
             static_cast<long long>(jetzt - letztes_aufsetzen_ms_));
   target_bitrate_bps_ = soll;

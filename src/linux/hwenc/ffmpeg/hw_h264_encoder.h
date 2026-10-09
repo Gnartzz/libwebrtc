@@ -82,6 +82,10 @@ class HwH264Encoder : public webrtc::VideoEncoder {
 
  private:
   int32_t CodecOeffnen();
+  // VA-API mit neuer Rate/Bildrate öffnen (unter `mutex_`). `wie` erscheint
+  // im hwenc.log („" oder „nachgeholt ").
+  void VaapiNeuAufsetzen(uint32_t neu, uint32_t gefordert, bool hoch, bool runter,
+                         bool bildrate, uint32_t fz, int64_t jetzt, const char* wie);
   void CodecSchliessen();
   // Holt jedes fertige Paket ab und reicht es an den Rückruf weiter. Die
   // Zeitangaben kommen aus `stempel_`, NICHT vom gerade übergebenen Bild —
@@ -152,6 +156,19 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   // Neu aufsetzen bei Ratenwechsel kostet ein Keyframe — deshalb nur bei
   // echten Sprüngen und nicht öfter als alle paar Sekunden.
   int64_t letztes_aufsetzen_ms_ = 0;
+  // ★★ 09.10.2026 (Haltoan, „720p mit 0,1 Mbit", hwenc.log Bündel 85): Ein
+  // Sprung, der in die Sperrzeit fiel, wurde VERWORFEN. Fragt WebRTC danach
+  // nicht mehr nach (Rate konstant: kein weiteres SetRates), blieb der
+  // Encoder für immer auf der Startrate — geöffnet mit 290 kbit/s, gefordert
+  // 4000. Jetzt wird der Sprung gemerkt und in `Encode` nachgeholt, sobald
+  // die Sperrzeit um ist.
+  bool aufsetzen_ausstehend_ = false;
+  uint32_t ausstehend_gefordert_ = 0;
+  uint32_t ausstehend_fz_ = 30;
+  bool ausstehend_hoch_ = false;
+  bool ausstehend_runter_ = false;
+  bool ausstehend_bildrate_ = false;
+  int64_t ausstehend_sperre_ms_ = 10000;
   // Nach einem gescheiterten Öffnen nicht endgültig aufgeben, sondern es
   // gelegentlich erneut versuchen (der Grund kann vorübergehend sein:
   // Gerät belegt, Suspend, VT-Wechsel).
