@@ -216,6 +216,10 @@ class NvCodecVideoEncoderImpl : public NvCodecVideoEncoder {
   webrtc::BitrateAdjuster bitrate_adjuster_;
   uint32_t target_bitrate_bps_ = 0;
   uint32_t max_bitrate_bps_ = 0;
+  // ★ HoneyCord: „Reconfigure OK" nur protokollieren, wenn die Rate sich
+  // spuerbar aenderte (SetRates-Zeile geschrieben) — sonst waechst
+  // nvenc-probe.log bei langen Freigaben ungebremst.
+  bool rates_protokollieren_ = true;
 
   int32_t InitNvEnc();
   int32_t ReleaseNvEnc();
@@ -388,7 +392,13 @@ bool NvCodecVideoEncoderImpl::EnsureNativeEncoder(ID3D11Device* device) {
                                     NV_ENC_PRESET_P3_GUID);
     ip.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
     ip.enableEncodeAsync = 0;
-    ip.frameRateNum = 60;
+    // ★ HoneyCord (16.10.2026, gemessen bei okunoku: Rennspiel als Fenster,
+    // 720p30, Ziel 1,8 Mbit/s -> 0,87 Mbit/s im Mittel, starke Kloetzchen,
+    // bwe 6 Mbit/s, kein Drosselgrund): Hier stand fest `60`. Die
+    // Ratensteuerung verteilt das Budget auf 60 Bilder/s — bei 30 echten
+    // Bildern kam also nur die HALBE Zielrate heraus. Jetzt die echte Rate
+    // aus maxFramerate/SetRates, mit 30 als Rueckfall.
+    ip.frameRateNum = framerate_ >= 1 ? framerate_ : 30;
     ip.frameRateDen = 1;
     cfg.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
     cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
@@ -397,13 +407,32 @@ bool NvCodecVideoEncoderImpl::EnsureNativeEncoder(ID3D11Device* device) {
     cfg.rcParams.averageBitRate = target_bitrate_bps_;
     cfg.rcParams.maxBitRate = max_bitrate_bps_;
     cfg.rcParams.vbvBufferSize = target_bitrate_bps_;
+    // Wie im NV12-Pfad (CreateEncoder): VBV-Startfuellung, keine B-Frames,
+    // AQ an. Ohne AQ zeigte der Zero-Copy-Pfad bei Bewegung deutlich mehr
+    // Kloetzchen als die Kamera ueber denselben Encoder.
+    cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
+    cfg.rcParams.disableBadapt = 1;
+    cfg.rcParams.enableAQ = 1;
+    cfg.rcParams.aqStrength = 8;
     cfg.encodeCodecConfig.h264Config.chromaFormatIDC = 1;
     cfg.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
     cfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
-    enc->CreateEncoder(&ip);
+    try {
+      enc->CreateEncoder(&ip);
+    } catch (const NVENCException& e) {
+      // Rueckfall (Leitprinzip: lieber ohne AQ als schwarz): einmal ohne die
+      // neuen Ratenoptionen versuchen.
+      NvProbeLog("EnsureNativeEncoder: mit AQ abgelehnt (%s) -> ohne AQ", e.what());
+      cfg.rcParams.enableAQ = 0;
+      cfg.rcParams.aqStrength = 0;
+      enc->CreateEncoder(&ip);
+    }
     nv_encoder_native_ = std::move(enc);
-    NvProbeLog("EnsureNativeEncoder: NVENC(ARGB) auf Frame-Device ok %ux%u",
-               width_, height_);
+    NvProbeLog("EnsureNativeEncoder: NVENC(ARGB) auf Frame-Device ok %ux%u "
+               "fps=%u avgBR=%u maxBR=%u aq=1/8",
+               width_, height_, (unsigned)ip.frameRateNum,
+               (unsigned)cfg.rcParams.averageBitRate,
+               (unsigned)cfg.rcParams.maxBitRate);
     return true;
   } catch (const NVENCException& e) {
     NvProbeLog("EnsureNativeEncoder THREW: %s", e.what());
@@ -474,14 +503,28 @@ int32_t NvCodecVideoEncoderImpl::Encode(
   NvEncoder* active_enc = nv_encoder_.get();
 #endif
 
-  if (!is_native && reconfigure_needed_) {
+  // ★ HoneyCord (16.10.2026): Vorher nur `!is_native` — neue Zielraten von
+  // WebRTC (SetRates) erreichten den Zero-Copy-Encoder der Bildschirm-
+  // freigabe NIE; er blieb fuer immer bei der Rate seines ersten Bildes,
+  // auch bei 6 Mbit/s verfuegbarer Bandbreite. Jetzt der AKTIVE Encoder.
+  // frameFieldMode ist im nativen Encoder fest gesetzt (EnsureNativeEncoder),
+  // der fruehere err-8-Fallstrick greift dort also nicht.
+  if (reconfigure_needed_ && active_enc != nullptr &&
+      bitrate_adjuster_.GetAdjustedBitrateBps() == 0) {
+    // Pausiert (dynacast, Bitrate 0): nicht umstellen — der Treiber lehnt
+    // avg=0 ab und das Protokoll fuellte sich mit Fehlerzeilen.
+    reconfigure_needed_ = false;
+  }
+  if (reconfigure_needed_ && active_enc != nullptr) {
     NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {
         NV_ENC_RECONFIGURE_PARAMS_VER};
     NV_ENC_CONFIG encode_config = {NV_ENC_CONFIG_VER};
     reconfigure_params.reInitEncodeParams.encodeConfig = &encode_config;
-    nv_encoder_->GetInitializeParams(&reconfigure_params.reInitEncodeParams);
+    active_enc->GetInitializeParams(&reconfigure_params.reInitEncodeParams);
 
-    reconfigure_params.reInitEncodeParams.frameRateNum = framerate_;
+    if (framerate_ >= 1) {
+      reconfigure_params.reInitEncodeParams.frameRateNum = framerate_;
+    }
 
     encode_config.rcParams.averageBitRate =
         bitrate_adjuster_.GetAdjustedBitrateBps();
@@ -500,7 +543,12 @@ int32_t NvCodecVideoEncoderImpl::Encode(
     // encode — the encoder is still valid at its current config.
     reconfigure_needed_ = false;
     try {
-      nv_encoder_->Reconfigure(&reconfigure_params);
+      active_enc->Reconfigure(&reconfigure_params);
+      if (rates_protokollieren_) NvProbeLog("Reconfigure OK enc=%s avg=%u max=%u fps=%u",
+                 is_native ? "native" : "nv12",
+                 (unsigned)encode_config.rcParams.averageBitRate,
+                 (unsigned)encode_config.rcParams.maxBitRate,
+                 (unsigned)reconfigure_params.reInitEncodeParams.frameRateNum);
     } catch (const NVENCException& e) {
       RTC_LOG(LS_ERROR) << __FUNCTION__
                         << " Reconfigure failed (non-fatal): " << e.what();
@@ -806,6 +854,17 @@ void NvCodecVideoEncoderImpl::SetRates(
                    << " target_bitrate_bps_:" << target_bitrate_bps_
                    << " new_bitrate:" << new_bitrate
                    << " max_bitrate_bps_:" << max_bitrate_bps_;
+  // ★ HoneyCord: Zielrate sichtbar machen (bisher nur RTC_LOG, in keinem
+  // Buendel). Nur bei spuerbarer Aenderung (>5 % oder neue Bildrate).
+  if (new_framerate != framerate_ ||
+      new_bitrate > target_bitrate_bps_ + target_bitrate_bps_ / 20 ||
+      new_bitrate + new_bitrate / 20 < target_bitrate_bps_) {
+    NvProbeLog("SetRates: fps=%u target=%u max=%u", new_framerate,
+               new_bitrate, (unsigned)max_bitrate_bps_);
+    rates_protokollieren_ = true;
+  } else {
+    rates_protokollieren_ = false;
+  }
   framerate_ = new_framerate;
   target_bitrate_bps_ = new_bitrate;
   bitrate_adjuster_.SetTargetBitrateBps(target_bitrate_bps_);
