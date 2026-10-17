@@ -156,6 +156,11 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   // Neu aufsetzen bei Ratenwechsel kostet ein Keyframe — deshalb nur bei
   // echten Sprüngen und nicht öfter als alle paar Sekunden.
   int64_t letztes_aufsetzen_ms_ = 0;
+  // ★ 17.10.2026: Anlaufphase nach InitEncode — aufwärts schneller neu aufsetzen.
+  static constexpr int64_t kAnlaufMs = 8000;
+  int64_t anlauf_bis_ms_ = 0;
+  // Intel-iHD erkannt (Qualitätsstufe 1).
+  bool intel_ = false;
   // ★★ 09.10.2026 (Haltoan, „720p mit 0,1 Mbit", hwenc.log Bündel 85): Ein
   // Sprung, der in die Sperrzeit fiel, wurde VERWORFEN. Fragt WebRTC danach
   // nicht mehr nach (Rate konstant: kein weiteres SetRates), blieb der

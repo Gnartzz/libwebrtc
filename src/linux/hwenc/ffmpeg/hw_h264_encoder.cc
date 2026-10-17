@@ -13,6 +13,9 @@
 
 #include "api/video/i420_buffer.h"
 #include "api/video_codecs/h264_profile_level_id.h"
+
+#include <dlfcn.h>
+#include <cstdlib>
 #include "media/base/media_constants.h"
 #include "modules/video_coding/codecs/h264/include/h264_globals.h"
 #include "modules/video_coding/include/video_codec_interface.h"
@@ -125,6 +128,66 @@ std::string GpuBeschreibung() {
             " (" + treiber + ")";
   }
   return text.empty() ? "keine Angabe" : text;
+}
+
+// ★ 17.10.2026 (Haltoan, UHD 620): Derselbe Bildweg kostet bei ihm ~15 ms je
+// Bild, auf einer UHD 630 im Messstand 1,7 ms — gleiche Grafik-Generation,
+// gleicher iHD-Treiber aus der Flatpak-Erweiterung (gemessen, auch mit den
+// Flatpak-Bibliotheken). Schon das reine Umformen auf der CPU ist bei ihm
+// viermal langsamer. Also mitschreiben, wie schnell CPU und GPU gerade
+// laufen, ob das Netzteil steckt und wie ausgelastet das System ist.
+std::string SystemLage() {
+  // CPU: Mittel der aktuellen Taktraten aller Kerne (sysfs, auch im Flatpak lesbar).
+  long summe_khz = 0;
+  int kerne = 0;
+  for (int i = 0; i < 64; ++i) {
+    const std::string z = SysfsZeile("/sys/devices/system/cpu/cpu" + std::to_string(i) +
+                                     "/cpufreq/scaling_cur_freq");
+    if (z == "?") break;
+    summe_khz += std::atol(z.c_str());
+    ++kerne;
+  }
+  const std::string regler = SysfsZeile("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+  const std::string epp =
+      SysfsZeile("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference");
+  // GPU (i915: gt_act_freq_mhz / gt_max_freq_mhz; andere Treiber: „?").
+  std::string gpu = "?";
+  for (const char* karte : {"card0", "card1", "card2"}) {
+    const std::string basis = std::string("/sys/class/drm/") + karte + "/";
+    const std::string akt = SysfsZeile(basis + "gt_act_freq_mhz");
+    if (akt == "?") continue;
+    gpu = akt + "/" + SysfsZeile(basis + "gt_max_freq_mhz") + " MHz";
+    break;
+  }
+  // Netzteil: irgendeine Stromquelle vom Typ „Mains" mit online=1.
+  std::string netz = "?";
+  for (const char* q : {"AC", "AC0", "ACAD", "ADP0", "ADP1", "AC1"}) {
+    const std::string z = SysfsZeile(std::string("/sys/class/power_supply/") + q + "/online");
+    if (z == "?") continue;
+    netz = z == "1" ? "ja" : "nein (Akku)";
+    break;
+  }
+  const std::string last = SysfsZeile("/proc/loadavg");
+  char text[256];
+  std::snprintf(text, sizeof(text), "CPU %ld MHz (%d Kerne, %s/%s) · GPU %s · Netzteil %s · Last %s",
+                kerne ? summe_khz / kerne / 1000 : 0, kerne, regler.c_str(), epp.c_str(),
+                gpu.c_str(), netz.c_str(), last.substr(0, 14).c_str());
+  return text;
+}
+
+// Welcher VA-Treiber wirklich geladen ist (iHD/i965/radeonsi samt Version).
+// libva ist zu diesem Zeitpunkt schon durch libavutil geladen; die Anzeige
+// steckt im ersten Feld von AVVAAPIDeviceContext (`VADisplay display`).
+std::string VaTreiber(AVBufferRef* geraet) {
+  if (!geraet) return "?";
+  using Fn = const char* (*)(void*);
+  auto fn = reinterpret_cast<Fn>(::dlsym(RTLD_DEFAULT, "vaQueryVendorString"));
+  if (!fn) return "? (vaQueryVendorString fehlt)";
+  auto* hw = reinterpret_cast<AVHWDeviceContext*>(geraet->data);
+  if (!hw || !hw->hwctx) return "?";
+  void* anzeige = *reinterpret_cast<void**>(hw->hwctx);
+  const char* t = anzeige ? fn(anzeige) : nullptr;
+  return t ? t : "?";
 }
 
 // ★ WebRTC liefert I420, die Hardware will NV12. Die Wandlung kostet einen
@@ -284,6 +347,8 @@ int HwH264Encoder::InitEncode(
   bildschirm_ = codec_settings->mode == webrtc::VideoCodecMode::kScreensharing;
   bitrate_adjuster_.SetTargetBitrateBps(target_bitrate_bps_);
   frame_index_ = 0;
+  // ★ 17.10.2026: Anlaufphase (s. SetRates).
+  anlauf_bis_ms_ = webrtc::TimeMillis() + kAnlaufMs;
 
   return CodecOeffnen();
 }
@@ -308,6 +373,17 @@ int32_t HwH264Encoder::CodecOeffnen() {
       RTC_LOG(LS_ERROR) << "[hwenc] VA-API-Gerät: " << ffmpeg::FehlerText(r);
       CodecSchliessen();
       return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    {
+      // Einmal je Prozess fragen und nennen. Statische Initialisierung ist
+      // threadsicher — Kamera- und Bildschirm-Encoder öffnen nebeneinander.
+      static const std::string treiber = [this] {
+        std::string t = VaTreiber(hw_device_);
+        Protokoll("VA-Treiber: %s", t.c_str());
+        Protokoll("System: %s", SystemLage().c_str());
+        return t;
+      }();
+      intel_ = treiber.find("Intel") != std::string::npos;
     }
 
     // Bildspeicher der Hardware — der Encoder nimmt nur Bilder an, die aus
@@ -387,6 +463,11 @@ int32_t HwH264Encoder::CodecOeffnen() {
   ctx_->rc_initial_buffer_occupancy = ctx_->rc_buffer_size * 3 / 4;
   if (!nvenc) {
     api.av_opt_set(ctx_->priv_data, "rc_mode", "CBR", 0);
+    // ★ 17.10.2026, gemessen auf einer UHD 630 (iHD 25.2.3, 720p, 1 Mbit/s):
+    // Qualitätsstufe 1 statt der Treibervorgabe 4 hebt SSIM 0,939 → 0,942 bei
+    // gleichem Tempo. NUR Intel — was radeonsi aus der Stufe macht, ist
+    // ungemessen, und dort läuft es gut.
+    if (intel_) api.av_opt_set(ctx_->priv_data, "quality", "1", 0);
   }
   // ★ KEINE periodischen Keyframes. WebRTC fordert sie an, wenn ein Empfänger
   // eines braucht; von selbst gesendete kosten nur Bandbreite. `gop_size`
@@ -683,12 +764,13 @@ int32_t HwH264Encoder::Encode(
   if (jetzt_ms - zeit_start_ms_ >= 5000 && zeit_bilder_ > 0) {
     const double n = zeit_bilder_;
     Protokoll("Zeiten je Bild (%d Bilder, %dx%d, %s): I420 %.1f ms · NV12 %.1f ms · "
-              "hochladen %.1f ms · kodieren+abholen %.1f ms",
+              "hochladen %.1f ms · kodieren+abholen %.1f ms · %s",
               zeit_bilder_, width_, height_,
               frame.video_frame_buffer()->type() == webrtc::VideoFrameBuffer::Type::kI420
                   ? "kam als I420" : "musste gewandelt werden",
               zeit_i420_us_ / n / 1000.0, zeit_nv12_us_ / n / 1000.0,
-              zeit_hoch_us_ / n / 1000.0, zeit_kod_us_ / n / 1000.0);
+              zeit_hoch_us_ / n / 1000.0, zeit_kod_us_ / n / 1000.0,
+              SystemLage().c_str());
     zeit_i420_us_ = zeit_nv12_us_ = zeit_hoch_us_ = zeit_kod_us_ = 0;
     zeit_bilder_ = 0;
     zeit_start_ms_ = jetzt_ms;
@@ -856,7 +938,13 @@ void HwH264Encoder::SetRates(
   // VA-API: wirklich neu aufsetzen. Das kostet ein Keyframe, deshalb nur bei
   // echten Sprüngen (s. oben: hoch ab 1,5×, runter ab 2×, Bildrate ab 1,5×)
   // UND höchstens alle zehn Sekunden. Kleine Wellen fängt der Ausgleicher ab.
-  const int64_t sperrzeit_ms = bildrate_hoch ? 3000 : 10000;
+  // ★ 17.10.2026 (Haltoan, hwenc.log 16.10.): Jede Freigabe öffnete mit
+  // 290 kbit/s und blieb dort zehn Sekunden (20:38:23 → 20:38:33 → 1900) —
+  // zehn Sekunden Matsch bei jedem Start. In der Anlaufphase darf es deshalb
+  // alle zwei Sekunden HOCH gehen; ein Vollbild kostet bei diesen Raten wenig.
+  // Abwärts bleibt es bei zehn Sekunden (der Kreis vom 21.09.).
+  const bool im_anlauf = hoch && !runter && jetzt < anlauf_bis_ms_;
+  const int64_t sperrzeit_ms = im_anlauf ? 2000 : bildrate_hoch ? 3000 : 10000;
   if (!sprung) {
     // Die Lage hat sich beruhigt: ein gemerkter Sprung gilt nicht mehr.
     aufsetzen_ausstehend_ = false;
