@@ -15,7 +15,6 @@
 #include "api/video_codecs/h264_profile_level_id.h"
 
 #include <dlfcn.h>
-#include <cstdlib>
 #include "media/base/media_constants.h"
 #include "modules/video_coding/codecs/h264/include/h264_globals.h"
 #include "modules/video_coding/include/video_codec_interface.h"
@@ -140,7 +139,10 @@ std::string SystemLage() {
   // CPU: Mittel der aktuellen Taktraten aller Kerne (sysfs, auch im Flatpak lesbar).
   long summe_khz = 0;
   int kerne = 0;
-  for (int i = 0; i < 64; ++i) {
+  // ★ Höchstens vier Kerne (Prüfbefund M2): Auf Kerneln vor 5.18 kann das
+  // Lesen von scaling_cur_freq je Kern ~10 ms schlafen — und das hier läuft
+  // alle fünf Sekunden auf dem Encode-Faden.
+  for (int i = 0; i < 4; ++i) {
     const std::string z = SysfsZeile("/sys/devices/system/cpu/cpu" + std::to_string(i) +
                                      "/cpufreq/scaling_cur_freq");
     if (z == "?") break;
@@ -181,7 +183,14 @@ std::string SystemLage() {
 std::string VaTreiber(AVBufferRef* geraet) {
   if (!geraet) return "?";
   using Fn = const char* (*)(void*);
-  auto fn = reinterpret_cast<Fn>(::dlsym(RTLD_DEFAULT, "vaQueryVendorString"));
+  // ★ NICHT RTLD_DEFAULT: FFmpeg wird mit RTLD_LOCAL geladen (ffmpeg_lader.cc),
+  // damit landet auch libva nicht im globalen Namensraum — gemessen 17.10.:
+  // RTLD_DEFAULT liefert nil. RTLD_NOLOAD gibt den Griff auf die schon
+  // geladene libva, ohne etwas nachzuladen.
+  void* va = ::dlopen("libva.so.2", RTLD_NOW | RTLD_NOLOAD);
+  if (!va) return "? (libva nicht geladen)";
+  auto fn = reinterpret_cast<Fn>(::dlsym(va, "vaQueryVendorString"));
+  ::dlclose(va);  // nur der Referenzzähler; libavutil hält sie weiter
   if (!fn) return "? (vaQueryVendorString fehlt)";
   auto* hw = reinterpret_cast<AVHWDeviceContext*>(geraet->data);
   if (!hw || !hw->hwctx) return "?";
@@ -383,7 +392,8 @@ int32_t HwH264Encoder::CodecOeffnen() {
         Protokoll("System: %s", SystemLage().c_str());
         return t;
       }();
-      intel_ = treiber.find("Intel") != std::string::npos;
+      // Nur iHD ist gemessen; i965 meldet sich ebenfalls als „Intel".
+      intel_ = treiber.find("iHD") != std::string::npos;
     }
 
     // Bildspeicher der Hardware — der Encoder nimmt nur Bilder an, die aus
