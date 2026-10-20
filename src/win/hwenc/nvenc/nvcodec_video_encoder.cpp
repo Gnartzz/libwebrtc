@@ -9,6 +9,7 @@
 
 #include "nvcodec_video_encoder.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -169,6 +170,15 @@ struct NvEncOutputFrame {
 using Microsoft::WRL::ComPtr;
 #endif
 
+#ifdef _WIN32
+// ★ HoneyCord #144 (okunoku 17.10.2026, Buendel 98): offene NVENC-Sitzungen
+// dieses Prozesses (Kamera + jede Bildschirmfreigabe). Consumer-Karten
+// erlauben nur wenige gleichzeitig; ist das Kontingent voll, kommt Fehler 21
+// und WebRTC faellt auf VP8 in Software zurueck ("Drossel CPU"). Der Zaehler
+// steht in jeder Oeffnen-/Schliessen-Zeile in nvenc-probe.log.
+static std::atomic<int> g_nvenc_offen{0};
+#endif
+
 class NvCodecVideoEncoderImpl : public NvCodecVideoEncoder {
  public:
   NvCodecVideoEncoderImpl(std::shared_ptr<CudaContext> cuda_context,
@@ -238,6 +248,24 @@ class NvCodecVideoEncoderImpl : public NvCodecVideoEncoder {
   Microsoft::WRL::ComPtr<ID3D11Device> native_device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> native_context_;
   bool EnsureNativeEncoder(ID3D11Device* device);
+  // ★ #144: Sitzungen gezielt oeffnen/schliessen (Zaehler + Protokoll).
+  bool EnsureNv12Encoder();
+  void Nv12Schliessen(const char* grund);
+  void NativeSchliessen(const char* grund);
+  // InitEncode erfolgreich — ersetzt die fruehere Pruefung `nv_encoder_`,
+  // weil der NV12-Encoder im Zero-Copy-Betrieb jetzt geschlossen sein darf.
+  bool initialisiert_ = false;
+  // Nach einem gescheiterten Oeffnen des Zero-Copy-Encoders nicht bei JEDEM
+  // Bild neu versuchen (Buendel 98: 587 Versuche in 10 s), sondern hoechstens
+  // alle 2 s; dazwischen kodiert der NV12-Encoder ueber den Readback.
+  uint64_t native_naechster_versuch_ms_ = 0;
+  // Erst nach so vielen Zero-Copy-Bildern in Folge den NV12-Encoder schliessen
+  // (kein Hin und Her, falls Quellen kurz CPU-Bilder liefern).
+  int native_folge_ = 0;
+  // Zuletzt kodierender Encoder. Wechselt er mitten im Strom (Rueckfall,
+  // Wiederoeffnen, CPU-Bild), muss ein IDR kommen — die GOP ist unendlich, der
+  // Empfaenger saehe sonst P-Bilder einer fremden Referenzkette (Befund M1).
+  NvEncoder* letzter_enc_ = nullptr;
 #endif
 #ifdef __linux__
   std::unique_ptr<NvCodecVideoEncoderCuda> cuda_;
@@ -313,7 +341,14 @@ NvCodecVideoEncoderImpl::NvCodecVideoEncoderImpl(
 #endif
 }
 
-NvCodecVideoEncoderImpl::~NvCodecVideoEncoderImpl() {}
+NvCodecVideoEncoderImpl::~NvCodecVideoEncoderImpl() {
+  // ★ #144: ueber ReleaseNvEnc schliessen, damit der Sitzungszaehler stimmt
+  // (vorher raeumten nur die unique_ptr-Destruktoren still ab).
+  try {
+    ReleaseNvEnc();
+  } catch (...) {
+  }
+}
 
 int32_t NvCodecVideoEncoderImpl::InitEncode(
     const webrtc::VideoCodec* codec_settings,
@@ -379,7 +414,10 @@ int32_t NvCodecVideoEncoderImpl::Release() {
 // CopyResource ohne CPU (Spike: 0,64 ms/Frame). Neu erzeugen, wenn Device wechselt.
 bool NvCodecVideoEncoderImpl::EnsureNativeEncoder(ID3D11Device* device) {
   if (nv_encoder_native_ && native_device_.Get() == device) return true;
-  nv_encoder_native_.reset();
+  if (nv_encoder_native_) NativeSchliessen("Device-Wechsel");
+  const uint64_t jetzt_ms = GetTickCount64();
+  if (native_naechster_versuch_ms_ != 0 && jetzt_ms < native_naechster_versuch_ms_)
+    return false;
   native_device_ = device;
   device->GetImmediateContext(native_context_.ReleaseAndGetAddressOf());
   try {
@@ -404,9 +442,12 @@ bool NvCodecVideoEncoderImpl::EnsureNativeEncoder(ID3D11Device* device) {
     cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
     cfg.frameIntervalP = 1;
     cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
-    cfg.rcParams.averageBitRate = target_bitrate_bps_;
-    cfg.rcParams.maxBitRate = max_bitrate_bps_;
-    cfg.rcParams.vbvBufferSize = target_bitrate_bps_;
+    // In einer dynacast-Pause (Rate 0) nicht mit avg=0 oeffnen (Befund N1);
+    // das naechste SetRates regelt ohnehin nach.
+    const uint32_t start_br = target_bitrate_bps_ ? target_bitrate_bps_ : 1000000;
+    cfg.rcParams.averageBitRate = start_br;
+    cfg.rcParams.maxBitRate = max_bitrate_bps_ > start_br ? max_bitrate_bps_ : start_br;
+    cfg.rcParams.vbvBufferSize = start_br;
     // Wie im NV12-Pfad (CreateEncoder): VBV-Startfuellung, keine B-Frames,
     // AQ an. Ohne AQ zeigte der Zero-Copy-Pfad bei Bewegung deutlich mehr
     // Kloetzchen als die Kamera ueber denselben Encoder.
@@ -428,14 +469,19 @@ bool NvCodecVideoEncoderImpl::EnsureNativeEncoder(ID3D11Device* device) {
       enc->CreateEncoder(&ip);
     }
     nv_encoder_native_ = std::move(enc);
+    native_naechster_versuch_ms_ = 0;
+    const int offen = ++g_nvenc_offen;
     NvProbeLog("EnsureNativeEncoder: NVENC(ARGB) auf Frame-Device ok %ux%u "
                "fps=%u avgBR=%u maxBR=%u aq=1/8",
                width_, height_, (unsigned)ip.frameRateNum,
                (unsigned)cfg.rcParams.averageBitRate,
                (unsigned)cfg.rcParams.maxBitRate);
+    NvProbeLog("NVENC offen kind=argb this=%p offen=%d", (void*)this, offen);
     return true;
   } catch (const NVENCException& e) {
-    NvProbeLog("EnsureNativeEncoder THREW: %s", e.what());
+    native_naechster_versuch_ms_ = jetzt_ms + 2000;
+    NvProbeLog("EnsureNativeEncoder THREW: %s (offen=%d, naechster Versuch in 2 s, "
+               "bis dahin NV12 ueber Readback)", e.what(), g_nvenc_offen.load());
     return false;
   }
 }
@@ -454,8 +500,12 @@ int32_t NvCodecVideoEncoderImpl::Encode(
                (int)frame.video_frame_buffer()->type(),
                frame_types ? "yes" : "null");
   }
+#ifdef _WIN32
+  if (!initialisiert_) {
+#else
   if (!nv_encoder_) {
-    NvProbeLog("Encode: nv_encoder is NULL -> UNINITIALIZED");
+#endif
+    NvProbeLog("Encode: nicht initialisiert -> UNINITIALIZED");
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
   }
   if (!callback_) {
@@ -488,15 +538,40 @@ int32_t NvCodecVideoEncoderImpl::Encode(
 #ifdef _WIN32
   // Zero-Copy: kNative-Frame (D3D11-Textur vom Capturer) -> eigener NVENC-
   // Encoder auf dem Frame-Device. Sonst der normale CPU-I420-Pfad.
-  const bool is_native = frame.video_frame_buffer()->type() ==
-                         webrtc::VideoFrameBuffer::Type::kNative;
+  bool is_native = frame.video_frame_buffer()->type() ==
+                   webrtc::VideoFrameBuffer::Type::kNative;
   honeycord::D3D11FrameBuffer* nb = nullptr;
-  NvEncoder* active_enc = nv_encoder_.get();
+  NvEncoder* active_enc = nullptr;
   if (is_native) {
     nb = static_cast<honeycord::D3D11FrameBuffer*>(
         frame.video_frame_buffer().get());
-    if (!EnsureNativeEncoder(nb->device())) return WEBRTC_VIDEO_CODEC_ERROR;
-    active_enc = nv_encoder_native_.get();
+    if (EnsureNativeEncoder(nb->device())) {
+      active_enc = nv_encoder_native_.get();
+      // ★ #144: EINE Sitzung je Freigabe — der NV12-Encoder aus InitEncode
+      // liegt im Zero-Copy-Betrieb brach und belegt nur Kontingent.
+      if (nv_encoder_ && ++native_folge_ >= 120) Nv12Schliessen("Zero-Copy aktiv");
+    } else {
+      // ★ #144: Rueckfall auf Readback + NV12-Hardware-Encoder (die Textur
+      // wird per ToI420 auf die CPU geholt) statt WEBRTC_VIDEO_CODEC_ERROR —
+      // so bleibt es bei NVENC und kippt nicht nach VP8 in Software.
+      native_folge_ = 0;
+      // Befund M2: Der Readback schreibt in eine width_ x height_ grosse
+      // Staging-Textur — bei abweichender Capturer-Groesse nicht kodieren.
+      if (nb->width() != (int)width_ || nb->height() != (int)height_) {
+        static int s_groesse = 0;
+        if ((s_groesse++ % 60) == 0)
+          NvProbeLog("Encode: Readback-Rueckfall Groesse %dx%d != %ux%u -> ERROR",
+                     nb->width(), nb->height(), width_, height_);
+        return WEBRTC_VIDEO_CODEC_ERROR;
+      }
+      if (!EnsureNv12Encoder()) return WEBRTC_VIDEO_CODEC_ERROR;
+      is_native = false;
+      active_enc = nv_encoder_.get();
+    }
+  } else {
+    native_folge_ = 0;
+    if (!EnsureNv12Encoder()) return WEBRTC_VIDEO_CODEC_ERROR;
+    active_enc = nv_encoder_.get();
   }
 #else
   const bool is_native = false;
@@ -587,6 +662,14 @@ int32_t NvCodecVideoEncoderImpl::Encode(
     NvProbeLog("Encode path: frame_types=null");
   }
 
+#ifdef _WIN32
+  if (active_enc != letzter_enc_) {
+    NvProbeLog("Encode: Encoderwechsel (%s) -> IDR erzwungen",
+               is_native ? "argb" : "nv12");
+    send_key_frame = true;
+    letzter_enc_ = active_enc;
+  }
+#endif
   NV_ENC_PIC_PARAMS pic_params = {NV_ENC_PIC_PARAMS_VER};
   pic_params.encodePicFlags = 0;
   if (send_key_frame) {
@@ -652,6 +735,12 @@ int32_t NvCodecVideoEncoderImpl::Encode(
   } else {
     webrtc::scoped_refptr<const webrtc::I420BufferInterface> frame_buffer =
         frame.video_frame_buffer()->ToI420();
+    if (!frame_buffer) {
+      // D3D11FrameBuffer::ToI420 liefert nullptr, wenn Staging/Map scheitern.
+      id3d11_context_->Unmap(id3d11_texture_.Get(), D3D11CalcSubresource(0, 0, 1));
+      NvProbeLog("Encode: ToI420 lieferte nullptr -> ERROR");
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
     libyuv::I420ToNV12(
         frame_buffer->DataY(), frame_buffer->StrideY(), frame_buffer->DataU(),
         frame_buffer->StrideU(), frame_buffer->DataV(), frame_buffer->StrideV(),
@@ -832,7 +921,13 @@ int32_t NvCodecVideoEncoderImpl::Encode(
 
 void NvCodecVideoEncoderImpl::SetRates(
     const webrtc::VideoEncoder::RateControlParameters& parameters) {
+  // ★ #144 (Pruefbefund S1): im Zero-Copy-Betrieb ist der NV12-Encoder
+  // absichtlich geschlossen — die Raten muessen trotzdem ankommen.
+#ifdef _WIN32
+  if (!initialisiert_) {
+#else
   if (!nv_encoder_) {
+#endif
     RTC_LOG(LS_WARNING) << "SetRates() while uninitialized.";
     return;
   }
@@ -898,9 +993,10 @@ int32_t NvCodecVideoEncoderImpl::InitNvEnc() {
     NvProbeLog("InitNvEnc: id3d11_device_ is null, aborting");
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
-  nv_encoder_ = CreateEncoder(
-      codec_, width_, height_, framerate_, target_bitrate_bps_,
-      max_bitrate_bps_, id3d11_device_.Get(), id3d11_texture_.GetAddressOf());
+  if (!EnsureNv12Encoder()) return WEBRTC_VIDEO_CODEC_ERROR;
+  initialisiert_ = true;
+  native_folge_ = 0;
+  native_naechster_versuch_ms_ = 0;
 #endif
 #ifdef __linux__
   nv_encoder_ =
@@ -917,7 +1013,71 @@ int32_t NvCodecVideoEncoderImpl::InitNvEnc() {
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
+#ifdef _WIN32
+bool NvCodecVideoEncoderImpl::EnsureNv12Encoder() {
+  if (nv_encoder_) return true;
+  if (!id3d11_device_) return false;
+  nv_encoder_ = CreateEncoder(
+      codec_, width_, height_, framerate_, target_bitrate_bps_,
+      max_bitrate_bps_, id3d11_device_.Get(), id3d11_texture_.GetAddressOf());
+  if (!nv_encoder_) {
+    id3d11_texture_.Reset();
+    NvProbeLog("NVENC Oeffnen fehlgeschlagen kind=nv12 this=%p offen=%d",
+               (void*)this, g_nvenc_offen.load());
+    return false;
+  }
+  const int offen = ++g_nvenc_offen;
+  NvProbeLog("NVENC offen kind=nv12 this=%p offen=%d", (void*)this, offen);
+  return true;
+}
+
+void NvCodecVideoEncoderImpl::Nv12Schliessen(const char* grund) {
+  if (!nv_encoder_) return;
+  if (letzter_enc_ == nv_encoder_.get()) letzter_enc_ = nullptr;
+  try {
+    std::vector<std::vector<uint8_t>> drain;
+    nv_encoder_->EndEncode(drain);
+    nv_encoder_->DestroyEncoder();
+  } catch (const NVENCException& e) {
+    RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
+  }
+  nv_encoder_ = nullptr;
+  id3d11_texture_.Reset();
+  const int offen = --g_nvenc_offen;
+  NvProbeLog("NVENC zu kind=nv12 this=%p grund=%s offen=%d", (void*)this, grund, offen);
+}
+
+void NvCodecVideoEncoderImpl::NativeSchliessen(const char* grund) {
+  if (nv_encoder_native_) {
+    if (letzter_enc_ == nv_encoder_native_.get()) letzter_enc_ = nullptr;
+    try {
+      std::vector<std::vector<uint8_t>> drain;
+      nv_encoder_native_->EndEncode(drain);
+      nv_encoder_native_->DestroyEncoder();
+    } catch (const NVENCException& e) {
+      RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
+    }
+    nv_encoder_native_.reset();
+    const int offen = --g_nvenc_offen;
+    NvProbeLog("NVENC zu kind=argb this=%p grund=%s offen=%d", (void*)this, grund, offen);
+  }
+  native_context_.Reset();
+  native_device_.Reset();
+}
+#endif
+
 int32_t NvCodecVideoEncoderImpl::ReleaseNvEnc() {
+#ifdef _WIN32
+  // ★ #144: BEIDE Sitzungen schliessen. Vorher blieb der Zero-Copy-Encoder
+  // (ARGB) bis zum Destruktor offen — WebRTC ruft Release() oft, ohne das
+  // Objekt gleich zu zerstoeren, und die Sitzung blockierte das Kontingent.
+  Nv12Schliessen("Release");
+  NativeSchliessen("Release");
+  initialisiert_ = false;
+  native_folge_ = 0;
+  native_naechster_versuch_ms_ = 0;
+  return WEBRTC_VIDEO_CODEC_OK;
+#else
   if (nv_encoder_) {
     try {
       std::vector<std::vector<uint8_t>> drain;
@@ -927,11 +1087,9 @@ int32_t NvCodecVideoEncoderImpl::ReleaseNvEnc() {
       RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
     }
     nv_encoder_ = nullptr;
-#ifdef _WIN32
-    id3d11_texture_.Reset();
-#endif
   }
   return WEBRTC_VIDEO_CODEC_OK;
+#endif
 }
 
 std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
