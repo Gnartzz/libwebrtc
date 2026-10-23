@@ -84,14 +84,26 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   int32_t CodecOeffnen();
   // VA-API mit neuer Rate/Bildrate öffnen (unter `mutex_`). `wie` erscheint
   // im hwenc.log („" oder „nachgeholt ").
+  // `unterschuss_gesendet` > 0: Auslöser ist der Unterschuss-Ausgleich
+  // (hwenc.11), der Wert ist die gemessene Ausgaberate fürs Protokoll.
   void VaapiNeuAufsetzen(uint32_t neu, uint32_t gefordert, bool hoch, bool runter,
                          bool bildrate, bool folge, uint32_t fz, int64_t jetzt,
-                         const char* wie);
+                         const char* wie, uint32_t unterschuss_gesendet);
   // ★★ 23.10.2026 (hwenc.10): wertet die zeitbasierten Folgen aus — aus
   // `SetRates` UND aus `Encode` (unter `mutex_`, nur VA-API). Rechnet nur mit
   // Zahlen, die schon da sind; keine Allokation, kein Treiberaufruf. Schreibt
   // höchstens alle 30 s eine Diagnosezeile.
-  void LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrate);
+  // ★★ hwenc.11: zusätzlich das Ausgabefenster fortschreiben und den
+  // Unterschuss werten (`unterschuss`).
+  void LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrate,
+                     bool* unterschuss);
+  // hwenc.11: Ziel für den Unterschuss-Ausgleich —
+  // min(Forderung, Ziel × Ziel / gesendet), mindestens 1,1× Ziel, nie über
+  // der rohen Forderung. Nur sinnvoll, wenn `LageAuswerten` Unterschuss meldet.
+  uint32_t UnterschussZiel() const;
+  // hwenc.11: Ausgabefenster leeren (nach jedem Öffnen — die alten Bytes
+  // gehören zu einem anderen Ziel).
+  void AusgabeFensterLeeren();
   void CodecSchliessen();
   // Holt jedes fertige Paket ab und reicht es an den Rückruf weiter. Die
   // Zeitangaben kommen aus `stempel_`, NICHT vom gerade übergebenen Bild —
@@ -163,6 +175,24 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   int64_t haengt_gemeldet_ms_ = 0;
   // So lange muss eine Abweichung durchgehend bestehen, bevor sie zählt.
   static constexpr int64_t kFolgeMs = 3000;
+  // ★★ 23.10.2026 (hwenc.11, jimtonics nach dem Netzstillstand 22:51): Was
+  // der Encoder WIRKLICH ausgibt — fünf Sekundenfächer (Bytes und Bilder),
+  // gefüllt in `PaketeAbholen`, fortgeschrieben in `LageAuswerten`. Feste
+  // Felder, keine Allokation. `gesendet_bps_` = 0 heißt „Fenster noch nicht
+  // voll" (nach jedem Öffnen fünf Sekunden).
+  static constexpr int kAusFaecher = 5;
+  static constexpr int64_t kUnterschussMs = 5000;
+  uint64_t aus_bytes_[kAusFaecher] = {};
+  uint32_t aus_bilder_[kAusFaecher] = {};
+  uint64_t aus_bytes_jetzt_ = 0;
+  uint32_t aus_bilder_jetzt_ = 0;
+  int aus_index_ = 0;
+  int aus_volle_ = 0;
+  int64_t aus_beginn_ms_ = 0;
+  uint32_t gesendet_bps_ = 0;
+  uint32_t gesendet_bilder_5s_ = 0;
+  // Seit wann die Unterschuss-Lage durchgehend besteht (0 = nicht).
+  int64_t unterschuss_seit_ms_ = 0;
   // Zeitmessung je Phase (Mikrosekunden), alle fünf Sekunden ins hwenc.log.
   int64_t zeit_i420_us_ = 0;
   int64_t zeit_nv12_us_ = 0;
@@ -198,8 +228,8 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   bool ausstehend_bildrate_ = false;
   bool ausstehend_folge_ = false;
   // Wahr, wenn der gemerkte Sprung NUR aus den zeitbasierten Folgen stammt
-  // (kein 1,5×-Sprung, kein Abwärts) — dann verfällt er auch in `Encode`,
-  // sobald die Folge abreißt.
+  // (kein 1,5×-Sprung, kein Abwärts; seit hwenc.11 zählt der Unterschuss
+  // dazu) — dann verfällt er auch in `Encode`, sobald die Folge abreißt.
   bool ausstehend_nur_folge_ = false;
   int64_t ausstehend_sperre_ms_ = 10000;
   // Nach einem gescheiterten Öffnen nicht endgültig aufgeben, sondern es

@@ -581,6 +581,8 @@ int32_t HwH264Encoder::CodecOeffnen() {
   misslungene_versuche_ = 0;
   letztes_aufsetzen_ms_ = webrtc::TimeMillis();
   framerate_offen_ = framerate_;
+  // hwenc.11: die bisher gezählten Bytes gehören zum alten Ziel.
+  AusgabeFensterLeeren();
   {
     static bool gpu_genannt = false;
     if (!gpu_genannt) {
@@ -684,9 +686,11 @@ int32_t HwH264Encoder::Encode(
     // paar Ganzzahlvergleiche (s. `LageAuswerten`).
     bool hoch_folge = false;
     bool bildrate = false;
-    LageAuswerten(jetzt, &hoch_folge, &bildrate);
+    bool unterschuss = false;   // hwenc.11, behandelt wie `hoch_folge`
+    LageAuswerten(jetzt, &hoch_folge, &bildrate, &unterschuss);
+    const bool folge_lage = hoch_folge || bildrate || unterschuss;
     bool frisch = false;   // erst in diesem Aufruf gemerkt (fürs Protokoll)
-    if (!aufsetzen_ausstehend_ && (hoch_folge || bildrate)) {
+    if (!aufsetzen_ausstehend_ && folge_lage) {
       frisch = true;
       aufsetzen_ausstehend_ = true;
       ausstehend_gefordert_ = forderung_roh_;
@@ -697,18 +701,19 @@ int32_t HwH264Encoder::Encode(
       ausstehend_folge_ = hoch_folge;
       ausstehend_nur_folge_ = true;
       ausstehend_sperre_ms_ = (bildrate && bildrate_richtung_ > 0) ? 3000
-                              : hoch_folge                         ? 5000
+                              : (hoch_folge || unterschuss)        ? 5000
                                                                    : 10000;
-    } else if (aufsetzen_ausstehend_ && ausstehend_nur_folge_ && !hoch_folge &&
-               !bildrate) {
+    } else if (aufsetzen_ausstehend_ && ausstehend_nur_folge_ && !folge_lage) {
       // Die Folge ist abgerissen: ein nur aus ihr gemerkter Sprung verfällt.
       aufsetzen_ausstehend_ = false;
-    } else if (aufsetzen_ausstehend_ && !ausstehend_runter_ && hoch_folge &&
+    } else if (aufsetzen_ausstehend_ && !ausstehend_runter_ && (hoch_folge || unterschuss) &&
                ausstehend_sperre_ms_ > 5000) {
       // Ein gemerkter 1,5×-Sprung (10 s) ist inzwischen auch eine Folge: dann
       // gilt deren kürzere Sperrzeit, auch wenn kein SetRates mehr kommt.
-      ausstehend_hoch_ = true;
-      ausstehend_folge_ = true;
+      if (hoch_folge) {
+        ausstehend_hoch_ = true;
+        ausstehend_folge_ = true;
+      }
       ausstehend_sperre_ms_ = 5000;
     }
 
@@ -717,10 +722,19 @@ int32_t HwH264Encoder::Encode(
     // selbst um und merkt nie etwas vor.
     if (aufsetzen_ausstehend_ && jetzt - letztes_aufsetzen_ms_ >= ausstehend_sperre_ms_) {
       aufsetzen_ausstehend_ = false;
-      VaapiNeuAufsetzen(bitrate_adjuster_.GetAdjustedBitrateBps(), ausstehend_gefordert_,
-                        ausstehend_hoch_, ausstehend_runter_, ausstehend_bildrate_,
-                        ausstehend_folge_, ausstehend_fz_, jetzt,
-                        frisch ? "" : "nachgeholt ");
+      uint32_t neu = bitrate_adjuster_.GetAdjustedBitrateBps();
+      uint32_t gefordert = ausstehend_gefordert_;
+      uint32_t gesendet = 0;
+      // hwenc.11: Besteht der Unterschuss JETZT (frisch gewertet), gilt sein
+      // Ziel — gerechnet mit der aktuellen Forderung, nicht der gemerkten.
+      if (unterschuss && !ausstehend_runter_) {
+        neu = std::max(neu, UnterschussZiel());
+        gefordert = forderung_roh_;
+        gesendet = gesendet_bps_;
+      }
+      VaapiNeuAufsetzen(neu, gefordert, ausstehend_hoch_, ausstehend_runter_,
+                        ausstehend_bildrate_, ausstehend_folge_, ausstehend_fz_, jetzt,
+                        frisch ? "" : "nachgeholt ", gesendet);
       if (!ctx_) return WEBRTC_VIDEO_CODEC_ERROR;   // Wiederanlauf oben greift
     }
   }
@@ -884,6 +898,9 @@ void HwH264Encoder::PaketeAbholen() {
 
       callback_->OnEncodedImage(encoded_image_, &spezifisch);
       bitrate_adjuster_.Update(static_cast<size_t>(packet_->size));
+      // hwenc.11: Ausgabefenster (zwei Additionen, s. `LageAuswerten`).
+      aus_bytes_jetzt_ += static_cast<uint64_t>(packet_->size);
+      ++aus_bilder_jetzt_;
     }
     api.av_packet_unref(packet_);
   }
@@ -937,7 +954,16 @@ void HwH264Encoder::SetRates(
   // Jedes Neu-Aufsetzen kostet ein Vollbild — das fraß genau die Bandbreite,
   // die die Schätzung zum Wachsen brauchte. Seitdem ABWÄRTS erst bei doppelter
   // Abweichung (auf den ausgeglichenen Wert bezogen, wie bisher).
-  const bool runter = neu < target_bitrate_bps_ && gross > klein * 2;
+  // ★ hwenc.11: … und nur, wenn die ROHE Forderung unter dem Encoder-Ziel
+  // liegt. Ohne diese Bedingung änderte sich nichts (der Ausgleicher geht nie
+  // unter 0,5× der Forderung, also ist neu < Ziel/2 nur mit Forderung < Ziel
+  // möglich) — bis auf eine Rundungslücke: Der Ausgleicher schneidet 0,5×F
+  // ab, bei ungeradem F ist 2 × ⌊F/2⌋ = F − 1 < F. Seit der
+  // Unterschuss-Ausgleich das Ziel bis an die Forderung heben darf (Ziel = F),
+  // hätte ein Vollbild, das den Ausgleicher an seine Untergrenze drückt, ein
+  // sofortiges „runter" ausgelöst.
+  const bool runter = neu < target_bitrate_bps_ && gross > klein * 2 &&
+                      parameters.bitrate.get_sum_bps() < target_bitrate_bps_;
   // ★★ 25.09.2026 (Haltoan, Linux-Stream matschig, hwenc.log): VA-API startete
   // mit 947 kbit/s, WebRTC forderte danach 1689 — das 1,78-Fache, also KEIN
   // doppelter Sprung, und der Encoder blieb für immer auf 947. AUFWÄRTS jetzt
@@ -983,12 +1009,16 @@ void HwH264Encoder::SetRates(
   fz_zuletzt_ = fz;
   bool hoch_folge = false;
   bool bildrate = false;
-  LageAuswerten(jetzt, &hoch_folge, &bildrate);
+  bool unterschuss = false;
+  LageAuswerten(jetzt, &hoch_folge, &bildrate, &unterschuss);
   const bool hoch = hoch_sprung || hoch_folge;
   // Steigt die Bildrate, schießt die Rate über — dann nicht zehn, sondern
   // höchstens drei Sekunden warten.
   const bool bildrate_hoch = bildrate && bildrate_richtung_ > 0;
-  const bool sprung = hoch || runter || bildrate;
+  // hwenc.11: Unterschuss-Ausgleich (s. `LageAuswerten`, Abschnitt 3) zählt
+  // wie die Folge aufwärts — nie zusammen mit „runter".
+  const bool unterschuss_hoch = unterschuss && !runter;
+  const bool sprung = hoch || runter || bildrate || unterschuss_hoch;
 
   // VA-API: wirklich neu aufsetzen. Das kostet ein Keyframe, deshalb nur bei
   // echten Sprüngen (s. oben: hoch ab 1,5× sofort oder ab 1,2× nach 3 s,
@@ -1001,10 +1031,10 @@ void HwH264Encoder::SetRates(
   // alle zwei Sekunden HOCH gehen; ein Vollbild kostet bei diesen Raten wenig.
   // Abwärts bleibt es bei zehn Sekunden (der Kreis vom 21.09.).
   const bool im_anlauf = hoch && !runter && jetzt < anlauf_bis_ms_;
-  const int64_t sperrzeit_ms = im_anlauf                ? 2000
-                               : bildrate_hoch          ? 3000
-                               : hoch_folge && !runter  ? 5000
-                                                        : 10000;
+  const int64_t sperrzeit_ms = im_anlauf                                ? 2000
+                               : bildrate_hoch                          ? 3000
+                               : (hoch_folge || unterschuss) && !runter ? 5000
+                                                                        : 10000;
   if (!sprung) {
     // Die Lage hat sich beruhigt: ein gemerkter Sprung gilt nicht mehr.
     aufsetzen_ausstehend_ = false;
@@ -1024,13 +1054,76 @@ void HwH264Encoder::SetRates(
     return;
   }
   aufsetzen_ausstehend_ = false;
-  VaapiNeuAufsetzen(neu, gefordert, hoch, runter, bildrate, hoch_folge && !hoch_sprung,
-                    fz, jetzt, "");
+  VaapiNeuAufsetzen(unterschuss_hoch ? std::max(neu, UnterschussZiel()) : neu, gefordert,
+                    hoch, runter, bildrate, hoch_folge && !hoch_sprung, fz, jetzt, "",
+                    unterschuss_hoch ? gesendet_bps_ : 0);
 }
 
-void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrate) {
+void HwH264Encoder::AusgabeFensterLeeren() {
+  for (int i = 0; i < kAusFaecher; ++i) {
+    aus_bytes_[i] = 0;
+    aus_bilder_[i] = 0;
+  }
+  aus_bytes_jetzt_ = 0;
+  aus_bilder_jetzt_ = 0;
+  aus_index_ = 0;
+  aus_volle_ = 0;
+  aus_beginn_ms_ = 0;
+  gesendet_bps_ = 0;
+  gesendet_bilder_5s_ = 0;
+  unterschuss_seit_ms_ = 0;
+}
+
+uint32_t HwH264Encoder::UnterschussZiel() const {
+  const uint64_t z = target_bitrate_bps_;
+  const uint64_t f = forderung_roh_;
+  const uint64_t g = gesendet_bps_;
+  // Ziel × (Ziel / gesendet): was der Treiber bei gleichbleibendem
+  // Unterschuss-Faktor bräuchte, um das bisherige Ziel wirklich zu liefern.
+  uint64_t soll = g > 0 ? z * z / g : f;
+  soll = std::min(soll, f);                          // NIE über die Forderung
+  soll = std::max(soll, z * 11 / 10);                // sonst Vollbild für nichts
+  soll = std::min(soll, f);                          // auch die Untergrenze nie über F
+  return static_cast<uint32_t>(soll);
+}
+
+void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrate,
+                                  bool* unterschuss) {
   *hoch_folge = false;
   *bildrate = false;
+  *unterschuss = false;
+
+  // ── 0. GESENDETE RATE (hwenc.11) ──
+  // Fünf Sekundenfächer; das laufende Fach füllt `PaketeAbholen`. Ist eine
+  // Sekunde um, wandert es in den Ring. Erst wenn alle fünf Fächer nach dem
+  // letzten Öffnen voll sind, gibt es eine Zahl — ein halbes Fenster mit dem
+  // Vollbild des Öffnens wäre keine Messung. Stand `Encode` länger als das
+  // Fenster still (Freigabe pausiert), beginnt die Zählung von vorn.
+  if (aus_beginn_ms_ == 0) {
+    aus_beginn_ms_ = jetzt;
+  } else if (jetzt - aus_beginn_ms_ > (kAusFaecher + 1) * 1000LL) {
+    AusgabeFensterLeeren();
+    aus_beginn_ms_ = jetzt;
+  }
+  while (jetzt - aus_beginn_ms_ >= 1000) {
+    aus_bytes_[aus_index_] = aus_bytes_jetzt_;
+    aus_bilder_[aus_index_] = aus_bilder_jetzt_;
+    aus_bytes_jetzt_ = 0;
+    aus_bilder_jetzt_ = 0;
+    aus_index_ = (aus_index_ + 1) % kAusFaecher;
+    if (aus_volle_ < kAusFaecher) ++aus_volle_;
+    aus_beginn_ms_ += 1000;
+    if (aus_volle_ >= kAusFaecher) {
+      uint64_t bytes = 0;
+      uint32_t bilder = 0;
+      for (int i = 0; i < kAusFaecher; ++i) {
+        bytes += aus_bytes_[i];
+        bilder += aus_bilder_[i];
+      }
+      gesendet_bps_ = static_cast<uint32_t>(bytes * 8 / kAusFaecher);
+      gesendet_bilder_5s_ = bilder;
+    }
+  }
 
   // ── 1. AUFWÄRTS IN DER FOLGE ──
   // Die ROHE Forderung (nicht der Ausgleicher, Prüfbefund M1) liegt seit
@@ -1097,7 +1190,51 @@ void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrat
   }
   *bildrate = richtung != 0 && jetzt - bildrate_seit_ms_ >= kFolgeMs;
 
-  // ── 3. DIAGNOSE „Encoder haengt" ──
+  // ── 3. UNTERSCHUSS-AUSGLEICH (hwenc.11) ──
+  // ★★ jimtonics 23.10., Intel Meteor Lake, iHD: Nach einem 3-s-Netzstillstand
+  // (22:51:43) stand der Encoder ab 22:53:28 auf 793 kbit/s. Intels CBR gab
+  // davon ~610 aus (0,76–0,78×, send.log). Die app-limitierte Schätzung wuchs
+  // nur bis ~1,6× des Gesendeten (bwe 988k), die Forderung blieb bei 957 —
+  // unter der Folge-Schwelle 1,2 × 997 = 1196. Fünfeinhalb Minuten Matsch,
+  // gelöst erst zufällig durch einen Bildraten-Neuaufsatz um 22:57:13. Die
+  // Prüfung von hwenc.10 hatte genau das vorhergesagt (N1: ab Unterschuss
+  // ≲ 0,78 trägt die Folge nicht mehr).
+  //
+  // Die Lage: WebRTC fordert MEHR (≥ 1,1× Encoder-Ziel), der Encoder liefert
+  // WENIGER (< 0,85× Ziel, gemessen über 5 s), und es kommen ≥ 15 Bilder/s —
+  // durchgehend fünf Sekunden, Anlaufphase vorbei. Dann neu aufsetzen auf
+  // min(Forderung, Ziel × Ziel / gesendet), mindestens 1,1× Ziel, NIE über
+  // die rohe Forderung (`UnterschussZiel`).
+  //
+  // ★ WARUM KEIN STATISCHER BILDSCHIRM AUSLÖST: Ein ruhender Bildschirm
+  // liefert 1–5 Bilder/s (Bildraten-Tor), und die app-limitierte Schätzung
+  // fordert bei ruhigem Bild nicht mehr, als der Encoder schon hat. Selbst
+  // wenn: Das Ziel steigt höchstens bis an die Forderung, danach braucht
+  // der nächste Schritt wieder 10 % MEHR Forderung, also echtes Wachstum.
+  //
+  // ★ WARUM KEINE NEUE ÜBERLAST: Das Ziel bleibt ≤ Forderung, und die
+  // Forderung ist das, was die Staukontrolle freigibt. Ein Treiber, der
+  // trifft oder überschießt, löst nie aus (gesendet ≥ 0,85× Ziel).
+  //
+  // ★ DER KREIS VOM 21.09. lief abwärts; hier geht es nur aufwärts, höchstens
+  // alle ~10 s (5 s Fenster nach dem Öffnen + 5 s Lage), und abwärts gilt
+  // weiter 2× / 10 s.
+  {
+    const uint64_t z = target_bitrate_bps_;
+    const bool lage = jetzt >= anlauf_bis_ms_ && gesendet_bps_ > 0 && z > 0 &&
+                      gesendet_bilder_5s_ >= 15u * kAusFaecher &&
+                      static_cast<uint64_t>(forderung_roh_) * 10 >= z * 11 &&
+                      static_cast<uint64_t>(gesendet_bps_) * 100 < z * 85;
+    if (!lage) {
+      unterschuss_seit_ms_ = 0;
+    } else if (unterschuss_seit_ms_ == 0) {
+      unterschuss_seit_ms_ = jetzt;
+    }
+    *unterschuss = lage && jetzt - unterschuss_seit_ms_ >= kUnterschussMs &&
+                   UnterschussZiel() > target_bitrate_bps_;
+  }
+
+  // ── 4. DIAGNOSE „Encoder haengt" ──
   // Liegen rohe Forderung und Encoder-Ziel länger als zehn Sekunden um mehr
   // als 30 % auseinander, steht es im hwenc.log — höchstens alle 30 s. Genau
   // diese Lage war bei jimtonics nur aus 2 Minuten SetRates-Zeilen
@@ -1114,26 +1251,41 @@ void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrat
   } else if (jetzt - haengt_seit_ms_ >= 10000 &&
              jetzt - haengt_gemeldet_ms_ >= 30000) {
     haengt_gemeldet_ms_ = jetzt;
-    Protokoll("Encoder haengt: Forderung %u kbit/s @%u, Encoder %u kbit/s @%u seit %lld s",
+    // hwenc.11: dazu, was wirklich herauskam („?" = Fenster nach dem
+    // letzten Öffnen noch nicht voll).
+    char gesendet[24] = "?";
+    if (gesendet_bps_ > 0) {
+      std::snprintf(gesendet, sizeof(gesendet), "%u", gesendet_bps_ / 1000);
+    }
+    Protokoll("Encoder haengt: Forderung %u kbit/s @%u, Encoder %u kbit/s @%u, "
+              "gesendet %s kbit/s seit %lld s",
               forderung_roh_ / 1000, fz_zuletzt_, target_bitrate_bps_ / 1000,
-              framerate_offen_,
+              framerate_offen_, gesendet,
               static_cast<long long>((jetzt - haengt_seit_ms_) / 1000));
   }
 }
 
 void HwH264Encoder::VaapiNeuAufsetzen(uint32_t neu, uint32_t gefordert, bool hoch,
                                       bool runter, bool bildrate, bool folge,
-                                      uint32_t fz, int64_t jetzt, const char* wie) {
+                                      uint32_t fz, int64_t jetzt, const char* wie,
+                                      uint32_t unterschuss_gesendet) {
   // Nur ABWÄRTS darf die Rate sinken. Löst „hoch" oder „bildrate" aus,
   // während der Ausgleicher gerade von einem Überschuss gedrückt ist, bliebe
   // sonst weniger als vorher (Prüfbefunde M1/M2).
   const uint32_t soll = runter ? neu : std::max(neu, target_bitrate_bps_);
-  Protokoll("VA-API %sneu aufsetzen: %u -> %u kbit/s, @%u -> @%u fps (%s%s%s%s, gefordert %u, "
+  // hwenc.11: „unterschuss, gesendet X von Y" — Y ist das bisherige Ziel.
+  char unterschuss[64] = "";
+  if (unterschuss_gesendet > 0) {
+    std::snprintf(unterschuss, sizeof(unterschuss), "%sunterschuss, gesendet %u von %u",
+                  bildrate ? " " : "", unterschuss_gesendet / 1000,
+                  target_bitrate_bps_ / 1000);
+  }
+  Protokoll("VA-API %sneu aufsetzen: %u -> %u kbit/s, @%u -> @%u fps (%s%s%s%s%s, gefordert %u, "
             "beim letzten Oeffnen %u, %lld ms seit dem letzten)",
             wie, target_bitrate_bps_ / 1000, soll / 1000, framerate_offen_, fz,
             hoch ? "hoch " : "", folge ? "(Folge) " : "", runter ? "runter " : "",
-            bildrate ? "bildrate" : "", gefordert / 1000, gefordert_offen_ / 1000,
-            static_cast<long long>(jetzt - letztes_aufsetzen_ms_));
+            bildrate ? "bildrate" : "", unterschuss, gefordert / 1000,
+            gefordert_offen_ / 1000, static_cast<long long>(jetzt - letztes_aufsetzen_ms_));
   target_bitrate_bps_ = soll;
   gefordert_offen_ = gefordert;
   // Neue Bezugswerte — alle Uhren beginnen von vorn.
