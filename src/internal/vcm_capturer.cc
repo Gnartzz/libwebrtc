@@ -719,7 +719,7 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
     //     Liefert er einen anderen (z. B. YUY2 720p@60, das bei
     //     „Bild/Rate erfuellt" den Zuschlag bekaeme), bleibt alles wie bisher.
     //  4. Rueckfall: StartCapture scheitert, kein Bild nach 10 s, oder ab
-    //     ~3 s nach dem ersten Bild ZWEI 2-s-Fenster nacheinander < 50 % der
+    //     ~3 s nach dem ersten Bild ZWEI 2-s-Fenster nacheinander < 40 % der
     //     Wunschrate -> einmal mit der alten Faehigkeit neu starten (Kameras,
     //     die bei erzwungener Rate schwarz bleiben oder nur ~5 fps liefern).
     //     Danach wird fuer diese Kamera im Prozess nicht mehr gesenkt.
@@ -1042,12 +1042,12 @@ void VcmCapturer::PlaneRatenPruefung(
   // Ablauf (alles auf worker_thread_, Takt 1 s; Pruefbefund M1):
   //  - kein Bild nach 10 s -> RateRueckfall („schwarz").
   //  - die ersten ~3 s nach dem ersten Bild zaehlen nicht (Belichtungs-Anlauf).
-  //  - danach 2-s-Fenster messen; ZWEI Fenster nacheinander < 50 % der
+  //  - danach 2-s-Fenster messen; ZWEI Fenster nacheinander < 40 % der
   //    Wunschrate -> RateRueckfall. Schwelle bewusst niedrig: echte
   //    Fehlerbilder sind schwarz oder ~5 fps; wenig Licht (30 statt 60) soll
   //    NICHT zurueckfallen, weil der unveraenderte Modus dann genauso begrenzt
   //    ist.
-  //  - ein Fenster >= 50 % beendet die Pruefung: > 1,15x Wunsch = Senkung
+  //  - ein Fenster >= 40 % beendet die Pruefung: > 1,15x Wunsch = Senkung
   //    wirkungslos (Kamera ignoriert die Ratensteuerung, N2), sonst bestaetigt.
   worker_thread_->PostDelayedTask(
       [this, lebt, runde, n_vorher, qpc_vorher, unter] {
@@ -1082,11 +1082,12 @@ void VcmCapturer::PlaneRatenPruefung(
         const double sek = static_cast<double>(jetzt - qpc_vorher) /
                            static_cast<double>(freq);
         const double fps = sek > 0 ? (n - n_vorher) / sek : 0.0;
-        if (fps < 0.5 * wunsch_fps_) {
+        // 40 %: wenig Licht (Belichtung 1/30 s, ~29,9 fps) darf NICHT zurueckfallen.
+        if (fps < 0.4 * wunsch_fps_) {
           if (unter + 1 >= 2) {
             char grund[112];
             std::snprintf(grund, sizeof(grund),
-                          "geliefert %.1f fps < 50%% von %d in zwei Fenstern "
+                          "geliefert %.1f fps < 40%% von %d in zwei Fenstern "
                           "(je %.1f s)",
                           fps, wunsch_fps_, sek);
             RateRueckfall(grund);
