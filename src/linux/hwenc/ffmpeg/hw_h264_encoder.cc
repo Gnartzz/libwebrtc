@@ -1099,14 +1099,14 @@ void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrat
 
   // ── 3. DIAGNOSE „Encoder haengt" ──
   // Liegen rohe Forderung und Encoder-Ziel länger als zehn Sekunden um mehr
-  // als 15 % auseinander, steht es im hwenc.log — höchstens alle 30 s. Genau
+  // als 30 % auseinander, steht es im hwenc.log — höchstens alle 30 s. Genau
   // diese Lage war bei jimtonics nur aus 2 Minuten SetRates-Zeilen
   // herauszurechnen. (Der Ausgleicher allein macht 5–50 % Abstand; die Zeile
   // ist ein Hinweis, kein Fehler.)
   const uint32_t zg = std::max(forderung_roh_, target_bitrate_bps_);
   const uint32_t zk = std::min(forderung_roh_, target_bitrate_bps_);
   const bool klafft = zk > 0 && static_cast<uint64_t>(zg) * 100 >
-                                    static_cast<uint64_t>(zk) * 115;
+                                    static_cast<uint64_t>(zk) * 130;  // 30 %: die tote Zone nach einer Folge reicht bis ~1,26 (Prüfbefund N3)
   if (!klafft) {
     haengt_seit_ms_ = 0;
   } else if (haengt_seit_ms_ == 0) {
