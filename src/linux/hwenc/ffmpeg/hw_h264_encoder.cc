@@ -344,12 +344,18 @@ int HwH264Encoder::InitEncode(
   height_ = codec_settings->height;
   framerate_ = codec_settings->maxFramerate ? codec_settings->maxFramerate : 30;
   max_fps_ = framerate_;
-  bildrate_folge_ = 0;
+  bildrate_richtung_ = 0;
+  bildrate_seit_ms_ = 0;
+  hoch_seit_ms_ = 0;
+  haengt_seit_ms_ = 0;
   aufsetzen_ausstehend_ = false;
   target_bitrate_bps_ = codec_settings->startBitrate * 1000;
   max_bitrate_bps_ = codec_settings->maxBitrate * 1000;
   if (target_bitrate_bps_ == 0) target_bitrate_bps_ = 1000000;
   gefordert_offen_ = target_bitrate_bps_;
+  forderung_roh_ = target_bitrate_bps_;
+  fz_zuletzt_ = std::clamp<uint32_t>(framerate_, std::min<uint32_t>(20, max_fps_),
+                                     std::max<uint32_t>(max_fps_, 20));
   if (max_bitrate_bps_ < target_bitrate_bps_) {
     max_bitrate_bps_ = target_bitrate_bps_ * 2;
   }
@@ -670,16 +676,51 @@ int32_t HwH264Encoder::Encode(
     }
   }
 
-  // ★★ 09.10.2026: einen in die Sperrzeit gefallenen Ratensprung nachholen
-  // (s. `aufsetzen_ausstehend_`). Nur VA-API — NVENC stellt sich in SetRates
-  // selbst um und merkt nie etwas vor.
-  if (aufsetzen_ausstehend_ && weg_ != Backend::kNvenc) {
+  if (weg_ != Backend::kNvenc) {
     const int64_t jetzt = webrtc::TimeMillis();
-    if (jetzt - letztes_aufsetzen_ms_ >= ausstehend_sperre_ms_) {
+    // ★★ 23.10.2026 (hwenc.10): die zeitbasierten Folgen auch HIER prüfen.
+    // WebRTC ruft `SetRates` nur, wenn sich etwas ändert; bleibt die Forderung
+    // stehen, käme die 3-s-Grenze sonst nie zur Auswertung. Pro Bild nur ein
+    // paar Ganzzahlvergleiche (s. `LageAuswerten`).
+    bool hoch_folge = false;
+    bool bildrate = false;
+    LageAuswerten(jetzt, &hoch_folge, &bildrate);
+    bool frisch = false;   // erst in diesem Aufruf gemerkt (fürs Protokoll)
+    if (!aufsetzen_ausstehend_ && (hoch_folge || bildrate)) {
+      frisch = true;
+      aufsetzen_ausstehend_ = true;
+      ausstehend_gefordert_ = forderung_roh_;
+      ausstehend_fz_ = fz_zuletzt_;
+      ausstehend_hoch_ = hoch_folge;
+      ausstehend_runter_ = false;
+      ausstehend_bildrate_ = bildrate;
+      ausstehend_folge_ = hoch_folge;
+      ausstehend_nur_folge_ = true;
+      ausstehend_sperre_ms_ = (bildrate && bildrate_richtung_ > 0) ? 3000
+                              : hoch_folge                         ? 5000
+                                                                   : 10000;
+    } else if (aufsetzen_ausstehend_ && ausstehend_nur_folge_ && !hoch_folge &&
+               !bildrate) {
+      // Die Folge ist abgerissen: ein nur aus ihr gemerkter Sprung verfällt.
+      aufsetzen_ausstehend_ = false;
+    } else if (aufsetzen_ausstehend_ && !ausstehend_runter_ && hoch_folge &&
+               ausstehend_sperre_ms_ > 5000) {
+      // Ein gemerkter 1,5×-Sprung (10 s) ist inzwischen auch eine Folge: dann
+      // gilt deren kürzere Sperrzeit, auch wenn kein SetRates mehr kommt.
+      ausstehend_hoch_ = true;
+      ausstehend_folge_ = true;
+      ausstehend_sperre_ms_ = 5000;
+    }
+
+    // ★★ 09.10.2026: einen in die Sperrzeit gefallenen Ratensprung nachholen
+    // (s. `aufsetzen_ausstehend_`). Nur VA-API — NVENC stellt sich in SetRates
+    // selbst um und merkt nie etwas vor.
+    if (aufsetzen_ausstehend_ && jetzt - letztes_aufsetzen_ms_ >= ausstehend_sperre_ms_) {
       aufsetzen_ausstehend_ = false;
       VaapiNeuAufsetzen(bitrate_adjuster_.GetAdjustedBitrateBps(), ausstehend_gefordert_,
                         ausstehend_hoch_, ausstehend_runter_, ausstehend_bildrate_,
-                        ausstehend_fz_, jetzt, "nachgeholt ");
+                        ausstehend_folge_, ausstehend_fz_, jetzt,
+                        frisch ? "" : "nachgeholt ");
       if (!ctx_) return WEBRTC_VIDEO_CODEC_ERROR;   // Wiederanlauf oben greift
     }
   }
@@ -905,32 +946,16 @@ void HwH264Encoder::SetRates(
   // zwischen 0,5× und 0,95× (ein Vollbild drückt ihn nach unten); auf ihn
   // bezogen hätte 1,5× den Kreis vom 21.09. wieder geöffnet (Prüfbefund M1).
   const uint32_t gefordert = parameters.bitrate.get_sum_bps();
-  const bool hoch = static_cast<uint64_t>(gefordert) * 2 >=
-                    static_cast<uint64_t>(gefordert_offen_) * 3;
+  const bool hoch_sprung = static_cast<uint64_t>(gefordert) * 2 >=
+                           static_cast<uint64_t>(gefordert_offen_) * 3;
   // ★★ Und die BILDRATE: VA-API verteilt die CBR-Rate auf die Bildrate beim
   // Öffnen. Geöffnet mit 60, geliefert ~22 → gesendet ein Drittel (gemessen
-  // 204–411 kbit/s bei 947 Ziel). Weicht die gemeldete Eingangsrate um das
-  // 1,5-Fache ab — und das DREI Meldungen in Folge in dieselbe Richtung, sonst
-  // setzte ein Bildschirm zwischen Ruhe, Tippen und Scrollen laufend neu auf
-  // (Prüfbefund M2) —, mit der echten neu aufsetzen.
+  // 204–411 kbit/s bei 947 Ziel). Weicht die gemeldete Eingangsrate ab — und
+  // das DURCHGEHEND in dieselbe Richtung, sonst setzte ein Bildschirm zwischen
+  // Ruhe, Tippen und Scrollen laufend neu auf (Prüfbefund M2) —, mit der
+  // echten neu aufsetzen. Schwelle und Folge seit hwenc.10: s. `LageAuswerten`.
   const uint32_t fz = std::clamp<uint32_t>(framerate_, std::min<uint32_t>(20, max_fps_),
                                            std::max<uint32_t>(max_fps_, 20));
-  const uint32_t fg = std::max(fz, framerate_offen_);
-  const uint32_t fk = std::max<uint32_t>(1, std::min(fz, framerate_offen_));
-  const bool abweichung = fg * 2 >= fk * 3;
-  const int richtung = !abweichung ? 0 : (fz > framerate_offen_ ? 1 : -1);
-  if (richtung == 0) {
-    bildrate_folge_ = 0;
-  } else if ((richtung > 0) == (bildrate_folge_ > 0) && bildrate_folge_ != 0) {
-    bildrate_folge_ += richtung;
-  } else {
-    bildrate_folge_ = richtung;
-  }
-  const bool bildrate = bildrate_folge_ >= 3 || bildrate_folge_ <= -3;
-  // Steigt die Bildrate, schießt die Rate über — dann nicht zehn, sondern
-  // höchstens drei Sekunden warten.
-  const bool bildrate_hoch = bildrate && bildrate_folge_ > 0;
-  const bool sprung = hoch || runter || bildrate;
   const int64_t jetzt = webrtc::TimeMillis();
 
   if (weg_ == Backend::kNvenc) {
@@ -945,16 +970,41 @@ void HwH264Encoder::SetRates(
     return;
   }
 
+  // ★★ 23.10.2026 (hwenc.10, jimtonics, Intel Arc/Meteor Lake, iHD 26.3.5,
+  // hwenc.log): Freigabe 1728x1072. Nach dem Anlauf stand VA-API auf 1343
+  // kbit/s @49; danach forderte WebRTC ZWEI MINUTEN LANG 1692–1926 kbit/s
+  // @53–57, und der Encoder blieb auf 1343 — 1926/1343 = 1,43 < 1,5, und
+  // 57/49 = 1,16 < 1,5. Intels CBR unterschießt (gesendet ~1,2 Mbit/s), die
+  // Schätzung wächst app-limitiert nur bis ~1,5× des Gesendeten: Teufelskreis,
+  // dauerhaft Blöcke. Deshalb zusätzlich die zeitbasierten Folgen (aufwärts
+  // ab 1,2× für 3 s, Bildrate ab 1,15× für 3 s) — Einzelheiten und warum sie
+  // den Kreis vom 21.09. NICHT wieder öffnen in `LageAuswerten`.
+  forderung_roh_ = gefordert;
+  fz_zuletzt_ = fz;
+  bool hoch_folge = false;
+  bool bildrate = false;
+  LageAuswerten(jetzt, &hoch_folge, &bildrate);
+  const bool hoch = hoch_sprung || hoch_folge;
+  // Steigt die Bildrate, schießt die Rate über — dann nicht zehn, sondern
+  // höchstens drei Sekunden warten.
+  const bool bildrate_hoch = bildrate && bildrate_richtung_ > 0;
+  const bool sprung = hoch || runter || bildrate;
+
   // VA-API: wirklich neu aufsetzen. Das kostet ein Keyframe, deshalb nur bei
-  // echten Sprüngen (s. oben: hoch ab 1,5×, runter ab 2×, Bildrate ab 1,5×)
-  // UND höchstens alle zehn Sekunden. Kleine Wellen fängt der Ausgleicher ab.
+  // echten Sprüngen (s. oben: hoch ab 1,5× sofort oder ab 1,2× nach 3 s,
+  // runter ab 2×, Bildrate ab 1,15× nach 3 s) UND mit Sperrzeit: zehn
+  // Sekunden, aufwärts in der Folge fünf, Bildrate aufwärts drei. Kleine
+  // Wellen fängt der Ausgleicher ab.
   // ★ 17.10.2026 (Haltoan, hwenc.log 16.10.): Jede Freigabe öffnete mit
   // 290 kbit/s und blieb dort zehn Sekunden (20:38:23 → 20:38:33 → 1900) —
   // zehn Sekunden Matsch bei jedem Start. In der Anlaufphase darf es deshalb
   // alle zwei Sekunden HOCH gehen; ein Vollbild kostet bei diesen Raten wenig.
   // Abwärts bleibt es bei zehn Sekunden (der Kreis vom 21.09.).
   const bool im_anlauf = hoch && !runter && jetzt < anlauf_bis_ms_;
-  const int64_t sperrzeit_ms = im_anlauf ? 2000 : bildrate_hoch ? 3000 : 10000;
+  const int64_t sperrzeit_ms = im_anlauf                ? 2000
+                               : bildrate_hoch          ? 3000
+                               : hoch_folge && !runter  ? 5000
+                                                        : 10000;
   if (!sprung) {
     // Die Lage hat sich beruhigt: ein gemerkter Sprung gilt nicht mehr.
     aufsetzen_ausstehend_ = false;
@@ -968,27 +1018,128 @@ void HwH264Encoder::SetRates(
     ausstehend_hoch_ = hoch;
     ausstehend_runter_ = runter;
     ausstehend_bildrate_ = bildrate;
+    ausstehend_folge_ = hoch_folge && !hoch_sprung;
+    ausstehend_nur_folge_ = !hoch_sprung && !runter;
     ausstehend_sperre_ms_ = sperrzeit_ms;
     return;
   }
   aufsetzen_ausstehend_ = false;
-  VaapiNeuAufsetzen(neu, gefordert, hoch, runter, bildrate, fz, jetzt, "");
+  VaapiNeuAufsetzen(neu, gefordert, hoch, runter, bildrate, hoch_folge && !hoch_sprung,
+                    fz, jetzt, "");
+}
+
+void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrate) {
+  *hoch_folge = false;
+  *bildrate = false;
+
+  // ── 1. AUFWÄRTS IN DER FOLGE ──
+  // Die ROHE Forderung (nicht der Ausgleicher, Prüfbefund M1) liegt seit
+  // mindestens drei Sekunden DURCHGEHEND bei ≥ 1,2× der Forderung beim
+  // letzten Öffnen. Eine einzige Meldung darunter setzt die Uhr zurück.
+  //
+  // ★ WARUM ZEIT STATT „DREI SetRates IN FOLGE": WebRTC meldet eine geänderte
+  // Eingangsbildrate bis zu jedes Bild (dann wären drei Meldungen 50 ms —
+  // eine Scroll-Spitze), eine stehende Forderung dagegen gar nicht mehr
+  // (dann käme die dritte nie). Drei Sekunden durchgehend sind beides
+  // zugleich: robuster gegen Spitzen und sicher erreichbar, weil auch
+  // `Encode` hier vorbeikommt.
+  //
+  // ★ WARUM DAS DEN KREIS VOM 21.09. NICHT WIEDER ÖFFNET: Der Kreis lief
+  // ABWÄRTS (930 → 495 → 285), jedes Vollbild drückte die Schätzung, und der
+  // Encoder folgte ihr nach unten. Abwärts bleibt unverändert (2×, 10 s).
+  // Aufwärts setzt die Folge `gefordert_offen_` auf die neue Forderung; der
+  // nächste Schritt braucht wieder echte 20 % Wachstum über drei Sekunden —
+  // höchstens ein Schritt je fünf Sekunden, und nur, solange die Schätzung
+  // tatsächlich steigt.
+  //
+  // Zusätzlich muss der AUSGEGLICHENE Wert mindestens 10 % über dem
+  // Encoder-Ziel liegen. Sonst ergäbe `max(neu, Ziel)` in
+  // `VaapiNeuAufsetzen` dieselbe Rate — ein Vollbild für nichts.
+  //
+  // In der Anlaufphase gilt nur der bisherige 1,5×-Sprung mit 2-s-Sperre
+  // (17.10.); die Uhr läuft aber schon mit.
+  const bool ueber = gefordert_offen_ > 0 &&
+                     static_cast<uint64_t>(forderung_roh_) * 5 >=
+                         static_cast<uint64_t>(gefordert_offen_) * 6;
+  if (!ueber) {
+    hoch_seit_ms_ = 0;
+  } else if (hoch_seit_ms_ == 0) {
+    hoch_seit_ms_ = jetzt;
+  }
+  if (ueber && jetzt >= anlauf_bis_ms_ && jetzt - hoch_seit_ms_ >= kFolgeMs) {
+    const uint32_t neu = bitrate_adjuster_.GetAdjustedBitrateBps();
+    *hoch_folge = static_cast<uint64_t>(neu) * 10 >=
+                  static_cast<uint64_t>(target_bitrate_bps_) * 11;
+  }
+
+  // ── 2. BILDRATE ──
+  // Bis hwenc.9: Abweichung ab 1,5× bei drei Meldungen in Folge. jimtonics
+  // lieferte 56–57 fps bei @49 geöffnet (1,14–1,16) — zwei Minuten lang nie
+  // ausgelöst, und der Encoder verteilte die Rate auf zu wenige Bilder.
+  // Jetzt: Beginn ab 1,15×, gehalten bis 1,10× (sonst risse 56/49 = 1,143
+  // die Uhr bei jeder zweiten Meldung ab), durchgehend drei Sekunden.
+  // Sperrzeit aufwärts 3 s, abwärts unverändert 10 s (s. `SetRates`).
+  const uint64_t fz = fz_zuletzt_;
+  const uint64_t fo = std::max<uint32_t>(1, framerate_offen_);
+  int richtung = 0;
+  if (fz * 100 >= fo * 115) {
+    richtung = 1;
+  } else if (fo * 100 >= fz * 115) {
+    richtung = -1;
+  } else if (bildrate_richtung_ > 0 && fz * 100 >= fo * 110) {
+    richtung = 1;    // Hysterese: eine laufende Folge hält bis 1,10×
+  } else if (bildrate_richtung_ < 0 && fo * 100 >= fz * 110) {
+    richtung = -1;
+  }
+  if (richtung != bildrate_richtung_) {
+    bildrate_richtung_ = richtung;
+    bildrate_seit_ms_ = richtung != 0 ? jetzt : 0;
+  }
+  *bildrate = richtung != 0 && jetzt - bildrate_seit_ms_ >= kFolgeMs;
+
+  // ── 3. DIAGNOSE „Encoder haengt" ──
+  // Liegen rohe Forderung und Encoder-Ziel länger als zehn Sekunden um mehr
+  // als 15 % auseinander, steht es im hwenc.log — höchstens alle 30 s. Genau
+  // diese Lage war bei jimtonics nur aus 2 Minuten SetRates-Zeilen
+  // herauszurechnen. (Der Ausgleicher allein macht 5–50 % Abstand; die Zeile
+  // ist ein Hinweis, kein Fehler.)
+  const uint32_t zg = std::max(forderung_roh_, target_bitrate_bps_);
+  const uint32_t zk = std::min(forderung_roh_, target_bitrate_bps_);
+  const bool klafft = zk > 0 && static_cast<uint64_t>(zg) * 100 >
+                                    static_cast<uint64_t>(zk) * 115;
+  if (!klafft) {
+    haengt_seit_ms_ = 0;
+  } else if (haengt_seit_ms_ == 0) {
+    haengt_seit_ms_ = jetzt;
+  } else if (jetzt - haengt_seit_ms_ >= 10000 &&
+             jetzt - haengt_gemeldet_ms_ >= 30000) {
+    haengt_gemeldet_ms_ = jetzt;
+    Protokoll("Encoder haengt: Forderung %u kbit/s @%u, Encoder %u kbit/s @%u seit %lld s",
+              forderung_roh_ / 1000, fz_zuletzt_, target_bitrate_bps_ / 1000,
+              framerate_offen_,
+              static_cast<long long>((jetzt - haengt_seit_ms_) / 1000));
+  }
 }
 
 void HwH264Encoder::VaapiNeuAufsetzen(uint32_t neu, uint32_t gefordert, bool hoch,
-                                      bool runter, bool bildrate, uint32_t fz,
-                                      int64_t jetzt, const char* wie) {
+                                      bool runter, bool bildrate, bool folge,
+                                      uint32_t fz, int64_t jetzt, const char* wie) {
   // Nur ABWÄRTS darf die Rate sinken. Löst „hoch" oder „bildrate" aus,
   // während der Ausgleicher gerade von einem Überschuss gedrückt ist, bliebe
   // sonst weniger als vorher (Prüfbefunde M1/M2).
   const uint32_t soll = runter ? neu : std::max(neu, target_bitrate_bps_);
-  Protokoll("VA-API %sneu aufsetzen: %u -> %u kbit/s, @%u -> @%u fps (%s%s%s, %lld ms seit dem letzten)",
+  Protokoll("VA-API %sneu aufsetzen: %u -> %u kbit/s, @%u -> @%u fps (%s%s%s%s, gefordert %u, "
+            "beim letzten Oeffnen %u, %lld ms seit dem letzten)",
             wie, target_bitrate_bps_ / 1000, soll / 1000, framerate_offen_, fz,
-            hoch ? "hoch " : "", runter ? "runter " : "", bildrate ? "bildrate" : "",
+            hoch ? "hoch " : "", folge ? "(Folge) " : "", runter ? "runter " : "",
+            bildrate ? "bildrate" : "", gefordert / 1000, gefordert_offen_ / 1000,
             static_cast<long long>(jetzt - letztes_aufsetzen_ms_));
   target_bitrate_bps_ = soll;
   gefordert_offen_ = gefordert;
-  bildrate_folge_ = 0;
+  // Neue Bezugswerte — alle Uhren beginnen von vorn.
+  bildrate_richtung_ = 0;
+  bildrate_seit_ms_ = 0;
+  hoch_seit_ms_ = 0;
   if (max_bitrate_bps_ < target_bitrate_bps_) {
     max_bitrate_bps_ = target_bitrate_bps_ * 2;
   }

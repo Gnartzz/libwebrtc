@@ -85,7 +85,13 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   // VA-API mit neuer Rate/Bildrate öffnen (unter `mutex_`). `wie` erscheint
   // im hwenc.log („" oder „nachgeholt ").
   void VaapiNeuAufsetzen(uint32_t neu, uint32_t gefordert, bool hoch, bool runter,
-                         bool bildrate, uint32_t fz, int64_t jetzt, const char* wie);
+                         bool bildrate, bool folge, uint32_t fz, int64_t jetzt,
+                         const char* wie);
+  // ★★ 23.10.2026 (hwenc.10): wertet die zeitbasierten Folgen aus — aus
+  // `SetRates` UND aus `Encode` (unter `mutex_`, nur VA-API). Rechnet nur mit
+  // Zahlen, die schon da sind; keine Allokation, kein Treiberaufruf. Schreibt
+  // höchstens alle 30 s eine Diagnosezeile.
+  void LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrate);
   void CodecSchliessen();
   // Holt jedes fertige Paket ab und reicht es an den Rückruf weiter. Die
   // Zeitangaben kommen aus `stempel_`, NICHT vom gerade übergebenen Bild —
@@ -137,9 +143,26 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   // schwankt von selbst zwischen 0,5× und 0,95× — auf ihn bezogen wäre eine
   // 1,5×-Schwelle ein neuer Kreis (Prüfbefund M1).
   uint32_t gefordert_offen_ = 0;
-  // Wie viele SetRates in Folge die Bildrate in DIESELBE Richtung abwich
-  // (+ = höher, − = niedriger). Erst ab drei gilt es (Prüfbefund M2).
-  int bildrate_folge_ = 0;
+  // In welche Richtung die gemeldete Bildrate von der beim Öffnen abweicht
+  // (+1 höher, −1 niedriger, 0 nicht) und seit wann durchgehend. Bis
+  // hwenc.9 zählte hier „drei SetRates in Folge" (Prüfbefund M2) — seit
+  // hwenc.10 gilt die ZEIT (3 s), s. `LageAuswerten`.
+  int bildrate_richtung_ = 0;
+  int64_t bildrate_seit_ms_ = 0;
+  // ★★ 23.10.2026 (hwenc.10, jimtonics): Die letzte ROHE Forderung und die
+  // letzte (geklemmte) Bildrate aus `SetRates` — damit `Encode` die Folgen
+  // auch dann auswerten kann, wenn WebRTC eine Weile nichts Neues meldet.
+  uint32_t forderung_roh_ = 0;
+  uint32_t fz_zuletzt_ = 30;
+  // Seit wann die rohe Forderung durchgehend ≥ 1,2× `gefordert_offen_` liegt
+  // (0 = nicht).
+  int64_t hoch_seit_ms_ = 0;
+  // Diagnose „Encoder haengt": seit wann Forderung und Encoder-Ziel um mehr
+  // als 15 % auseinanderliegen, und wann zuletzt gemeldet.
+  int64_t haengt_seit_ms_ = 0;
+  int64_t haengt_gemeldet_ms_ = 0;
+  // So lange muss eine Abweichung durchgehend bestehen, bevor sie zählt.
+  static constexpr int64_t kFolgeMs = 3000;
   // Zeitmessung je Phase (Mikrosekunden), alle fünf Sekunden ins hwenc.log.
   int64_t zeit_i420_us_ = 0;
   int64_t zeit_nv12_us_ = 0;
@@ -173,6 +196,11 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   bool ausstehend_hoch_ = false;
   bool ausstehend_runter_ = false;
   bool ausstehend_bildrate_ = false;
+  bool ausstehend_folge_ = false;
+  // Wahr, wenn der gemerkte Sprung NUR aus den zeitbasierten Folgen stammt
+  // (kein 1,5×-Sprung, kein Abwärts) — dann verfällt er auch in `Encode`,
+  // sobald die Folge abreißt.
+  bool ausstehend_nur_folge_ = false;
   int64_t ausstehend_sperre_ms_ = 10000;
   // Nach einem gescheiterten Öffnen nicht endgültig aufgeben, sondern es
   // gelegentlich erneut versuchen (der Grund kann vorübergehend sein:
