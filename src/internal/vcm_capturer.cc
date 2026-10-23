@@ -32,8 +32,11 @@
 #include <dvdmedia.h>  // VIDEOINFOHEADER2 (Ratenliste je Medientyp)
 #include <atomic>
 #include <cctype>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <set>
 namespace {
 void CamRotateIfNeeded(const char* path) {
   char old_path[MAX_PATH + 8];
@@ -95,6 +98,55 @@ const char* CamVideoTypeName(webrtc::VideoType t) {
     case webrtc::VideoType::kUYVY: return "UYVY";
     default: return "andere";
   }
+}
+
+// N4 (Pruefung 23.10.): mehrzeilige Bloecke (Faehigkeits-/Ratenliste) erst
+// sammeln und dann mit EINEM CamLog (ein fopen/fclose) schreiben.
+void CamPuffer(std::string* p, const char* fmt, ...) {
+  if (!p) return;
+  char z[512];
+  va_list ap;
+  va_start(ap, fmt);
+  int m = std::vsnprintf(z, sizeof(z), fmt, ap);
+  va_end(ap);
+  if (m <= 0) return;
+  p->append(z);
+  p->push_back('\n');
+}
+void CamPufferSchreiben(std::string* p) {
+  if (!p || p->empty()) return;
+  if (p->back() == '\n') p->pop_back();
+  CamLog("%s", p->c_str());
+  p->clear();
+}
+
+// Merker je DevicePath fuer die Prozesslaufzeit (nur Init-/Worker-Pfad, nie
+// Bildpfad). Absichtlich nie freigegeben (kein Zerstoerungs-Reihenfolge-Risiko
+// beim Prozessende).
+std::mutex& CamMerkerMtx() {
+  static std::mutex* m = new std::mutex();
+  return *m;
+}
+std::set<std::string>& CamListeGeschrieben() {
+  static std::set<std::string>* s = new std::set<std::string>();
+  return *s;
+}
+std::set<std::string>& CamSenkungGescheitertSet() {
+  static std::set<std::string>* s = new std::set<std::string>();
+  return *s;
+}
+// true beim ersten Aufruf je Name (und merkt ihn sich).
+bool CamListeErstesMal(const std::string& name) {
+  std::lock_guard<std::mutex> l(CamMerkerMtx());
+  return CamListeGeschrieben().insert(name).second;
+}
+bool CamSenkungGescheitert(const std::string& name) {
+  std::lock_guard<std::mutex> l(CamMerkerMtx());
+  return CamSenkungGescheitertSet().count(name) != 0;
+}
+void CamSenkungGescheitertMerken(const std::string& name) {
+  std::lock_guard<std::mutex> l(CamMerkerMtx());
+  CamSenkungGescheitertSet().insert(name);
 }
 
 // id34: Toleranter Vergleich der DirectShow-DevicePaths (case-insensitiv, einer
@@ -325,16 +377,18 @@ IPin* HcErsterAusgangsPin(IBaseFilter* filter) {
   return gefunden;
 }
 
-// Liest alle Medientypen samt Ratenliste, schreibt sie ins cam.log und
+// Liest alle Medientypen samt Ratenliste, sammelt sie in *detail und
 // beurteilt, ob die gewaehlte Faehigkeit (want_*) die Wunschrate kann.
 // „Passend" = gleiche Breite/Hoehe/Format UND gleiche Hoechstrate, wie
 // webrtc sie berechnet (int(1e7 / kuerzeste Dauer)).
 CamRaten CamRatenPruefen(const char* unique_name, int want_w, int want_h,
                          webrtc::VideoType want_typ, int want_max,
-                         int wunsch_fps) {
+                         int wunsch_fps, std::string* detail,
+                         int64_t* dauer_ms) {
   const int64_t t0 = static_cast<int64_t>(GetTickCount64());
+  if (dauer_ms) *dauer_ms = 0;
   if (!unique_name || !unique_name[0]) {
-    CamLog("Raten: kein DevicePath -> nicht lesbar");
+    CamPuffer(detail, "Raten: kein DevicePath -> nicht lesbar");
     return CamRaten::kNichtLesbar;
   }
   bool com_inited = false;
@@ -396,18 +450,18 @@ CamRaten CamRatenPruefen(const char* unique_name, int want_w, int want_h,
   }
   int count = 0, size = 0;
   if (!filter) {
-    CamLog("Raten: Geraet nicht geoeffnet (DevicePath-Match) -> nicht lesbar");
+    CamPuffer(detail, "Raten: Geraet nicht geoeffnet (DevicePath-Match) -> nicht lesbar");
   } else if (!pin || !sc) {
-    CamLog("Raten: kein Ausgangs-Pin/IAMStreamConfig -> nicht lesbar");
+    CamPuffer(detail, "Raten: kein Ausgangs-Pin/IAMStreamConfig -> nicht lesbar");
   } else if (FAILED(sc->GetNumberOfCapabilities(&count, &size)) ||
              count <= 0 || size <= 0 || size > 4096) {
-    CamLog("Raten: GetNumberOfCapabilities fehlgeschlagen -> nicht lesbar");
+    CamPuffer(detail, "Raten: GetNumberOfCapabilities fehlgeschlagen -> nicht lesbar");
   } else {
     // VIDEO_STREAM_CONFIG_CAPS ist 128 Byte; Puffer grosszuegig.
     alignas(8) BYTE caps_buf[4096];
     bool passend_mit_liste = false, passend_ohne_liste = false;
     bool wunsch_da = false;
-    CamLog("Raten: %d DirectShow-Medientypen, IAMVideoControl=%s", count,
+    CamPuffer(detail, "Raten: %d DirectShow-Medientypen, IAMVideoControl=%s", count,
            vc ? "ja" : "NEIN");
     for (int i = 0; i < count; ++i) {
       AM_MEDIA_TYPE* pmt = nullptr;
@@ -480,7 +534,7 @@ CamRaten CamRatenPruefen(const char* unique_name, int want_w, int want_h,
         if (dauern) CoTaskMemFree(dauern);
       }
       const int avg_fps = avg > 0 ? static_cast<int>(10000000 / avg) : 0;
-      CamLog("  ds#%d %dx%d %s %s avg=%d raten: %s", i, w, h, fcc_txt,
+      CamPuffer(detail, "  ds#%d %dx%d %s %s avg=%d raten: %s", i, w, h, fcc_txt,
              vi2 ? "VI2" : "VI", avg_fps, hat_liste ? raten : "(keine Liste)");
       const int vergleich_max = hat_liste ? list_max : avg_fps;
       if (w == want_w && h == want_h && typ == want_typ &&
@@ -508,10 +562,7 @@ CamRaten CamRatenPruefen(const char* unique_name, int want_w, int want_h,
   if (pin) pin->Release();
   if (filter) filter->Release();
   if (com_inited) CoUninitialize();
-  CamLog("Raten: Urteil fuer %dx%d %s @%d (Wunsch %d): %s (%lldms)", want_w,
-         want_h, CamVideoTypeName(want_typ), want_max, wunsch_fps,
-         CamRatenName(urteil),
-         (long long)(static_cast<int64_t>(GetTickCount64()) - t0));
+  if (dauer_ms) *dauer_ms = static_cast<int64_t>(GetTickCount64()) - t0;
   return urteil;
 }
 
@@ -585,16 +636,20 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
   int64_t best_score = 0;
   [[maybe_unused]] int32_t best_index = -1;  // nur Windows-Log
 #ifdef _WIN32
-  // Faehigkeitsliste einmal je Kamera-Start ins cam.log (2026-10-23): ohne sie
-  // war im Feld nicht zu sehen, WARUM z. B. „@90" gewaehlt wurde.
-  CamLog("Kamera \"%s\": %d Faehigkeiten (webrtc-Sicht, maxFPS = hoechste Rate "
-         "je Medientyp)", device_name, ncaps);
+  // Faehigkeitsliste ins cam.log (2026-10-23): ohne sie war im Feld nicht zu
+  // sehen, WARUM z. B. „@90" gewaehlt wurde. N4: nur beim ersten Start je
+  // Kamera in diesem Prozess, gesammelt und mit EINEM Schreibvorgang.
+  const bool liste_neu = CamListeErstesMal(unique_name_);
+  std::string block;
+  std::string* liste = liste_neu ? &block : nullptr;
+  CamPuffer(liste, "Kamera \"%s\": %d Faehigkeiten (webrtc-Sicht, maxFPS = "
+            "hoechste Rate je Medientyp)", device_name, ncaps);
 #endif
   for (int32_t i = 0; i < ncaps; ++i) {
     VideoCaptureCapability c;
     if (device_info->GetCapability(uid, i, c) != 0) continue;
 #ifdef _WIN32
-    CamLog("  cap#%d %dx%d %s maxFPS=%d%s", i, c.width, c.height,
+    CamPuffer(liste, "  cap#%d %dx%d %s maxFPS=%d%s", i, c.width, c.height,
            CamVideoTypeName(c.videoType), c.maxFPS,
            c.interlaced ? " interlaced" : "");
 #endif
@@ -639,7 +694,7 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
     // mehr Aufloesung/fps ueberschreiben, sonst verhandelt DirectShow neu.
     capability_ = best;
 #ifdef _WIN32
-    CamLog("Init: Wunsch %dx%d@%d prefMJPEG=%d -> gewaehlt %dx%d@%d Format=%s (aus %d Caps, CapMap=%lldms)",
+    CamPuffer(&block, "Init: Wunsch %dx%d@%d prefMJPEG=%d -> gewaehlt %dx%d@%d Format=%s (aus %d Caps, CapMap=%lldms)",
            wantW, wantH, wantF, prefer_mjpeg ? 1 : 0, capability_.width,
            capability_.height, capability_.maxFPS,
            CamVideoTypeName(capability_.videoType), ncaps, (long long)cap_map_ms_);
@@ -663,22 +718,42 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
     //     Abgleich laeuft spaeter in SetCameraOutput; gleiche Enumeration).
     //     Liefert er einen anderen (z. B. YUY2 720p@60, das bei
     //     „Bild/Rate erfuellt" den Zuschlag bekaeme), bleibt alles wie bisher.
-    //  4. Rueckfall: StartCapture scheitert oder die Kamera liefert in den
-    //     ersten Sekunden < 80 % der Wunschrate -> einmal mit der alten
-    //     Faehigkeit neu starten (Kameras, die bei erzwungener Rate schwarz
-    //     bleiben oder nur 5 fps liefern).
+    //  4. Rueckfall: StartCapture scheitert, kein Bild nach 10 s, oder ab
+    //     ~3 s nach dem ersten Bild ZWEI 2-s-Fenster nacheinander < 50 % der
+    //     Wunschrate -> einmal mit der alten Faehigkeit neu starten (Kameras,
+    //     die bei erzwungener Rate schwarz bleiben oder nur ~5 fps liefern).
+    //     Danach wird fuer diese Kamera im Prozess nicht mehr gesenkt.
+    //  5. (S1) Nur bei NICHT ganzzahligem Verhaeltnis (90->60, 50->30). Bei
+    //     60->30 (und der Capture-Karte) verwirft der Adapter gleichmaessig
+    //     2:1 — kein Ruckeln; ein echter 30er-Modus liesse die Auto-Belichtung
+    //     bis 1/30 s und tiefer gehen (altes 30->24->15-Muster).
     rueckfall_cap_ = capability_;
     rate_gesenkt_ = false;
     wunsch_fps_ = wantF;
-    if (wantF > 0 && best.maxFPS > wantF) {
-      const CamRaten raten =
-          CamRatenPruefen(unique_name_.c_str(), best.width, best.height,
-                          best.videoType, best.maxFPS, wantF);
+    if (wantF > 0 && best.maxFPS > wantF && best.maxFPS % wantF == 0) {
+      CamPuffer(&block, "Rate unveraendert %d (Wunsch %d): ganzzahliges "
+                "Verhaeltnis, Adapter verwirft gleichmaessig", best.maxFPS,
+                wantF);
+    } else if (wantF > 0 && best.maxFPS > wantF &&
+               CamSenkungGescheitert(unique_name_)) {
+      CamPuffer(&block, "Rate unveraendert %d (Wunsch %d): Senkung fuer diese "
+                "Kamera in diesem Prozess schon gescheitert", best.maxFPS,
+                wantF);
+    } else if (wantF > 0 && best.maxFPS > wantF) {
+      std::string raten_detail;
+      int64_t raten_ms = 0;
+      const CamRaten raten = CamRatenPruefen(
+          unique_name_.c_str(), best.width, best.height, best.videoType,
+          best.maxFPS, wantF, liste_neu ? &raten_detail : nullptr, &raten_ms);
+      block += raten_detail;
+      CamPuffer(&block, "Raten: Urteil fuer %dx%d %s @%d (Wunsch %d): %s (%lldms)",
+                best.width, best.height, CamVideoTypeName(best.videoType),
+                best.maxFPS, wantF, CamRatenName(raten), (long long)raten_ms);
       const bool versuchen =
           raten == CamRaten::kWunschDa || raten == CamRaten::kNichtLesbar;
       if (!versuchen) {
-        CamLog("Rate unveraendert %d (Wunsch %d): %s", best.maxFPS, wantF,
-               CamRatenName(raten));
+        CamPuffer(&block, "Rate unveraendert %d (Wunsch %d): %s", best.maxFPS,
+                  wantF, CamRatenName(raten));
       } else {
         VideoCaptureCapability probe = best;
         probe.maxFPS = wantF;
@@ -690,14 +765,14 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
         if (idx_alt >= 0 && idx_neu == idx_alt) {
           capability_.maxFPS = wantF;
           rate_gesenkt_ = true;
-          CamLog("Rate auf %d gesetzt (Kamera bot %d)%s [Abgleich idx %d, gewaehlt cap#%d]",
+          CamPuffer(&block, "Rate auf %d gesetzt (Kamera bot %d)%s [Abgleich idx %d, gewaehlt cap#%d]",
                  wantF, best.maxFPS,
                  raten == CamRaten::kNichtLesbar
                      ? " — Ratenliste nicht lesbar, Versuch mit Rueckfall"
                      : "",
                  idx_neu, best_index);
         } else {
-          CamLog("Rate unveraendert %d: Abgleich mit %d waehlt anderes Format "
+          CamPuffer(&block, "Rate unveraendert %d: Abgleich mit %d waehlt anderes Format "
                  "(idx %d = %dx%d@%d %s statt idx %d = %dx%d@%d %s)",
                  best.maxFPS, wantF, idx_neu, res_neu.width, res_neu.height,
                  res_neu.maxFPS, CamVideoTypeName(res_neu.videoType), idx_alt,
@@ -706,6 +781,8 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
         }
       }
     }
+    kamera_fps_log_.store(capability_.maxFPS, std::memory_order_relaxed);
+    CamPufferSchreiben(&block);
 #endif
   } else {
     // Fallback: alte Heuristik (Index 0 + Wunschwerte, I420-Konvertierung).
@@ -715,6 +792,8 @@ bool VcmCapturer::Init(size_t width, size_t height, size_t target_fps,
     capability_.maxFPS = wantF;
     capability_.videoType = VideoType::kI420;
 #ifdef _WIN32
+    CamPufferSchreiben(&block);
+    kamera_fps_log_.store(capability_.maxFPS, std::memory_order_relaxed);
     CamLog("Init: keine Caps gefunden (%d) -> Fallback %dx%d@%d I420", ncaps,
            wantW, wantH, wantF);
 #endif
@@ -752,7 +831,9 @@ bool VcmCapturer::StartCapture() {
     CamLog("Rueckfall auf %d: StartCapture mit %d FEHLGESCHLAGEN",
            rueckfall_cap_.maxFPS, capability_.maxFPS);
     rate_gesenkt_ = false;
+    CamSenkungGescheitertMerken(unique_name_);
     capability_ = rueckfall_cap_;
+    kamera_fps_log_.store(capability_.maxFPS, std::memory_order_relaxed);
     result = worker_thread_->BlockingCall(
         [&] { return vcm_->StartCapture(capability_); });
   }
@@ -777,13 +858,13 @@ bool VcmCapturer::StartCapture() {
          capability_.width, capability_.height, capability_.maxFPS,
          CamVideoTypeName(capability_.videoType), (long long)start_ms,
          (long long)cap_map_ms_);
-  // Rueckfall Teil 2: gesenkte Rate lief an -> nach ~2+2 s nachmessen.
+  // Rueckfall Teil 2: gesenkte Rate lief an -> nachmessen (PlaneRatenPruefung).
   // Frischer Lebt-Merker je Start; StopCapture setzt ihn auf dem
   // worker_thread_ auf false (dort laufen auch die verzoegerten Aufgaben).
   worker_thread_->BlockingCall([&] {
     if (pruef_lebt_) pruef_lebt_->store(false);  // Reste frueherer Starts
     pruef_lebt_ = std::make_shared<std::atomic<bool>>(true);
-    if (rate_gesenkt_) PlaneRatenPruefung(pruef_lebt_, 0, 0, 0);
+    if (rate_gesenkt_) PlaneRatenPruefung(pruef_lebt_, 0, 0, 0, 0);
   });
   // id34 „Framerate <-> Helligkeit" (opt-in): flutter_webrtc setzt die
   // Prozess-Umgebungsvariable via Win32-SetEnvironmentVariableA — im selben
@@ -942,7 +1023,8 @@ void VcmCapturer::TaktZusammenfassen(int64_t jetzt_qpc) {
                 "Kamera @%d, min/mittel/max/p95)",
                 ein.n, ein.min_ms, ein.mittel_ms, ein.max_ms, ein.p95_ms,
                 aus.n, aus.min_ms, aus.mittel_ms, aus.max_ms, aus.p95_ms,
-                aus.ueber, soll_ms, capability_.maxFPS);
+                aus.ueber, soll_ms,
+                kamera_fps_log_.load(std::memory_order_relaxed));
   ein_n_ = aus_n_ = 0;
   ein_pos_ = aus_pos_ = 0;
   takt_fenster_qpc_ = jetzt_qpc;
@@ -955,50 +1037,77 @@ void VcmCapturer::TaktZusammenfassen(int64_t jetzt_qpc) {
 
 void VcmCapturer::PlaneRatenPruefung(
     std::shared_ptr<std::atomic<bool>> lebt, int runde, uint32_t n_vorher,
-    int64_t qpc_vorher) {
+    int64_t qpc_vorher, int unter) {
 #ifdef _WIN32
-  // Ablauf (alles auf worker_thread_):
-  //  - alle 2 s nachsehen; erst wenn Bilder fliessen, einen Messpunkt setzen,
-  //    2 s spaeter die Rate des Fensters dazwischen beurteilen (die ersten
-  //    Bilder nach dem Anlauf zaehlen also nicht mit — Belichtungs-Anlauf).
-  //  - < 80 % der Wunschrate -> RateRueckfall (genau einmal).
-  //  - nach 10 s noch kein Bild -> RateRueckfall („schwarz").
+  // Ablauf (alles auf worker_thread_, Takt 1 s; Pruefbefund M1):
+  //  - kein Bild nach 10 s -> RateRueckfall („schwarz").
+  //  - die ersten ~3 s nach dem ersten Bild zaehlen nicht (Belichtungs-Anlauf).
+  //  - danach 2-s-Fenster messen; ZWEI Fenster nacheinander < 50 % der
+  //    Wunschrate -> RateRueckfall. Schwelle bewusst niedrig: echte
+  //    Fehlerbilder sind schwarz oder ~5 fps; wenig Licht (30 statt 60) soll
+  //    NICHT zurueckfallen, weil der unveraenderte Modus dann genauso begrenzt
+  //    ist.
+  //  - ein Fenster >= 50 % beendet die Pruefung: > 1,15x Wunsch = Senkung
+  //    wirkungslos (Kamera ignoriert die Ratensteuerung, N2), sonst bestaetigt.
   worker_thread_->PostDelayedTask(
-      [this, lebt, runde, n_vorher, qpc_vorher] {
+      [this, lebt, runde, n_vorher, qpc_vorher, unter] {
         if (!lebt || !lebt->load() || !vcm_ || !rate_gesenkt_) return;
         const int64_t jetzt = HcQpc();
         const uint32_t n = bilder_gesamt_.load(std::memory_order_relaxed);
-        const bool fliesst =
-            erstes_bild_qpc_.load(std::memory_order_relaxed) != 0;
-        if (qpc_vorher == 0) {
-          if (fliesst) {
-            PlaneRatenPruefung(lebt, runde + 1, n, jetzt);
-          } else if (runde >= 4) {
+        const int64_t erstes =
+            erstes_bild_qpc_.load(std::memory_order_relaxed);
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        const int64_t freq = f.QuadPart > 0 ? f.QuadPart : 1;
+        if (erstes == 0) {
+          if (runde >= 10) {
             RateRueckfall("nach 10 s kein Bild");
           } else {
-            PlaneRatenPruefung(lebt, runde + 1, 0, 0);
+            PlaneRatenPruefung(lebt, runde + 1, 0, 0, 0);
           }
           return;
         }
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        const double sek =
-            static_cast<double>(jetzt - qpc_vorher) /
-            static_cast<double>(f.QuadPart > 0 ? f.QuadPart : 1);
+        if (qpc_vorher == 0) {
+          // Anlauf abwarten, dann ersten Messpunkt setzen.
+          if (jetzt - erstes >= 3 * freq)
+            PlaneRatenPruefung(lebt, runde + 1, n, jetzt, 0);
+          else
+            PlaneRatenPruefung(lebt, runde + 1, 0, 0, 0);
+          return;
+        }
+        if (jetzt - qpc_vorher < 2 * freq) {
+          PlaneRatenPruefung(lebt, runde + 1, n_vorher, qpc_vorher, unter);
+          return;
+        }
+        const double sek = static_cast<double>(jetzt - qpc_vorher) /
+                           static_cast<double>(freq);
         const double fps = sek > 0 ? (n - n_vorher) / sek : 0.0;
-        if (fps < 0.8 * wunsch_fps_) {
-          char grund[96];
-          std::snprintf(grund, sizeof(grund),
-                        "geliefert %.1f fps < 80%% von %d (Fenster %.1f s)",
-                        fps, wunsch_fps_, sek);
-          RateRueckfall(grund);
+        if (fps < 0.5 * wunsch_fps_) {
+          if (unter + 1 >= 2) {
+            char grund[112];
+            std::snprintf(grund, sizeof(grund),
+                          "geliefert %.1f fps < 50%% von %d in zwei Fenstern "
+                          "(je %.1f s)",
+                          fps, wunsch_fps_, sek);
+            RateRueckfall(grund);
+          } else {
+            CamLog("Rate %d: Fenster 1 nur %.1f fps (%.1f s) -> zweites "
+                   "Fenster", wunsch_fps_, fps, sek);
+            PlaneRatenPruefung(lebt, runde + 1, n, jetzt, unter + 1);
+          }
+          return;
+        }
+        rate_gesenkt_ = false;  // Pruefung beendet
+        if (fps > 1.15 * wunsch_fps_) {
+          CamLog("Senkung wirkungslos (liefert %.1f fps statt %d, Fenster "
+                 "%.1f s) — Kamera ignoriert die Ratensteuerung",
+                 fps, wunsch_fps_, sek);
         } else {
-          rate_gesenkt_ = false;  // bestaetigt, keine weitere Pruefung
           CamLog("Rate %d bestaetigt: geliefert %.1f fps (Fenster %.1f s)",
                  wunsch_fps_, fps, sek);
         }
       },
-      webrtc::TimeDelta::Seconds(2));
+      webrtc::TimeDelta::Seconds(1));
 #endif
 }
 
@@ -1006,13 +1115,17 @@ void VcmCapturer::RateRueckfall(const char* grund) {
 #ifdef _WIN32
   // worker_thread_ (wie StartCapture/StopCapture via BlockingCall). Hoechstens
   // einmal je Kamera-Start: rate_gesenkt_ wird vorher geloescht, und
-  // PlaneRatenPruefung laeuft nur, solange es gesetzt ist.
+  // PlaneRatenPruefung laeuft nur, solange es gesetzt ist. Zusaetzlich merkt
+  // sich der Prozess die Kamera (M1): kein erneuter Senkversuch beim
+  // naechsten Start.
   rate_gesenkt_ = false;
   if (!vcm_) return;
   CamLog("Rueckfall auf %d: %s", rueckfall_cap_.maxFPS, grund);
+  CamSenkungGescheitertMerken(unique_name_);
   const int64_t t0 = static_cast<int64_t>(GetTickCount64());
   vcm_->StopCapture();
   capability_ = rueckfall_cap_;
+  kamera_fps_log_.store(capability_.maxFPS, std::memory_order_relaxed);
   // capability != _requestedCapability -> VideoCaptureDS baut den Graphen mit
   // der alten Faehigkeit neu (DisconnectGraph + SetCameraOutput).
   const int32_t r = vcm_->StartCapture(capability_);
