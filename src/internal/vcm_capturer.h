@@ -56,7 +56,7 @@ class VcmCapturer : public VideoCapturer,
   // worker_thread_ eine Messung ein; liefert die Kamera zu wenig, einmal
   // Rueckfall auf die unveraenderte Faehigkeit. Nur auf worker_thread_.
   void PlaneRatenPruefung(std::shared_ptr<std::atomic<bool>> lebt, int runde,
-                          uint32_t n_vorher, int64_t qpc_vorher);
+                          uint32_t n_vorher, int64_t qpc_vorher, int unter);
   void RateRueckfall(const char* grund);
   // Takt-Ringfeld auswerten und (ueber den worker_thread_) ins cam.log geben.
   void TaktZusammenfassen(int64_t jetzt_qpc);
@@ -92,6 +92,9 @@ class VcmCapturer : public VideoCapturer,
   // Vom Aufnahme-Faden geschrieben, vom worker_thread_ gelesen.
   std::atomic<uint32_t> bilder_gesamt_{0};
   std::atomic<int64_t> erstes_bild_qpc_{0};
+  // N1: Kamera-Rate fuer die Takt-Zeile (Streaming-Faden liest; Init,
+  // StartCapture und RateRueckfall schreiben) — statt capability_.maxFPS.
+  std::atomic<int> kamera_fps_log_{0};
 
   // --- Takt-Messung (nur Aufnahme-Faden) ----------------------------------
   // Annahme Einzelfaden: OnFrame und NachAdapterBild laufen beide auf dem
