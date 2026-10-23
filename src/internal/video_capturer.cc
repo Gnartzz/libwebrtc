@@ -49,6 +49,9 @@ void VideoCapturer::OnFrame(const VideoFrame& frame) {
     return;
   }
 
+  // Takt-Messpunkt „aus" (nur Kamera-Unterklassen werten das aus).
+  NachAdapterBild();
+
   if (out_height != frame.height() || out_width != frame.width()) {
     // Video adapter has requested a down-scale. Allocate a new buffer and
     // return scaled version.
