@@ -193,6 +193,11 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   uint32_t gesendet_bilder_5s_ = 0;
   // Seit wann die Unterschuss-Lage durchgehend besteht (0 = nicht).
   int64_t unterschuss_seit_ms_ = 0;
+  // Wann zuletzt „runter" neu aufgesetzt wurde (0 = nie). Danach ist die
+  // Unterschuss-Hebung kNachRunterMs gesperrt — die Schätzung springt nach
+  // einem Stau noch (Prüfbefund M2).
+  static constexpr int64_t kNachRunterMs = 20000;
+  int64_t runter_ms_ = 0;
   // Zeitmessung je Phase (Mikrosekunden), alle fünf Sekunden ins hwenc.log.
   int64_t zeit_i420_us_ = 0;
   int64_t zeit_nv12_us_ = 0;

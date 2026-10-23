@@ -348,6 +348,7 @@ int HwH264Encoder::InitEncode(
   bildrate_seit_ms_ = 0;
   hoch_seit_ms_ = 0;
   haengt_seit_ms_ = 0;
+  runter_ms_ = 0;
   aufsetzen_ausstehend_ = false;
   target_bitrate_bps_ = codec_settings->startBitrate * 1000;
   max_bitrate_bps_ = codec_settings->maxBitrate * 1000;
@@ -1096,9 +1097,11 @@ void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrat
   // ── 0. GESENDETE RATE (hwenc.11) ──
   // Fünf Sekundenfächer; das laufende Fach füllt `PaketeAbholen`. Ist eine
   // Sekunde um, wandert es in den Ring. Erst wenn alle fünf Fächer nach dem
-  // letzten Öffnen voll sind, gibt es eine Zahl — ein halbes Fenster mit dem
-  // Vollbild des Öffnens wäre keine Messung. Stand `Encode` länger als das
-  // Fenster still (Freigabe pausiert), beginnt die Zählung von vorn.
+  // letzten Öffnen voll sind, gibt es eine Zahl. ★ Das ERSTE volle Fenster
+  // enthält noch das Vollbild des Öffnens (Prüfbefund N1) — es misst also
+  // eher zu hoch, und ein Unterschuss wird dann später erkannt, nie
+  // fälschlich. Stand `Encode` länger als das Fenster still (Freigabe
+  // pausiert), beginnt die Zählung von vorn.
   if (aus_beginn_ms_ == 0) {
     aus_beginn_ms_ = jetzt;
   } else if (jetzt - aus_beginn_ms_ > (kAusFaecher + 1) * 1000LL) {
@@ -1201,30 +1204,43 @@ void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrat
   // ≲ 0,78 trägt die Folge nicht mehr).
   //
   // Die Lage: WebRTC fordert MEHR (≥ 1,1× Encoder-Ziel), der Encoder liefert
-  // WENIGER (< 0,85× Ziel, gemessen über 5 s), und es kommen ≥ 15 Bilder/s —
-  // durchgehend fünf Sekunden, Anlaufphase vorbei. Dann neu aufsetzen auf
+  // WENIGER (< 0,85× Ziel, gemessen über 5 s), aber nicht fast nichts
+  // (≥ 0,5× Ziel), es kommen ≥ 15 Bilder/s, und das letzte „runter" liegt
+  // ≥ 20 s zurück — durchgehend fünf Sekunden, Anlaufphase vorbei. Dann neu
+  // aufsetzen auf
   // min(Forderung, Ziel × Ziel / gesendet), mindestens 1,1× Ziel, NIE über
   // die rohe Forderung (`UnterschussZiel`).
   //
-  // ★ WARUM KEIN STATISCHER BILDSCHIRM AUSLÖST: Ein ruhender Bildschirm
-  // liefert 1–5 Bilder/s (Bildraten-Tor), und die app-limitierte Schätzung
-  // fordert bei ruhigem Bild nicht mehr, als der Encoder schon hat. Selbst
-  // wenn: Das Ziel steigt höchstens bis an die Forderung, danach braucht
+  // ★ WARUM KEIN STATISCHER BILDSCHIRM AUSLÖST: ANNAHME (nicht gemessen):
+  // Ein ruhender Bildschirm liefert nur 1–5 Bilder/s (Bildraten-Tor). Darauf
+  // allein ist kein Verlass — ein Capturer kann auch unveränderte Bilder mit
+  // voller Rate schicken, eine ruhende Kamera tut es sicher (Prüfbefund M1).
+  // Deshalb die Untergrenze gesendet ≥ 0,5× Ziel: Intels Unterschuss lag
+  // gemessen bei 0,76–0,78×, ruhiger Inhalt gibt nahe 0 aus. Selbst wenn es
+  // auslöst: Das Ziel steigt höchstens bis an die Forderung, danach braucht
   // der nächste Schritt wieder 10 % MEHR Forderung, also echtes Wachstum.
+  //
+  // ★ 20 s NACH EINEM „runter" GESPERRT (Prüfbefund M2): Direkt nach einem
+  // Stau springt die Schätzung noch. Am Log: 22:53:28 runter auf 793, eine
+  // Hebung wäre um ~22:53:38 gekommen, und um 22:53:39 fiel die Forderung
+  // auf 525. Gilt auch für den Merk-/Nachholpfad, weil beide nur über
+  // diese Lage gehen.
   //
   // ★ WARUM KEINE NEUE ÜBERLAST: Das Ziel bleibt ≤ Forderung, und die
   // Forderung ist das, was die Staukontrolle freigibt. Ein Treiber, der
   // trifft oder überschießt, löst nie aus (gesendet ≥ 0,85× Ziel).
   //
   // ★ DER KREIS VOM 21.09. lief abwärts; hier geht es nur aufwärts, höchstens
-  // alle ~10 s (5 s Fenster nach dem Öffnen + 5 s Lage), und abwärts gilt
-  // weiter 2× / 10 s.
+  // alle ~10 s (5 s Fenster nach dem Öffnen + 5 s Lage), nach einem „runter"
+  // frühestens nach 20 s, und abwärts gilt weiter 2× / 10 s.
   {
     const uint64_t z = target_bitrate_bps_;
     const bool lage = jetzt >= anlauf_bis_ms_ && gesendet_bps_ > 0 && z > 0 &&
                       gesendet_bilder_5s_ >= 15u * kAusFaecher &&
+                      (runter_ms_ == 0 || jetzt - runter_ms_ >= kNachRunterMs) &&
                       static_cast<uint64_t>(forderung_roh_) * 10 >= z * 11 &&
-                      static_cast<uint64_t>(gesendet_bps_) * 100 < z * 85;
+                      static_cast<uint64_t>(gesendet_bps_) * 100 < z * 85 &&
+                      static_cast<uint64_t>(gesendet_bps_) * 2 >= z;
     if (!lage) {
       unterschuss_seit_ms_ = 0;
     } else if (unterschuss_seit_ms_ == 0) {
@@ -1288,6 +1304,8 @@ void HwH264Encoder::VaapiNeuAufsetzen(uint32_t neu, uint32_t gefordert, bool hoc
             gefordert_offen_ / 1000, static_cast<long long>(jetzt - letztes_aufsetzen_ms_));
   target_bitrate_bps_ = soll;
   gefordert_offen_ = gefordert;
+  // hwenc.11 (Prüfbefund M2): Uhr für die Unterschuss-Sperre nach „runter".
+  if (runter) runter_ms_ = jetzt;
   // Neue Bezugswerte — alle Uhren beginnen von vorn.
   bildrate_richtung_ = 0;
   bildrate_seit_ms_ = 0;
