@@ -48,6 +48,14 @@ class VideoCapturer : public webrtc::VideoSourceInterface<VideoFrame> {
  protected:
   webrtc::VideoSinkWants GetSinkWants();
 
+  // Takt-Messpunkt (2026-10-23, Mikroruckler-Analyse): wird in OnFrame genau
+  // dann aufgerufen, wenn ein NICHT-nativer Frame den VideoAdapter passiert hat
+  // (AdaptFrameResolution == true), also wirklich an die Senken geht. Native
+  // GPU-Frames (Bildschirm-Zero-Copy) laufen am Adapter vorbei und rufen das
+  // nie auf. Standard: nichts tun; nur VcmCapturer (Kamera/Capture-Karte)
+  // ueberschreibt es. Laeuft im Bildpfad: keine Allokation, keine Sperre.
+  virtual void NachAdapterBild() {}
+
  private:
   void UpdateVideoAdapter();
 
