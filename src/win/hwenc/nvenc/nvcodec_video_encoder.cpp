@@ -26,6 +26,8 @@
 
 // WebRTC
 #include <api/scoped_refptr.h>
+#include <api/task_queue/task_queue_base.h>
+#include <api/units/time_delta.h>
 #include <api/video/encoded_image.h>
 #include <api/video/nv12_buffer.h>
 #include <api/video/render_resolution.h>
@@ -266,6 +268,36 @@ class NvCodecVideoEncoderImpl : public NvCodecVideoEncoder {
   // Wiederoeffnen, CPU-Bild), muss ein IDR kommen — die GOP ist unendlich, der
   // Empfaenger saehe sonst P-Bilder einer fremden Referenzkette (Befund M1).
   NvEncoder* letzter_enc_ = nullptr;
+
+  // ★ HoneyCord Leerlauf (okunoku 23.10.2026, Buendel 106): Endet eine
+  // Bildschirmfreigabe (Unpublish), ruft WebRTC weder Release() noch den
+  // Destruktor — der Encoder lebt bis zum Ende der PeerConnection, seine
+  // NVENC-Sitzung blieb offen (Zaehler je Freigabe +1, NVML 2/3/4), nach
+  // ~7 Freigaben waere das Kontingent voll (Fehler 21 -> VP8 in Software).
+  // Daher: kam laenger als kLeerlaufMs kein Bild an Encode(), schliesst der
+  // Encoder BEIDE Sitzungen selbst; initialisiert_ bleibt true, das naechste
+  // Bild oeffnet lazily neu (Encoderwechsel -> IDR). Gilt auch fuer die
+  // Kamera und fuer eine dynacast-Pause (Rate 0, keine Bilder).
+  //
+  // Zeitgeber: ein verzoegerter Task auf der Encoder-TaskQueue (dieselbe
+  // Queue, auf der Encode/SetRates laufen -> kein gleichzeitiger Zugriff,
+  // siehe VideoStreamEncoder::EncodeVideoFrame, RTC_DCHECK_RUN_ON
+  // (encoder_queue_)). Der Anker schuetzt vor einem Task, der nach dem
+  // Destruktor faellig wird: der Destruktor setzt `self` unter `m` auf
+  // nullptr, der Task arbeitet nur unter `m` und nur mit gueltigem `self`.
+  struct LeerlaufAnker {
+    std::mutex m;
+    NvCodecVideoEncoderImpl* self = nullptr;
+  };
+  static constexpr uint64_t kLeerlaufMs = 3000;
+  std::shared_ptr<LeerlaufAnker> leerlauf_anker_;
+  uint64_t letztes_bild_ms_ = 0;   // GetTickCount64 des letzten echten Bildes
+  bool leerlauf_geplant_ = false;  // ein Leerlauf-Task steht aus
+  bool leerlauf_ohne_queue_gemeldet_ = false;
+  void LeerlaufPlanen(webrtc::TaskQueueBase* queue, uint64_t verzoegerung_ms);
+  void LeerlaufTakt();
+  void LeerlaufSchliessen(uint64_t seit_ms, const char* quelle);
+  bool SitzungOffen() const { return nv_encoder_ || nv_encoder_native_; }
 #endif
 #ifdef __linux__
   std::unique_ptr<NvCodecVideoEncoderCuda> cuda_;
@@ -290,6 +322,8 @@ NvCodecVideoEncoderImpl::NvCodecVideoEncoderImpl(
     CudaVideoCodec codec)
     : cuda_context_(cuda_context), codec_(codec), bitrate_adjuster_(0.5, 0.95) {
 #ifdef _WIN32
+  leerlauf_anker_ = std::make_shared<LeerlaufAnker>();
+  leerlauf_anker_->self = this;
   // HoneyCord: enumerate adapters and pick the NVIDIA one explicitly. Used
   // to be EnumAdapters(0) which breaks on hybrid systems (Optimus / iGPU +
   // dGPU) AND on machines where Windows lists a "Microsoft Basic Display
@@ -342,6 +376,14 @@ NvCodecVideoEncoderImpl::NvCodecVideoEncoderImpl(
 }
 
 NvCodecVideoEncoderImpl::~NvCodecVideoEncoderImpl() {
+#ifdef _WIN32
+  // Leerlauf-Task entwaffnen, bevor die Sitzungen fallen (wartet ggf., bis ein
+  // gerade laufender Task fertig ist).
+  if (leerlauf_anker_) {
+    std::lock_guard<std::mutex> lock(leerlauf_anker_->m);
+    leerlauf_anker_->self = nullptr;
+  }
+#endif
   // ★ #144: ueber ReleaseNvEnc schliessen, damit der Sitzungszaehler stimmt
   // (vorher raeumten nur die unique_ptr-Destruktoren still ab).
   try {
@@ -515,6 +557,37 @@ int32_t NvCodecVideoEncoderImpl::Encode(
         << "has not been set with RegisterEncodeCompleteCallback()";
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
   }
+
+  // ★ Leerlauf: Leere Bilder (kEmptyFrame) VOR dem Oeffnen der Sitzungen
+  // abweisen — sonst oeffnete ein leeres Bild eine im Leerlauf geschlossene
+  // Sitzung wieder, ohne etwas zu kodieren. (Frueher stand die Pruefung erst
+  // hinter EnsureNv12Encoder/EnsureNativeEncoder und dem Reconfigure; ein
+  // ausstehendes Reconfigure greift jetzt beim naechsten echten Bild.)
+  if (frame_types != nullptr && !frame_types->empty() &&
+      (*frame_types)[0] == webrtc::VideoFrameType::kEmptyFrame) {
+    static int s_empty_counter = 0;
+    if ((s_empty_counter++ % 60) == 0) {
+      NvProbeLog("Encode: kEmptyFrame #%d -> return OK no encode", s_empty_counter);
+    }
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
+
+#ifdef _WIN32
+  // ★ Leerlauf: einziger Aufwand pro Bild = Zeitstempel (+ Planen, falls
+  // gerade kein Task aussteht, also hoechstens alle ~3 s).
+  letztes_bild_ms_ = GetTickCount64();
+  if (!leerlauf_geplant_) {
+    webrtc::TaskQueueBase* queue = webrtc::TaskQueueBase::Current();
+    if (queue != nullptr) {
+      leerlauf_geplant_ = true;
+      LeerlaufPlanen(queue, kLeerlaufMs);
+    } else if (!leerlauf_ohne_queue_gemeldet_) {
+      leerlauf_ohne_queue_gemeldet_ = true;
+      NvProbeLog("Leerlauf: Encode ohne TaskQueue (Current()==null) this=%p -> "
+                 "Pruefung nur bei SetRates", (void*)this);
+    }
+  }
+#endif
 
 #if defined(__linux__)
   if (frame.video_frame_buffer()->type() ==
@@ -932,6 +1005,16 @@ void NvCodecVideoEncoderImpl::SetRates(
     return;
   }
 
+#ifdef _WIN32
+  // ★ Leerlauf-Rueckfall: Lief Encode() nie auf einer TaskQueue (kein
+  // Zeitgeber geplant), wird hier geprueft — z. B. bei der Rate 0, die
+  // LiveKit/WebRTC beim Abmelden bzw. in einer dynacast-Pause setzt.
+  if (!leerlauf_geplant_ && letztes_bild_ms_ != 0 && SitzungOffen()) {
+    const uint64_t seit = GetTickCount64() - letztes_bild_ms_;
+    if (seit >= kLeerlaufMs) LeerlaufSchliessen(seit, "SetRates");
+  }
+#endif
+
   if (parameters.framerate_fps < 1.0) {
     RTC_LOG(LS_WARNING) << "Invalid frame rate: " << parameters.framerate_fps;
     return;
@@ -1017,9 +1100,13 @@ int32_t NvCodecVideoEncoderImpl::InitNvEnc() {
 bool NvCodecVideoEncoderImpl::EnsureNv12Encoder() {
   if (nv_encoder_) return true;
   if (!id3d11_device_) return false;
+  // Wiederoeffnen nach Leerlauf/dynacast-Pause: nie mit avg=0 oeffnen (wie
+  // EnsureNativeEncoder, Befund N1); das naechste SetRates regelt nach.
+  const uint32_t start_br = target_bitrate_bps_ ? target_bitrate_bps_ : 1000000;
+  const uint32_t max_br = max_bitrate_bps_ > start_br ? max_bitrate_bps_ : start_br;
   nv_encoder_ = CreateEncoder(
-      codec_, width_, height_, framerate_, target_bitrate_bps_,
-      max_bitrate_bps_, id3d11_device_.Get(), id3d11_texture_.GetAddressOf());
+      codec_, width_, height_, framerate_ >= 1 ? framerate_ : 30, start_br,
+      max_br, id3d11_device_.Get(), id3d11_texture_.GetAddressOf());
   if (!nv_encoder_) {
     id3d11_texture_.Reset();
     NvProbeLog("NVENC Oeffnen fehlgeschlagen kind=nv12 this=%p offen=%d",
@@ -1063,6 +1150,59 @@ void NvCodecVideoEncoderImpl::NativeSchliessen(const char* grund) {
   }
   native_context_.Reset();
   native_device_.Reset();
+}
+
+// ★ Leerlauf: einmaliger Task, der sich selbst neu plant, solange eine
+// Sitzung offen ist. Bei laufendem Strom ~ein Task je 3 s und Encoder.
+void NvCodecVideoEncoderImpl::LeerlaufPlanen(webrtc::TaskQueueBase* queue,
+                                             uint64_t verzoegerung_ms) {
+  std::shared_ptr<LeerlaufAnker> anker = leerlauf_anker_;
+  queue->PostDelayedTask(
+      [anker] {
+        std::lock_guard<std::mutex> lock(anker->m);
+        if (anker->self == nullptr) return;  // Encoder bereits zerstoert
+        anker->self->LeerlaufTakt();
+      },
+      webrtc::TimeDelta::Millis(static_cast<int64_t>(verzoegerung_ms)));
+}
+
+void NvCodecVideoEncoderImpl::LeerlaufTakt() {
+  if (!SitzungOffen()) {
+    // Nichts offen (Release, schon geschlossen): Zeitgeber ruht, das naechste
+    // echte Bild plant neu.
+    leerlauf_geplant_ = false;
+    return;
+  }
+  const uint64_t seit = GetTickCount64() - letztes_bild_ms_;
+  if (seit >= kLeerlaufMs) {
+    LeerlaufSchliessen(seit, "Zeitgeber");
+    leerlauf_geplant_ = false;
+    return;
+  }
+  webrtc::TaskQueueBase* queue = webrtc::TaskQueueBase::Current();
+  if (queue == nullptr) {
+    leerlauf_geplant_ = false;
+    return;
+  }
+  uint64_t rest = kLeerlaufMs - seit;
+  if (rest < 100) rest = 100;
+  LeerlaufPlanen(queue, rest);
+}
+
+void NvCodecVideoEncoderImpl::LeerlaufSchliessen(uint64_t seit_ms,
+                                                 const char* quelle) {
+  NvProbeLog("Leerlauf: %llu ms ohne Bild (%s) this=%p -> NVENC-Sitzungen "
+             "schliessen, naechstes Bild oeffnet neu (IDR)",
+             (unsigned long long)seit_ms, quelle, (void*)this);
+  NativeSchliessen("Leerlauf");
+  Nv12Schliessen("Leerlauf");
+  // Beide Schliessen loesen letzter_enc_ schon; hier ausdruecklich, damit der
+  // Encoderwechsel beim naechsten Bild IMMER ein IDR erzwingt (ein neuer
+  // Encoder koennte an derselben Adresse liegen wie der alte).
+  letzter_enc_ = nullptr;
+  native_folge_ = 0;
+  native_naechster_versuch_ms_ = 0;
+  // initialisiert_ bleibt true: InitEncode ist weiter gueltig.
 }
 #endif
 
