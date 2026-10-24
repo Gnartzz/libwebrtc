@@ -261,6 +261,17 @@ class NvCodecVideoEncoderImpl : public NvCodecVideoEncoder {
   // Bild neu versuchen (Buendel 98: 587 Versuche in 10 s), sondern hoechstens
   // alle 2 s; dazwischen kodiert der NV12-Encoder ueber den Readback.
   uint64_t native_naechster_versuch_ms_ = 0;
+  // Dieselbe Drossel fuer den NV12-Oeffnungsweg im Encode (Gutachten M1):
+  // ist das Kontingent beim Wiederoeffnen nach Leerlauf voll, wuerde sonst bei
+  // JEDEM Bild neu versucht (Staging-Textur + Oeffnen + Protokollzeilen).
+  // Nach kNv12FehlversucheMax Fehlversuchen in Folge meldet Encode einmal
+  // WEBRTC_VIDEO_CODEC_ENCODER_FAILURE — nur darauf wechselt WebRTC M144 den
+  // Encoder (video_stream_encoder.cc:2219-2226); bei CODEC_ERROR friert das
+  // Bild ein. Zaehler bei Erfolg zurueck auf 0.
+  uint64_t nv12_naechster_versuch_ms_ = 0;
+  int nv12_fehlversuche_ = 0;
+  static constexpr int kNv12FehlversucheMax = 3;
+  int32_t Nv12ImEncodeOeffnen();
   // Erst nach so vielen Zero-Copy-Bildern in Folge den NV12-Encoder schliessen
   // (kein Hin und Her, falls Quellen kurz CPU-Bilder liefern).
   int native_folge_ = 0;
@@ -295,6 +306,7 @@ class NvCodecVideoEncoderImpl : public NvCodecVideoEncoder {
   bool leerlauf_geplant_ = false;  // ein Leerlauf-Task steht aus
   bool leerlauf_ohne_queue_gemeldet_ = false;
   void LeerlaufPlanen(webrtc::TaskQueueBase* queue, uint64_t verzoegerung_ms);
+  void LeerlaufZeitgeberStarten(const char* quelle);
   void LeerlaufTakt();
   void LeerlaufSchliessen(uint64_t seit_ms, const char* quelle);
   bool SitzungOffen() const { return nv_encoder_ || nv_encoder_native_; }
@@ -575,18 +587,7 @@ int32_t NvCodecVideoEncoderImpl::Encode(
 #ifdef _WIN32
   // ★ Leerlauf: einziger Aufwand pro Bild = Zeitstempel (+ Planen, falls
   // gerade kein Task aussteht, also hoechstens alle ~3 s).
-  letztes_bild_ms_ = GetTickCount64();
-  if (!leerlauf_geplant_) {
-    webrtc::TaskQueueBase* queue = webrtc::TaskQueueBase::Current();
-    if (queue != nullptr) {
-      leerlauf_geplant_ = true;
-      LeerlaufPlanen(queue, kLeerlaufMs);
-    } else if (!leerlauf_ohne_queue_gemeldet_) {
-      leerlauf_ohne_queue_gemeldet_ = true;
-      NvProbeLog("Leerlauf: Encode ohne TaskQueue (Current()==null) this=%p -> "
-                 "Pruefung nur bei SetRates", (void*)this);
-    }
-  }
+  LeerlaufZeitgeberStarten("Encode");
 #endif
 
 #if defined(__linux__)
@@ -637,13 +638,15 @@ int32_t NvCodecVideoEncoderImpl::Encode(
                      nb->width(), nb->height(), width_, height_);
         return WEBRTC_VIDEO_CODEC_ERROR;
       }
-      if (!EnsureNv12Encoder()) return WEBRTC_VIDEO_CODEC_ERROR;
+      const int32_t rc = Nv12ImEncodeOeffnen();
+      if (rc != WEBRTC_VIDEO_CODEC_OK) return rc;
       is_native = false;
       active_enc = nv_encoder_.get();
     }
   } else {
     native_folge_ = 0;
-    if (!EnsureNv12Encoder()) return WEBRTC_VIDEO_CODEC_ERROR;
+    const int32_t rc = Nv12ImEncodeOeffnen();
+    if (rc != WEBRTC_VIDEO_CODEC_OK) return rc;
     active_enc = nv_encoder_.get();
   }
 #else
@@ -717,17 +720,7 @@ int32_t NvCodecVideoEncoderImpl::Encode(
     }
     // We only support a single stream.
     RTC_DCHECK_EQ(frame_types->size(), static_cast<size_t>(1));
-    // Skip frame?
-    if ((*frame_types)[0] == webrtc::VideoFrameType::kEmptyFrame) {
-      // Log every empty-frame skip — if WebRTC sends a steady stream of
-      // these the encoder produces no output and the resolution ladder
-      // collapses, which is the symptom we're chasing.
-      static int s_empty_counter = 0;
-      if ((s_empty_counter++ % 60) == 0) {
-        NvProbeLog("Encode: kEmptyFrame #%d -> return OK no encode", s_empty_counter);
-      }
-      return WEBRTC_VIDEO_CODEC_OK;
-    }
+    // (kEmptyFrame wurde oben, vor dem Oeffnen der Sitzungen, abgewiesen.)
     // Force key frame?
     send_key_frame =
         (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
@@ -1080,6 +1073,12 @@ int32_t NvCodecVideoEncoderImpl::InitNvEnc() {
   initialisiert_ = true;
   native_folge_ = 0;
   native_naechster_versuch_ms_ = 0;
+  // ★ Leerlauf (Gutachten M2): Zeitgeber schon hier starten, nicht erst beim
+  // ersten Bild — der SimulcastEncoderAdapter ruft InitEncode auch fuer
+  // pausierte Schichten (Startbitrate 0, simulcast_encoder_adapter.cc:391/454),
+  // die nie ein Bild bekommen; ihre NV12-Sitzung bliebe sonst offen. Setzt
+  // zugleich den Zeitstempel frisch (Release + InitEncode, N2).
+  LeerlaufZeitgeberStarten("InitEncode");
 #endif
 #ifdef __linux__
   nv_encoder_ =
@@ -1100,6 +1099,9 @@ int32_t NvCodecVideoEncoderImpl::InitNvEnc() {
 bool NvCodecVideoEncoderImpl::EnsureNv12Encoder() {
   if (nv_encoder_) return true;
   if (!id3d11_device_) return false;
+  const uint64_t jetzt_ms = GetTickCount64();
+  if (nv12_naechster_versuch_ms_ != 0 && jetzt_ms < nv12_naechster_versuch_ms_)
+    return false;  // Drossel (M1): hoechstens alle 2 s ein Oeffnungsversuch
   // Wiederoeffnen nach Leerlauf/dynacast-Pause: nie mit avg=0 oeffnen (wie
   // EnsureNativeEncoder, Befund N1); das naechste SetRates regelt nach.
   const uint32_t start_br = target_bitrate_bps_ ? target_bitrate_bps_ : 1000000;
@@ -1109,13 +1111,34 @@ bool NvCodecVideoEncoderImpl::EnsureNv12Encoder() {
       max_br, id3d11_device_.Get(), id3d11_texture_.GetAddressOf());
   if (!nv_encoder_) {
     id3d11_texture_.Reset();
-    NvProbeLog("NVENC Oeffnen fehlgeschlagen kind=nv12 this=%p offen=%d",
-               (void*)this, g_nvenc_offen.load());
+    nv12_naechster_versuch_ms_ = jetzt_ms + 2000;
+    ++nv12_fehlversuche_;
+    NvProbeLog("NVENC Oeffnen fehlgeschlagen kind=nv12 this=%p offen=%d "
+               "(Fehlversuch %d, naechster in 2 s)",
+               (void*)this, g_nvenc_offen.load(), nv12_fehlversuche_);
     return false;
   }
+  nv12_naechster_versuch_ms_ = 0;
+  nv12_fehlversuche_ = 0;
   const int offen = ++g_nvenc_offen;
   NvProbeLog("NVENC offen kind=nv12 this=%p offen=%d", (void*)this, offen);
   return true;
+}
+
+// NV12-Sitzung aus dem Encode heraus oeffnen (Gutachten M1). Rueckgabe:
+// OK, CODEC_ERROR (gedrosselt/erneut versuchen) oder einmal ENCODER_FAILURE
+// nach kNv12FehlversucheMax Fehlversuchen in Folge, damit WebRTC den Encoder
+// wechselt (VP8/H264 in Software) statt das Bild einzufrieren.
+int32_t NvCodecVideoEncoderImpl::Nv12ImEncodeOeffnen() {
+  if (EnsureNv12Encoder()) return WEBRTC_VIDEO_CODEC_OK;
+  if (nv12_fehlversuche_ >= kNv12FehlversucheMax) {
+    NvProbeLog("NVENC Oeffnen kind=nv12 %d-mal in Folge gescheitert this=%p "
+               "offen=%d -> ENCODER_FAILURE (WebRTC wechselt auf Software)",
+               nv12_fehlversuche_, (void*)this, g_nvenc_offen.load());
+    nv12_fehlversuche_ = 0;  // nur einmal melden
+    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+  }
+  return WEBRTC_VIDEO_CODEC_ERROR;
 }
 
 void NvCodecVideoEncoderImpl::Nv12Schliessen(const char* grund) {
@@ -1127,6 +1150,11 @@ void NvCodecVideoEncoderImpl::Nv12Schliessen(const char* grund) {
     nv_encoder_->DestroyEncoder();
   } catch (const NVENCException& e) {
     RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
+  } catch (...) {
+    // Fremde Ausnahme aus dem Treiber: nie aus einem TaskQueue-Task heraus in
+    // std::terminate laufen (Gutachten N1).
+    NvProbeLog("Nv12Schliessen: unbekannte Ausnahme beim Schliessen this=%p",
+               (void*)this);
   }
   nv_encoder_ = nullptr;
   id3d11_texture_.Reset();
@@ -1143,6 +1171,9 @@ void NvCodecVideoEncoderImpl::NativeSchliessen(const char* grund) {
       nv_encoder_native_->DestroyEncoder();
     } catch (const NVENCException& e) {
       RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
+    } catch (...) {
+      NvProbeLog("NativeSchliessen: unbekannte Ausnahme beim Schliessen this=%p",
+                 (void*)this);
     }
     nv_encoder_native_.reset();
     const int offen = --g_nvenc_offen;
@@ -1164,6 +1195,24 @@ void NvCodecVideoEncoderImpl::LeerlaufPlanen(webrtc::TaskQueueBase* queue,
         anker->self->LeerlaufTakt();
       },
       webrtc::TimeDelta::Millis(static_cast<int64_t>(verzoegerung_ms)));
+}
+
+// Zeitstempel setzen und — falls kein Task aussteht — den Leerlauf-Task auf
+// der aktuellen TaskQueue planen. Aus Encode (jedes echte Bild) und InitNvEnc
+// (Schicht ohne Bilder, M2). Ohne TaskQueue: einmal protokollieren, Pruefung
+// dann bei SetRates().
+void NvCodecVideoEncoderImpl::LeerlaufZeitgeberStarten(const char* quelle) {
+  letztes_bild_ms_ = GetTickCount64();
+  if (leerlauf_geplant_) return;
+  webrtc::TaskQueueBase* queue = webrtc::TaskQueueBase::Current();
+  if (queue != nullptr) {
+    leerlauf_geplant_ = true;
+    LeerlaufPlanen(queue, kLeerlaufMs);
+  } else if (!leerlauf_ohne_queue_gemeldet_) {
+    leerlauf_ohne_queue_gemeldet_ = true;
+    NvProbeLog("Leerlauf: %s ohne TaskQueue (Current()==null) this=%p -> "
+               "Pruefung nur bei SetRates", quelle, (void*)this);
+  }
 }
 
 void NvCodecVideoEncoderImpl::LeerlaufTakt() {
@@ -1202,6 +1251,8 @@ void NvCodecVideoEncoderImpl::LeerlaufSchliessen(uint64_t seit_ms,
   letzter_enc_ = nullptr;
   native_folge_ = 0;
   native_naechster_versuch_ms_ = 0;
+  nv12_naechster_versuch_ms_ = 0;
+  nv12_fehlversuche_ = 0;
   // initialisiert_ bleibt true: InitEncode ist weiter gueltig.
 }
 #endif
@@ -1216,6 +1267,8 @@ int32_t NvCodecVideoEncoderImpl::ReleaseNvEnc() {
   initialisiert_ = false;
   native_folge_ = 0;
   native_naechster_versuch_ms_ = 0;
+  nv12_naechster_versuch_ms_ = 0;
+  nv12_fehlversuche_ = 0;
   return WEBRTC_VIDEO_CODEC_OK;
 #else
   if (nv_encoder_) {
