@@ -280,6 +280,42 @@ class NvCodecVideoEncoderImpl : public NvCodecVideoEncoder {
   // Empfaenger saehe sonst P-Bilder einer fremden Referenzkette (Befund M1).
   NvEncoder* letzter_enc_ = nullptr;
 
+  // ★ HoneyCord Diagnose (25.10.2026, Kamera haelt ~5-6 % 3D ohne Renderer):
+  // GPU-Zeit der Upload-Kopie im NV12-CPU-Pfad (CopyResource staging ->
+  // NVENC-Eingangstextur auf dem Immediate-Context, also auf der 3D-Queue).
+  // D3D11-Timestamp-Queries, Auswertung NICHT blockierend: ein Ring aus
+  // kUploadRing Saetzen, abgeholt fruehestens zwei Bilder spaeter per
+  // GetData(DONOTFLUSH); liegt nichts vor, wird der Satz verworfen. Alle 5 s
+  // eine Zeile `[upload] 5s: …` in nvenc-probe.log. Scheitert CreateQuery,
+  // einmal protokollieren und die Messung fuer diesen Encoder abschalten —
+  // die Kodierung bleibt unberuehrt. Nur der NV12-Pfad, nicht Zero-Copy.
+  //
+  // Bewusst NICHT um EncodeFrame gemessen: EncodeFrame wartet auf den
+  // Bitstrom und flusht den Context; Timestamps davor/danach messen dann
+  // vor allem die CPU-Wartezeit (GPU leer zwischen zwei Flushes), nicht
+  // Treiberarbeit auf der 3D-Queue.
+  static constexpr int kUploadRing = 4;
+  struct UploadSatz {
+    Microsoft::WRL::ComPtr<ID3D11Query> disjoint, vor, nach;
+    uint64_t bild = 0;     // laufende Bildnummer, in der der Satz gesetzt wurde
+    bool offen = false;    // gesetzt, Ergebnis noch nicht abgeholt
+  };
+  UploadSatz upload_ring_[kUploadRing];
+  bool upload_bereit_ = false;   // Queries angelegt
+  bool upload_aus_ = false;      // CreateQuery scheiterte -> dauerhaft aus
+  uint64_t upload_bild_ = 0;     // Bilder durch den NV12-Pfad (gesamt)
+  uint64_t upload_fenster_ms_ = 0;
+  uint64_t upload_letztes_ms_ = 0;
+  uint32_t upload_bilder_ = 0, upload_gemessen_ = 0, upload_disjoint_ = 0,
+           upload_nicht_fertig_ = 0;
+  double upload_summe_us_ = 0, upload_max_us_ = 0;
+  bool UploadVorbereiten();
+  void UploadAbholen(bool satz_freimachen);
+  void UploadBeginn(UploadSatz*& satz);
+  void UploadEnde(UploadSatz* satz);
+  void UploadZeile();
+  void UploadZuruecksetzen();
+
   // ★ HoneyCord Leerlauf (okunoku 23.10.2026, Buendel 106): Endet eine
   // Bildschirmfreigabe (Unpublish), ruft WebRTC weder Release() noch den
   // Destruktor — der Encoder lebt bis zum Ende der PeerConnection, seine
@@ -817,7 +853,10 @@ int32_t NvCodecVideoEncoderImpl::Encode(
   id3d11_context_->Unmap(id3d11_texture_.Get(), D3D11CalcSubresource(0, 0, 1));
   ID3D11Texture2D* nv11_texture =
       reinterpret_cast<ID3D11Texture2D*>(input_frame->inputPtr);
+  UploadSatz* upload_satz = nullptr;
+  UploadBeginn(upload_satz);
   id3d11_context_->CopyResource(nv11_texture, id3d11_texture_.Get());
+  UploadEnde(upload_satz);
   }  // else: CPU-I420/NV12-Pfad
 #endif
 #ifdef __linux__
@@ -1257,6 +1296,137 @@ void NvCodecVideoEncoderImpl::LeerlaufSchliessen(uint64_t seit_ms,
 }
 #endif
 
+#ifdef _WIN32
+// ---------------------------------------------------------------------------
+// ★ Upload-Messung (Diagnose, siehe Deklaration). Alles auf der Encoder-
+// TaskQueue, wie Encode selbst; der Immediate-Context gehoert dem eigenen
+// Device dieses Encoders.
+
+bool NvCodecVideoEncoderImpl::UploadVorbereiten() {
+  if (upload_bereit_) return true;
+  if (upload_aus_ || !id3d11_device_) return false;
+  D3D11_QUERY_DESC dd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+  D3D11_QUERY_DESC dt = {D3D11_QUERY_TIMESTAMP, 0};
+  for (int i = 0; i < kUploadRing; ++i) {
+    UploadSatz& u = upload_ring_[i];
+    HRESULT hr = id3d11_device_->CreateQuery(&dd, u.disjoint.ReleaseAndGetAddressOf());
+    if (SUCCEEDED(hr)) hr = id3d11_device_->CreateQuery(&dt, u.vor.ReleaseAndGetAddressOf());
+    if (SUCCEEDED(hr)) hr = id3d11_device_->CreateQuery(&dt, u.nach.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+      NvProbeLog("[upload] Messung aus: CreateQuery hr=0x%08lx this=%p",
+                 (long)hr, (void*)this);
+      upload_aus_ = true;
+      UploadZuruecksetzen();
+      return false;
+    }
+    u.offen = false;
+  }
+  upload_bereit_ = true;
+  return true;
+}
+
+// Holt fertige Ergebnisse ab, ohne zu warten. Nur Saetze, die mindestens
+// zwei Bilder alt sind. Mit `satz_freimachen` (Satz dieses Bildes soll
+// wiederverwendet werden) wird ein noch nicht fertiger Satz verworfen.
+void NvCodecVideoEncoderImpl::UploadAbholen(bool satz_freimachen) {
+  for (int i = 0; i < kUploadRing; ++i) {
+    UploadSatz& u = upload_ring_[i];
+    if (!u.offen) continue;
+    const bool reif = upload_bild_ >= u.bild + 2;
+    const bool wird_gebraucht =
+        satz_freimachen && (int)(upload_bild_ % kUploadRing) == i;
+    if (!reif && !wird_gebraucht) continue;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+    UINT64 t0 = 0, t1 = 0;
+    const UINT fl = D3D11_ASYNC_GETDATA_DONOTFLUSH;
+    const bool fertig =
+        id3d11_context_->GetData(u.disjoint.Get(), &dj, sizeof(dj), fl) == S_OK &&
+        id3d11_context_->GetData(u.vor.Get(), &t0, sizeof(t0), fl) == S_OK &&
+        id3d11_context_->GetData(u.nach.Get(), &t1, sizeof(t1), fl) == S_OK;
+    if (!fertig) {
+      if (wird_gebraucht) {
+        ++upload_nicht_fertig_;  // ueberspringen, Satz wird neu belegt
+        u.offen = false;
+      }
+      continue;
+    }
+    u.offen = false;
+    if (dj.Disjoint || dj.Frequency == 0 || t1 < t0) {
+      ++upload_disjoint_;
+      continue;
+    }
+    const double us = (double)(t1 - t0) * 1e6 / (double)dj.Frequency;
+    ++upload_gemessen_;
+    upload_summe_us_ += us;
+    if (us > upload_max_us_) upload_max_us_ = us;
+  }
+}
+
+void NvCodecVideoEncoderImpl::UploadBeginn(UploadSatz*& satz) {
+  satz = nullptr;
+  if (!id3d11_context_ || !UploadVorbereiten()) return;
+  const uint64_t jetzt_ms = GetTickCount64();
+  // Nach einer Pause (Leerlauf, dynacast) das alte Fenster abschliessen,
+  // damit die Zeile nicht Bilder von vor der Pause mitzaehlt.
+  if (upload_fenster_ms_ != 0 && upload_bilder_ > 0 &&
+      jetzt_ms - upload_letztes_ms_ > 2000)
+    UploadZeile();
+  if (upload_fenster_ms_ == 0 || upload_bilder_ == 0) upload_fenster_ms_ = jetzt_ms;
+  upload_letztes_ms_ = jetzt_ms;
+  ++upload_bild_;
+  ++upload_bilder_;
+  UploadAbholen(false);
+  UploadAbholen(true);  // Satz dieses Bildes freimachen
+  UploadSatz& u = upload_ring_[upload_bild_ % kUploadRing];
+  if (u.offen) return;  // (kann nicht passieren; sicherheitshalber nicht messen)
+  id3d11_context_->Begin(u.disjoint.Get());
+  id3d11_context_->End(u.vor.Get());
+  u.bild = upload_bild_;
+  satz = &u;
+}
+
+void NvCodecVideoEncoderImpl::UploadEnde(UploadSatz* satz) {
+  if (satz) {
+    id3d11_context_->End(satz->nach.Get());
+    id3d11_context_->End(satz->disjoint.Get());
+    satz->offen = true;
+  }
+  if (upload_fenster_ms_ != 0 && upload_bilder_ > 0 &&
+      GetTickCount64() - upload_fenster_ms_ >= 5000)
+    UploadZeile();
+}
+
+void NvCodecVideoEncoderImpl::UploadZeile() {
+  const double schnitt =
+      upload_gemessen_ ? upload_summe_us_ / (double)upload_gemessen_ : 0.0;
+  NvProbeLog("[upload] 5s: bilder=%u gpu_us \xC3\x98=%.0f max=%.0f gemessen=%u "
+             "disjoint=%u groesse=%ux%u nicht_fertig=%u",
+             upload_bilder_, schnitt, upload_max_us_, upload_gemessen_,
+             upload_disjoint_, width_, height_, upload_nicht_fertig_);
+  upload_fenster_ms_ = GetTickCount64();
+  upload_bilder_ = upload_gemessen_ = upload_disjoint_ = upload_nicht_fertig_ = 0;
+  upload_summe_us_ = upload_max_us_ = 0;
+}
+
+// Release/Destruktor: Query-Objekte freigeben, Zaehler auf null. Ein
+// abgebrochenes Fenster wird nicht mehr protokolliert. upload_aus_ bleibt.
+void NvCodecVideoEncoderImpl::UploadZuruecksetzen() {
+  for (int i = 0; i < kUploadRing; ++i) {
+    upload_ring_[i].disjoint.Reset();
+    upload_ring_[i].vor.Reset();
+    upload_ring_[i].nach.Reset();
+    upload_ring_[i].offen = false;
+    upload_ring_[i].bild = 0;
+  }
+  upload_bereit_ = false;
+  upload_bild_ = 0;
+  upload_fenster_ms_ = 0;
+  upload_letztes_ms_ = 0;
+  upload_bilder_ = upload_gemessen_ = upload_disjoint_ = upload_nicht_fertig_ = 0;
+  upload_summe_us_ = upload_max_us_ = 0;
+}
+#endif
+
 int32_t NvCodecVideoEncoderImpl::ReleaseNvEnc() {
 #ifdef _WIN32
   // ★ #144: BEIDE Sitzungen schliessen. Vorher blieb der Zero-Copy-Encoder
@@ -1264,6 +1434,7 @@ int32_t NvCodecVideoEncoderImpl::ReleaseNvEnc() {
   // Objekt gleich zu zerstoeren, und die Sitzung blockierte das Kontingent.
   Nv12Schliessen("Release");
   NativeSchliessen("Release");
+  UploadZuruecksetzen();
   initialisiert_ = false;
   native_folge_ = 0;
   native_naechster_versuch_ms_ = 0;
