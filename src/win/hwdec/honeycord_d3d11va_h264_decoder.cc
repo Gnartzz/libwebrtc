@@ -17,6 +17,7 @@
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
 #include "src/win/honeycord_d3d11_frame.h"
+#include "src/win/hwdec/honeycord_h264_sps_diag.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -68,6 +69,41 @@ inline void RotateHwdecLogOnce(const std::string& path) {
     return true;
   }();
   (void)done;
+}
+
+// Eine fertige Zeile an hwdec.log anhaengen (gleicher Weg wie die Adapter-
+// Zeilen und DbgFlush). Nur fuer seltene Einzelzeilen gedacht.
+inline void AppendHwdecLog(const char* s) {
+  if (const char* base = std::getenv("LOCALAPPDATA")) {
+    std::string p = std::string(base) + "\\HoneyCord";
+    CreateDirectoryA(p.c_str(), nullptr);
+    RotateHwdecLogOnce(p + "\\hwdec.log");
+    if (FILE* f = std::fopen((p + "\\hwdec.log").c_str(), "a")) {
+      std::fputs(s, f);
+      std::fclose(f);
+    }
+  }
+}
+
+const char* DxgiFormatName(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_NV12: return "NV12";
+    case DXGI_FORMAT_P010: return "P010";
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return "BGRA8";
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return "RGBA8";
+    case DXGI_FORMAT_420_OPAQUE: return "420_OPAQUE";
+    default: return "?";
+  }
+}
+
+const char* UsageName(D3D11_USAGE u) {
+  switch (u) {
+    case D3D11_USAGE_DEFAULT: return "DEFAULT";
+    case D3D11_USAGE_IMMUTABLE: return "IMMUTABLE";
+    case D3D11_USAGE_DYNAMIC: return "DYNAMIC";
+    case D3D11_USAGE_STAGING: return "STAGING";
+    default: return "?";
+  }
 }
 
 inline double MsSince(std::chrono::steady_clock::time_point t0) {
@@ -473,6 +509,10 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
   const uint32_t rtp = input_image.RtpTimestamp();
   const int64_t ntp = input_image.NtpTimeMs();
 
+  // PRUEF hwdec-diagnose: SPS nur in Keyframes suchen, Zeile nur bei Aenderung.
+  if (input_image.FrameType() == webrtc::VideoFrameType::kVideoFrameKey)
+    DiagLogSps(input_image.data(), input_image.size());
+
   // Input-Sample (Annex-B H.264, von webrtc) bauen.
   ComPtr<IMFSample> sample;
   ComPtr<IMFMediaBuffer> mbuf;
@@ -561,11 +601,15 @@ int32_t D3D11VAH264Decoder::Decode(const webrtc::EncodedImage& input_image,
     }
     ComPtr<IMFMediaBuffer> ob;
     ComPtr<IMFDXGIBuffer> dxgi;
-    if (out && SUCCEEDED(out->GetBufferByIndex(0, &ob)) && SUCCEEDED(ob.As(&dxgi))) {
+    const bool have_dxgi = out && SUCCEEDED(out->GetBufferByIndex(0, &ob)) &&
+                           SUCCEEDED(ob.As(&dxgi));
+    if (out && !have_dxgi) DiagLogDxva(nullptr, 0);  // Systemspeicher-Sample
+    if (have_dxgi) {
       ComPtr<ID3D11Texture2D> tex;
       UINT slice = 0;
       if (SUCCEEDED(dxgi->GetResource(IID_PPV_ARGS(&tex))) &&
           SUCCEEDED(dxgi->GetSubresourceIndex(&slice))) {
+        DiagLogDxva(tex.Get(), slice);
         auto _t_em = std::chrono::steady_clock::now();
         EmitFrame(tex.Get(), slice, out_rtp, ntp);
         dbg_emit_ms_ += MsSince(_t_em);
@@ -645,6 +689,106 @@ void D3D11VAH264Decoder::ReleaseInternal() {
     mft_configured_ = false;
   }
   conv_w_ = conv_h_ = coded_w_ = coded_h_ = out_w_ = out_h_ = 0;
+  // Nach Release/Neuaufbau wieder einmal protokollieren.
+  diag_sps_.reset();
+  diag_sps_bad_logged_ = false;
+  diag_dxva_logged_ = false;
+  diag_dxva_w_ = diag_dxva_h_ = 0;
+}
+
+// ---------------------------------------------------------------------------
+// PRUEF hwdec-diagnose (2026-10-27): einmalige Zeilen je Strom und Wechsel.
+// Kein Eingriff ins Dekodieren; jeder Fehler wird zu einer Zeile, nie zu einem
+// Abbruch.
+// ---------------------------------------------------------------------------
+void D3D11VAH264Decoder::DiagLogSps(const uint8_t* data, size_t size) {
+  // Die SPS steht vorn im Zugriffsblock (vor PPS und IDR). 4 KB reichen und
+  // halten den Suchlauf bei grossen Keyframes kurz.
+  const size_t n = size < 4096 ? size : 4096;
+  bool found = false;
+  std::optional<hwdec_diag::SpsInfo> sps =
+      hwdec_diag::FindAndParseSps(webrtc::ArrayView<const uint8_t>(data, n), &found);
+  char buf[400];
+  if (!sps) {
+    if (diag_sps_bad_logged_) return;
+    diag_sps_bad_logged_ = true;
+    std::snprintf(buf, sizeof(buf),
+                  "[hwdec-sps] nicht lesbar (%s, keyframe=%zu Byte) | strom=%p\n",
+                  found ? "SPS-Lesefehler" : "keine SPS im Keyframe", size,
+                  static_cast<void*>(this));
+    AppendHwdecLog(buf);
+    return;
+  }
+  diag_sps_bad_logged_ = false;
+  if (diag_sps_ && *diag_sps_ == *sps) return;
+  diag_sps_ = *sps;
+  diag_dxva_logged_ = false;  // naechster Output meldet den Pfad erneut
+  hwdec_diag::FormatSpsLine(*sps, this, buf, sizeof(buf));
+  AppendHwdecLog(buf);
+}
+
+void D3D11VAH264Decoder::DiagLogDxva(ID3D11Texture2D* tex, UINT slice) {
+  char buf[400];
+  if (!tex) {
+    if (diag_dxva_logged_ && diag_dxva_w_ == -1) return;
+    diag_dxva_logged_ = true;
+    diag_dxva_w_ = diag_dxva_h_ = -1;
+    std::snprintf(buf, sizeof(buf),
+                  "[hwdec-dxva] dxva=nein dxgibuf=nein (Output im Systemspeicher) "
+                  "| strom=%p\n",
+                  static_cast<void*>(this));
+    AppendHwdecLog(buf);
+    return;
+  }
+  D3D11_TEXTURE2D_DESC td = {};
+  tex->GetDesc(&td);
+  if (diag_dxva_logged_ && diag_dxva_w_ == static_cast<int>(td.Width) &&
+      diag_dxva_h_ == static_cast<int>(td.Height))
+    return;
+  diag_dxva_logged_ = true;
+  diag_dxva_w_ = static_cast<int>(td.Width);
+  diag_dxva_h_ = static_cast<int>(td.Height);
+
+  // Belastbares Signal: D3D11_BIND_DECODER an der Ausgabe-Textur. Nur der
+  // DXVA-Pfad dekodiert in eine Decoder-Render-Target-Textur (Textur-Array mit
+  // BIND_DECODER); der Software-Rueckfall des MFT laedt fertige Bilder in eine
+  // gewoehnliche Textur hoch.
+  const bool dxva = (td.BindFlags & D3D11_BIND_DECODER) != 0;
+
+  // Zusatzsignale (schwach, siehe Bericht): MF_SA_D3D11_AWARE sagt nur, dass
+  // der MFT D3D11 KANN; CODECAPI_AVDecVideoAcceleration_H264 ist eine
+  // Einstellung (an/aus), keine Zustandsmeldung.
+  UINT32 aware = 0xFFFFFFFF;
+  ComPtr<IMFAttributes> attrs;
+  if (mft_ && SUCCEEDED(mft_->GetAttributes(&attrs)) && attrs) {
+    if (FAILED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &aware))) aware = 0xFFFFFFFF;
+  }
+  long accel = -1;
+  ComPtr<ICodecAPI> codec;
+  if (mft_ && SUCCEEDED(mft_.As(&codec))) {
+    VARIANT v;
+    v.vt = VT_EMPTY;
+    if (SUCCEEDED(codec->GetValue(&CODECAPI_AVDecVideoAcceleration_H264, &v))) {
+      if (v.vt == VT_UI4) accel = static_cast<long>(v.ulVal);
+      else if (v.vt == VT_BOOL) accel = v.boolVal ? 1 : 0;
+      else if (v.vt == VT_I4) accel = v.lVal;
+    }
+  }
+  char aware_s[8], accel_s[8];
+  if (aware == 0xFFFFFFFF) std::snprintf(aware_s, sizeof(aware_s), "-");
+  else std::snprintf(aware_s, sizeof(aware_s), "%u", aware);
+  if (accel < 0) std::snprintf(accel_s, sizeof(accel_s), "-");
+  else std::snprintf(accel_s, sizeof(accel_s), "%ld", accel);
+
+  std::snprintf(buf, sizeof(buf),
+                "[hwdec-dxva] %ux%u dxva=%s bind=0x%X array=%u slice=%u fmt=%s(%d) "
+                "usage=%s misc=0x%X dxgibuf=ja d3d11aware=%s accel_h264=%s "
+                "| anzeige=%dx%d strom=%p\n",
+                td.Width, td.Height, dxva ? "ja" : "nein", td.BindFlags,
+                td.ArraySize, slice, DxgiFormatName(td.Format),
+                static_cast<int>(td.Format), UsageName(td.Usage), td.MiscFlags,
+                aware_s, accel_s, out_w_, out_h_, static_cast<void*>(this));
+  AppendHwdecLog(buf);
 }
 
 webrtc::VideoDecoder::DecoderInfo D3D11VAH264Decoder::GetDecoderInfo() const {

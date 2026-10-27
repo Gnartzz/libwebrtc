@@ -21,6 +21,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include <d3d11.h>
 #include <mfidl.h>
@@ -29,6 +30,7 @@
 
 #include "api/video_codecs/video_decoder.h"
 #include "api/video/encoded_image.h"
+#include "src/win/hwdec/honeycord_h264_sps_diag.h"
 
 namespace libwebrtc {
 
@@ -128,6 +130,18 @@ class D3D11VAH264Decoder : public webrtc::VideoDecoder {
   // Decoder gedrosselt) oder NACH dem Decode (decode_fps ~30, Render-Queue droppt)?
   std::chrono::steady_clock::time_point dbg_win_{};
   void DbgFlush();
+
+  // PRUEF hwdec-diagnose (2026-10-27): je Decoder-Instanz (= Strom) EINE Zeile
+  // [hwdec-sps] beim ersten Keyframe und bei jeder SPS-Aenderung, und EINE
+  // Zeile [hwdec-dxva] beim ersten Output und nach SPS-/Groessenwechsel.
+  // Belegt, ob der MFT wirklich DXVA nutzt (D3D11_BIND_DECODER an der
+  // Ausgabe-Textur) und welches Level/Profil der Sender schreibt.
+  void DiagLogSps(const uint8_t* data, size_t size);
+  void DiagLogDxva(ID3D11Texture2D* tex, UINT slice);  // tex=nullptr: kein IMFDXGIBuffer
+  std::optional<hwdec_diag::SpsInfo> diag_sps_;
+  bool diag_sps_bad_logged_ = false;
+  bool diag_dxva_logged_ = false;
+  int diag_dxva_w_ = 0, diag_dxva_h_ = 0;  // -1 = Systemspeicher-Output gemeldet
 
   std::mutex mutex_;
 };
