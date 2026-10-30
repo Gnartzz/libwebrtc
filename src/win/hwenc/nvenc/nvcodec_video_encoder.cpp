@@ -879,6 +879,12 @@ int32_t NvCodecVideoEncoderImpl::Encode(
              (eingang_puffer = PufferBild(frame, dbg_path)) != nullptr) {
     // *** Eingangspuffer: CPU-Bild -> libyuv -> NVENC-Systemspeicherpuffer,
     //     keine D3D11-Textur, kein Map/CopyResource auf der 3D-Queue ***
+    // Gutachten M1: nvEncodeAPI.h zu inputPitch: „If pitch value is not
+    // known, set this to inputWidth" — 0 ist dort kein zulaessiger Wert. Fuer
+    // registrierte D3D11-Texturen kennt der Treiber den Pitch selbst (der
+    // Texturweg laesst das Feld seit je auf 0), fuer Systemspeicherpuffer
+    // tragen wir den Pitch aus dem Lock ein (so auch FFmpeg nvenc.c).
+    pic_params.inputPitch = puffer_pitch_;
   } else {
   if (!id3d11_texture_) {
     static int s_no_tex_counter = 0;
