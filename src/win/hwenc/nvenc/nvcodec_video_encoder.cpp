@@ -22,6 +22,7 @@
 #include <shlobj.h>
 #include <cstdio>
 #include <cstdarg>
+#include <cstring>
 #endif
 
 // WebRTC
@@ -117,14 +118,50 @@ static void RotateLogIfNeededW(const wchar_t* path) {
   }
 }
 
-static void NvProbeLog(const char* fmt, ...) {
+// %LOCALAPPDATA%\HoneyCord (angelegt, falls noetig). false, wenn der Pfad
+// nicht zu ermitteln ist. Gemeinsam fuer nvenc-probe.log und die
+// Schalterdateien (nvenc-eingang.txt).
+static bool HoneyCordOrdnerW(wchar_t (&dir)[MAX_PATH]) {
   wchar_t localAppData[MAX_PATH] = {0};
   if (FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
-    return;
+    return false;
   }
-  wchar_t dir[MAX_PATH] = {0};
   swprintf_s(dir, MAX_PATH, L"%s\\HoneyCord", localAppData);
   CreateDirectoryW(dir, NULL);  // ignore EEXIST
+  return true;
+}
+
+// ★ HoneyCord Messschalter (30.10.2026): Datei %LOCALAPPDATA%\HoneyCord\
+// nvenc-eingang.txt mit Inhalt `puffer` (Gross-/Kleinschreibung, Leerraum,
+// Zeilenende und UTF-8-BOM egal) -> NV12-Bilder gehen ueber NVENC-
+// Eingangspuffer statt ueber die D3D11-Textur. Alles andere oder keine
+// Datei -> bisheriger Texturweg. Wird je Encoder-Start (InitNvEnc) gelesen.
+static bool NvEncEingangPufferGewuenscht() {
+  wchar_t dir[MAX_PATH] = {0};
+  if (!HoneyCordOrdnerW(dir)) return false;
+  wchar_t file[MAX_PATH] = {0};
+  swprintf_s(file, MAX_PATH, L"%s\\nvenc-eingang.txt", dir);
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, file, L"rb") != 0 || !f) return false;
+  char puffer[64] = {0};
+  const size_t n = fread(puffer, 1, sizeof(puffer) - 1, f);
+  fclose(f);
+  puffer[n] = 0;
+  const char* p = puffer;
+  if (n >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB &&
+      (unsigned char)p[2] == 0xBF)
+    p += 3;  // UTF-8-BOM (Editor)
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+  size_t len = strlen(p);
+  while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t' ||
+                     p[len - 1] == '\r' || p[len - 1] == '\n'))
+    --len;
+  return len == 6 && _strnicmp(p, "puffer", 6) == 0;
+}
+
+static void NvProbeLog(const char* fmt, ...) {
+  wchar_t dir[MAX_PATH] = {0};
+  if (!HoneyCordOrdnerW(dir)) return;
   wchar_t file[MAX_PATH] = {0};
   swprintf_s(file, MAX_PATH, L"%s\\nvenc-probe.log", dir);
   {
@@ -315,6 +352,52 @@ class NvCodecVideoEncoderImpl : public NvCodecVideoEncoder {
   void UploadEnde(UploadSatz* satz);
   void UploadZeile();
   void UploadZuruecksetzen();
+
+  // ★ HoneyCord Messschalter „NVENC Eingang" (30.10.2026, okunoku RTX 2070
+  // Super, Buendel 106/111): Die Kamera (NV12-CPU-Pfad) haelt 6-8 % „3D" im
+  // Task-Manager, die [upload]-Messung erklaert davon nur ~1,4 % (0,46 ms je
+  // Bild fuer CopyResource). Verdacht: Treiberarbeit um Map/Unmap der als
+  // DIRECTX-Ressource registrierten Eingangstextur. Zum Beweis laeuft der
+  // NV12-Weg wahlweise OHNE D3D11-Textur: nvEncCreateInputBuffer (System-
+  // speicher), je Bild nvEncLockInputBuffer -> libyuv direkt in bufferDataPtr
+  // (pitch aus dem Lock) -> nvEncUnlockInputBuffer -> nvEncEncodePicture mit
+  // dem Puffer (EncodeFrameAusPuffer). Schalter: nvenc-eingang.txt = `puffer`.
+  //
+  // Ring: genau SlotAnzahl() Puffer (= Zahl der Eingabe-Texturen, 4), Slot =
+  // NaechsterSlot() wie im Texturweg. Der Helfer holt den Bitstrom eines
+  // Bildes erst m_nOutputDelay (= 3) Bilder spaeter ab (GetEncodedPacket);
+  // bis dahin darf sein Eingang nicht ueberschrieben werden. Mit 4 Slots wird
+  // Slot i erst beim Bild k+4 neu belegt, nachdem Bild k+3 den Bitstrom von
+  // Bild k abgeholt hat — Doppelpufferung (2) waere also NICHT ausreichend,
+  // obwohl der Encoder synchron laeuft.
+  //
+  // Fehler (Create/Lock): einmal protokollieren, Puffer weg, fuer diesen
+  // Encoder dauerhaft Texturweg (puffer_aus_); das laufende Bild geht ueber
+  // die Textur weiter. Lebenszeit: die Puffer gehoeren zur NV12-Sitzung —
+  // angelegt in EnsureNv12Encoder (InitNvEnc, Wiederoeffnen nach Leerlauf/
+  // Zero-Copy), zerstoert in Nv12Schliessen (Release, Destruktor, Leerlauf,
+  // Zero-Copy aktiv) VOR DestroyEncoder. Zero-Copy-ARGB und Readback bleiben
+  // unberuehrt (der Readback-Rueckfall nutzt denselben NV12-Weg, also auch den
+  // Puffer, wenn der Schalter steht).
+  //
+  // Messung: kein [upload]-Timestamp (keine GPU-Kopie), stattdessen CPU-Zeit
+  // Lock+Konvertieren+Unlock je Bild, alle 5 s `[eingang] 5s: bilder=N
+  // lock_us Ø=… max=… pitch=… groesse=WxH` in nvenc-probe.log.
+  bool eingang_puffer_ = false;             // Schalter (je InitNvEnc gelesen)
+  bool puffer_aus_ = false;                 // Create/Lock scheiterte -> Texturweg
+  std::vector<NV_ENC_INPUT_PTR> puffer_ring_;  // je Slot ein Eingangspuffer
+  uint32_t puffer_pitch_ = 0;               // letzter Pitch aus dem Lock (Protokoll)
+  uint64_t eingang_fenster_ms_ = 0;
+  uint64_t eingang_letztes_ms_ = 0;
+  uint32_t eingang_bilder_ = 0;
+  double eingang_summe_us_ = 0, eingang_max_us_ = 0;
+  void PufferAnlegen();
+  void PufferZerstoeren();
+  // Bild in den Puffer des naechsten Slots; liefert den Puffer oder nullptr
+  // (dann Texturweg fuer dieses Bild).
+  NV_ENC_INPUT_PTR PufferBild(const webrtc::VideoFrame& frame, bool dbg_path);
+  void EingangZeile();
+  void EingangZuruecksetzen();
 
   // ★ HoneyCord Leerlauf (okunoku 23.10.2026, Buendel 106): Endet eine
   // Bildschirmfreigabe (Unpublish), ruft WebRTC weder Release() noch den
@@ -784,12 +867,18 @@ int32_t NvCodecVideoEncoderImpl::Encode(
   v_packet_.clear();
 
 #ifdef _WIN32
+  // ★ Messschalter: Eingangspuffer dieses Bildes (nullptr = Texturweg).
+  NV_ENC_INPUT_PTR eingang_puffer = nullptr;
   if (is_native) {
     // *** Zero-Copy: Capture-Textur -> NVENC-Input, reiner GPU-CopyResource ***
     const NvEncInputFrame* in = active_enc->GetNextInputFrame();
     if (!in) return WEBRTC_VIDEO_CODEC_ERROR;
     native_context_->CopyResource(
         reinterpret_cast<ID3D11Texture2D*>(in->inputPtr), nb->texture());
+  } else if (eingang_puffer_ && !puffer_aus_ && !puffer_ring_.empty() &&
+             (eingang_puffer = PufferBild(frame, dbg_path)) != nullptr) {
+    // *** Eingangspuffer: CPU-Bild -> libyuv -> NVENC-Systemspeicherpuffer,
+    //     keine D3D11-Textur, kein Map/CopyResource auf der 3D-Queue ***
   } else {
   if (!id3d11_texture_) {
     static int s_no_tex_counter = 0;
@@ -896,7 +985,15 @@ int32_t NvCodecVideoEncoderImpl::Encode(
   QueryPerformanceCounter(&enc_t0);
 #endif
   try {
+#ifdef _WIN32
+    if (eingang_puffer != nullptr) {
+      active_enc->EncodeFrameAusPuffer(eingang_puffer, raw_packets, &pic_params);
+    } else {
+      active_enc->EncodeFrame(raw_packets, &pic_params);
+    }
+#else
     active_enc->EncodeFrame(raw_packets, &pic_params);
+#endif
   } catch (const NVENCException& e) {
     RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
     NvProbeLog("Encode: EncodeFrame THREW: %s", e.what());
@@ -1108,6 +1205,14 @@ int32_t NvCodecVideoEncoderImpl::InitNvEnc() {
     NvProbeLog("InitNvEnc: id3d11_device_ is null, aborting");
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
+  // ★ Messschalter einmal je Encoder-Start lesen (VOR dem Oeffnen, damit
+  // EnsureNv12Encoder die Puffer gleich mit anlegt). puffer_aus_ bleibt ueber
+  // einen Release/InitEncode hinweg stehen: ein Treiber, der Create/Lock
+  // ablehnte, tut es beim naechsten Mal wieder.
+  eingang_puffer_ = NvEncEingangPufferGewuenscht();
+  NvProbeLog("NVENC Eingang: %s (Schalter nvenc-eingang.txt)%s",
+             eingang_puffer_ ? "puffer" : "textur",
+             (eingang_puffer_ && puffer_aus_) ? " - Puffer frueher gescheitert, Texturweg" : "");
   if (!EnsureNv12Encoder()) return WEBRTC_VIDEO_CODEC_ERROR;
   initialisiert_ = true;
   native_folge_ = 0;
@@ -1161,6 +1266,10 @@ bool NvCodecVideoEncoderImpl::EnsureNv12Encoder() {
   nv12_fehlversuche_ = 0;
   const int offen = ++g_nvenc_offen;
   NvProbeLog("NVENC offen kind=nv12 this=%p offen=%d", (void*)this, offen);
+  // ★ Eingangspuffer gehoeren zu dieser Sitzung: bei JEDEM Oeffnen (InitNvEnc,
+  // Wiederoeffnen nach Leerlauf oder Zero-Copy) neu anlegen. Scheitert es,
+  // laeuft der Encoder ueber die Textur weiter (PufferAnlegen protokolliert).
+  if (eingang_puffer_ && !puffer_aus_) PufferAnlegen();
   return true;
 }
 
@@ -1186,6 +1295,9 @@ void NvCodecVideoEncoderImpl::Nv12Schliessen(const char* grund) {
   try {
     std::vector<std::vector<uint8_t>> drain;
     nv_encoder_->EndEncode(drain);
+    // ★ Eingangspuffer NACH dem Leeren (kein Bild haengt mehr an ihnen) und
+    // VOR nvEncDestroyEncoder zerstoeren. Wirft nicht.
+    PufferZerstoeren();
     nv_encoder_->DestroyEncoder();
   } catch (const NVENCException& e) {
     RTC_LOG(LS_ERROR) << __FUNCTION__ << e.what();
@@ -1195,6 +1307,9 @@ void NvCodecVideoEncoderImpl::Nv12Schliessen(const char* grund) {
     NvProbeLog("Nv12Schliessen: unbekannte Ausnahme beim Schliessen this=%p",
                (void*)this);
   }
+  // Falls EndEncode warf: Puffer trotzdem noch an der lebenden Sitzung
+  // zerstoeren (idempotent), bevor der unique_ptr sie abraeumt.
+  PufferZerstoeren();
   nv_encoder_ = nullptr;
   id3d11_texture_.Reset();
   const int offen = --g_nvenc_offen;
@@ -1425,6 +1540,188 @@ void NvCodecVideoEncoderImpl::UploadZuruecksetzen() {
   upload_bilder_ = upload_gemessen_ = upload_disjoint_ = upload_nicht_fertig_ = 0;
   upload_summe_us_ = upload_max_us_ = 0;
 }
+
+// ---------------------------------------------------------------------------
+// ★ Eingangspuffer-Weg (Messschalter nvenc-eingang.txt, siehe Deklaration).
+// Alles auf der Encoder-TaskQueue wie Encode selbst. Die Puffer haengen an
+// der NV12-Sitzung nv_encoder_ (Handle + API-Tabelle des Helfers).
+
+void NvCodecVideoEncoderImpl::PufferAnlegen() {
+  PufferZerstoeren();  // Altbestand (darf es nicht geben) weg
+  if (!nv_encoder_ || !nv_encoder_->Handle()) return;
+  const int slots = nv_encoder_->SlotAnzahl();
+  if (slots <= 0) {
+    NvProbeLog("[eingang] Puffer aus: SlotAnzahl=%d this=%p -> Texturweg",
+               slots, (void*)this);
+    puffer_aus_ = true;
+    return;
+  }
+  const NV_ENCODE_API_FUNCTION_LIST& api = nv_encoder_->Api();
+  if (!api.nvEncCreateInputBuffer || !api.nvEncLockInputBuffer ||
+      !api.nvEncUnlockInputBuffer || !api.nvEncDestroyInputBuffer) {
+    NvProbeLog("[eingang] Puffer aus: Eingangspuffer-API fehlt in der "
+               "Funktionstabelle this=%p -> Texturweg", (void*)this);
+    puffer_aus_ = true;
+    return;
+  }
+  puffer_ring_.reserve(slots);
+  for (int i = 0; i < slots; ++i) {
+    NV_ENC_CREATE_INPUT_BUFFER cib = {NV_ENC_CREATE_INPUT_BUFFER_VER};
+    cib.width = width_;
+    cib.height = height_;
+    cib.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+    cib.memoryHeap = NV_ENC_MEMORY_HEAP_AUTOSELECT;  // laut Header veraltet, 0
+    const NVENCSTATUS s = api.nvEncCreateInputBuffer(nv_encoder_->Handle(), &cib);
+    if (s != NV_ENC_SUCCESS || cib.inputBuffer == nullptr) {
+      const char* detail = api.nvEncGetLastErrorString
+                               ? api.nvEncGetLastErrorString(nv_encoder_->Handle())
+                               : nullptr;
+      NvProbeLog("[eingang] Puffer aus: nvEncCreateInputBuffer Slot %d/%d "
+                 "status=%d (%s) %ux%u this=%p -> Texturweg",
+                 i, slots, (int)s, detail ? detail : "-", width_, height_,
+                 (void*)this);
+      puffer_aus_ = true;
+      PufferZerstoeren();
+      return;
+    }
+    puffer_ring_.push_back(cib.inputBuffer);
+  }
+  NvProbeLog("[eingang] %d Eingangspuffer NV12 %ux%u angelegt this=%p",
+             slots, width_, height_, (void*)this);
+}
+
+// Idempotent, wirft nicht. Braucht die noch lebende Sitzung (vor
+// DestroyEncoder bzw. vor dem Fallenlassen des unique_ptr).
+void NvCodecVideoEncoderImpl::PufferZerstoeren() {
+  if (puffer_ring_.empty()) return;
+  if (nv_encoder_ && nv_encoder_->Handle() && nv_encoder_->Api().nvEncDestroyInputBuffer) {
+    for (NV_ENC_INPUT_PTR p : puffer_ring_) {
+      if (p) nv_encoder_->Api().nvEncDestroyInputBuffer(nv_encoder_->Handle(), p);
+    }
+  }
+  // Ohne Sitzung gehen die Puffer mit nvEncDestroyEncoder unter.
+  puffer_ring_.clear();
+  puffer_pitch_ = 0;
+}
+
+NV_ENC_INPUT_PTR NvCodecVideoEncoderImpl::PufferBild(
+    const webrtc::VideoFrame& frame, bool dbg_path) {
+  if (!nv_encoder_ || !nv_encoder_->Handle()) return nullptr;
+  const int slot = nv_encoder_->NaechsterSlot();
+  if (slot < 0 || (size_t)slot >= puffer_ring_.size()) return nullptr;
+  NV_ENC_INPUT_PTR puffer = puffer_ring_[slot];
+  if (!puffer) return nullptr;
+
+  // Quelle VOR dem Lock holen: bei einem kNative-Readback (ToI420) kann das
+  // nullptr liefern — dann ohne Lock zurueck, der Texturweg meldet den Fehler.
+  webrtc::scoped_refptr<const webrtc::I420BufferInterface> i420;
+  const webrtc::NV12BufferInterface* nv12 = nullptr;
+  if (frame.video_frame_buffer()->type() ==
+      webrtc::VideoFrameBuffer::Type::kNV12) {
+    nv12 = static_cast<const webrtc::NV12BufferInterface*>(
+        frame.video_frame_buffer().get());
+  } else {
+    i420 = frame.video_frame_buffer()->ToI420();
+    if (!i420) return nullptr;
+  }
+  // Nie ueber den Puffer hinaus schreiben (Puffer ist width_ x height_).
+  const int src_w = nv12 ? nv12->width() : i420->width();
+  const int src_h = nv12 ? nv12->height() : i420->height();
+  const int w = src_w < (int)width_ ? src_w : (int)width_;
+  const int h = src_h < (int)height_ ? src_h : (int)height_;
+
+  const uint64_t jetzt_ms = GetTickCount64();
+  // Nach einer Pause (Leerlauf, dynacast) das alte Fenster abschliessen.
+  if (eingang_fenster_ms_ != 0 && eingang_bilder_ > 0 &&
+      jetzt_ms - eingang_letztes_ms_ > 2000)
+    EingangZeile();
+  if (eingang_fenster_ms_ == 0 || eingang_bilder_ == 0) eingang_fenster_ms_ = jetzt_ms;
+  eingang_letztes_ms_ = jetzt_ms;
+
+  LARGE_INTEGER t0, t1, freq;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&t0);
+
+  const NV_ENCODE_API_FUNCTION_LIST& api = nv_encoder_->Api();
+  NV_ENC_LOCK_INPUT_BUFFER lib = {NV_ENC_LOCK_INPUT_BUFFER_VER};
+  lib.inputBuffer = puffer;
+  lib.doNotWait = 0;
+  const NVENCSTATUS s = api.nvEncLockInputBuffer(nv_encoder_->Handle(), &lib);
+  if (s != NV_ENC_SUCCESS || lib.bufferDataPtr == nullptr || lib.pitch == 0) {
+    const char* detail = api.nvEncGetLastErrorString
+                             ? api.nvEncGetLastErrorString(nv_encoder_->Handle())
+                             : nullptr;
+    NvProbeLog("[eingang] Puffer aus: nvEncLockInputBuffer Slot %d status=%d "
+               "(%s) ptr=%p pitch=%u this=%p -> Texturweg (Bild geht ueber "
+               "die Textur)",
+               slot, (int)s, detail ? detail : "-", lib.bufferDataPtr,
+               (unsigned)lib.pitch, (void*)this);
+    if (s == NV_ENC_SUCCESS) api.nvEncUnlockInputBuffer(nv_encoder_->Handle(), puffer);
+    // Puffer NICHT sofort zerstoeren: die letzten drei Bilder (Ausgabe-
+    // verzoegerung) haengen noch an ihren Puffern. Sie gehen mit der
+    // Sitzung in Nv12Schliessen unter; ab jetzt wird keiner mehr benutzt.
+    puffer_aus_ = true;
+    if (eingang_bilder_ > 0) EingangZeile();
+    return nullptr;
+  }
+  uint8_t* y = static_cast<uint8_t*>(lib.bufferDataPtr);
+  // NV12 im Eingangspuffer: Chroma-Ebene direkt hinter pitch*height Zeilen
+  // Luma, gleicher Pitch (wie NvEncoder::GetChromaSubPlaneOffsets fuer NV12).
+  uint8_t* uv = y + (size_t)lib.pitch * height_;
+  if (nv12) {
+    libyuv::NV12Copy(nv12->DataY(), nv12->StrideY(), nv12->DataUV(),
+                     nv12->StrideUV(), y, (int)lib.pitch, uv, (int)lib.pitch,
+                     w, h);
+  } else {
+    libyuv::I420ToNV12(i420->DataY(), i420->StrideY(), i420->DataU(),
+                       i420->StrideU(), i420->DataV(), i420->StrideV(), y,
+                       (int)lib.pitch, uv, (int)lib.pitch, w, h);
+  }
+  const NVENCSTATUS u = api.nvEncUnlockInputBuffer(nv_encoder_->Handle(), puffer);
+  QueryPerformanceCounter(&t1);
+  puffer_pitch_ = lib.pitch;
+  if (u != NV_ENC_SUCCESS) {
+    // Unlock abgelehnt: dieses Bild nicht kodieren lassen (Puffer-Zustand
+    // unklar), Texturweg uebernimmt es; Weg fuer diesen Encoder aus.
+    NvProbeLog("[eingang] Puffer aus: nvEncUnlockInputBuffer Slot %d status=%d "
+               "this=%p -> Texturweg", slot, (int)u, (void*)this);
+    puffer_aus_ = true;  // Puffer bleiben bis Nv12Schliessen (s. o.)
+    if (eingang_bilder_ > 0) EingangZeile();
+    return nullptr;
+  }
+  const double us = (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)freq.QuadPart;
+  ++eingang_bilder_;
+  eingang_summe_us_ += us;
+  if (us > eingang_max_us_) eingang_max_us_ = us;
+  if (dbg_path) {
+    NvProbeLog("Encode path: Eingangspuffer Slot %d pitch=%u %dx%d lock_us=%.0f",
+               slot, (unsigned)lib.pitch, w, h, us);
+  }
+  if (GetTickCount64() - eingang_fenster_ms_ >= 5000) EingangZeile();
+  return puffer;
+}
+
+void NvCodecVideoEncoderImpl::EingangZeile() {
+  const double schnitt =
+      eingang_bilder_ ? eingang_summe_us_ / (double)eingang_bilder_ : 0.0;
+  NvProbeLog("[eingang] 5s: bilder=%u lock_us \xC3\x98=%.0f max=%.0f pitch=%u "
+             "groesse=%ux%u",
+             eingang_bilder_, schnitt, eingang_max_us_, (unsigned)puffer_pitch_,
+             width_, height_);
+  eingang_fenster_ms_ = GetTickCount64();
+  eingang_bilder_ = 0;
+  eingang_summe_us_ = eingang_max_us_ = 0;
+}
+
+// Release/Destruktor: Zaehler auf null (die Puffer selbst zerstoert
+// Nv12Schliessen). Ein abgebrochenes Fenster wird nicht mehr protokolliert.
+// puffer_aus_ bleibt.
+void NvCodecVideoEncoderImpl::EingangZuruecksetzen() {
+  eingang_fenster_ms_ = 0;
+  eingang_letztes_ms_ = 0;
+  eingang_bilder_ = 0;
+  eingang_summe_us_ = eingang_max_us_ = 0;
+}
 #endif
 
 int32_t NvCodecVideoEncoderImpl::ReleaseNvEnc() {
@@ -1432,9 +1729,10 @@ int32_t NvCodecVideoEncoderImpl::ReleaseNvEnc() {
   // ★ #144: BEIDE Sitzungen schliessen. Vorher blieb der Zero-Copy-Encoder
   // (ARGB) bis zum Destruktor offen — WebRTC ruft Release() oft, ohne das
   // Objekt gleich zu zerstoeren, und die Sitzung blockierte das Kontingent.
-  Nv12Schliessen("Release");
+  Nv12Schliessen("Release");  // zerstoert auch die Eingangspuffer
   NativeSchliessen("Release");
   UploadZuruecksetzen();
+  EingangZuruecksetzen();
   initialisiert_ = false;
   native_folge_ = 0;
   native_naechster_versuch_ms_ = 0;

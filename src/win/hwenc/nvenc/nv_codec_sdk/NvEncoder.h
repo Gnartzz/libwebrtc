@@ -211,6 +211,25 @@ public:
     */
     void GetSequenceParams(std::vector<uint8_t> &seqParams);
 
+    // ★ HoneyCord (Messschalter nvenc-eingang.txt, 30.10.2026): Bild aus einem
+    // NVENC-Eingangspuffer (nvEncCreateInputBuffer, Systemspeicher) kodieren,
+    // statt die registrierte D3D11-Textur dieses Slots zu mappen. Anlegen,
+    // Sperren, Freigeben und Zerstoeren der Puffer macht der Aufrufer ueber
+    // Api()/Handle(); hier nur die Uebergabe an DoEncode, damit Bitstrom-Ring,
+    // Zaehler (m_iToSend/m_iGot) und GetEncodedPacket unveraendert bleiben.
+    // Der Slot bleibt ungemappt (m_vMappedInputBuffers[i] == nullptr), also
+    // hat GetEncodedPacket dort nichts zu unmappen. Wirft NVENCException wie
+    // EncodeFrame.
+    void EncodeFrameAusPuffer(NV_ENC_INPUT_PTR puffer, std::vector<std::vector<uint8_t>> &vPacket, NV_ENC_PIC_PARAMS *pPicParams);
+    const NV_ENCODE_API_FUNCTION_LIST& Api() const { return m_nvenc; }
+    void* Handle() const { return m_hEncoder; }
+    // Zahl der Eingabe-Slots (= Groesse des Textur-Rings, nach CreateEncoder)
+    // und der Slot, den das naechste Bild belegt — derselbe Index, den auch
+    // GetNextInputFrame() benutzt. Ein Slot wird erst wiederverwendet, nachdem
+    // GetEncodedPacket den Bitstrom seines Bildes abgeholt hat.
+    int SlotAnzahl() const { return m_nEncoderBuffer; }
+    int NaechsterSlot() const { return m_nEncoderBuffer > 0 ? m_iToSend % m_nEncoderBuffer : 0; }
+
     /**
     *  @brief  NvEncoder class virtual destructor.
     */
@@ -405,3 +424,19 @@ private:
     int32_t m_nEncoderBuffer = 0;
     int32_t m_nOutputDelay = 0;
 };
+
+// ★ HoneyCord: siehe Deklaration. Inline hier, damit NvEncoder.cpp (Vendor-
+// Datei) unangetastet bleibt.
+inline void NvEncoder::EncodeFrameAusPuffer(NV_ENC_INPUT_PTR puffer, std::vector<std::vector<uint8_t>> &vPacket, NV_ENC_PIC_PARAMS *pPicParams)
+{
+    vPacket.clear();
+    if (!IsHWEncoderInitialized())
+    {
+        NVENC_THROW_ERROR("Encoder device not found", NV_ENC_ERR_NO_ENCODE_DEVICE);
+    }
+    if (!puffer)
+    {
+        NVENC_THROW_ERROR("Eingangspuffer ist null", NV_ENC_ERR_INVALID_PTR);
+    }
+    DoEncode(puffer, vPacket, pPicParams);
+}
