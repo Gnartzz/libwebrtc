@@ -1,6 +1,7 @@
 #include "src/linux/hwenc/ffmpeg/hw_h264_encoder.h"
 
 #include <fcntl.h>
+#include "src/linux/hwenc/ffmpeg/ratenregeln.h"
 #include <unistd.h>
 
 #include <algorithm>
@@ -353,6 +354,17 @@ int HwH264Encoder::InitEncode(
   target_bitrate_bps_ = codec_settings->startBitrate * 1000;
   max_bitrate_bps_ = codec_settings->maxBitrate * 1000;
   if (target_bitrate_bps_ == 0) target_bitrate_bps_ = 1000000;
+  // ★★ O34 (2): VA-API nicht mit WebRTCs 290 kbit/s öffnen, sondern ab 720p
+  // mit 1300 (darunter anteilig) — die ersten Sekunden waren matschig, und
+  // die Schätzung wächst nur, wenn auch gesendet wird. `gefordert_offen_`
+  // nimmt darunter denselben Wert: Die 1,1×/1,5×-Schwellen messen damit an
+  // der Rate, mit der der Encoder WIRKLICH geöffnet wurde — sonst wäre jede
+  // Forderung über 435 ein „Sprung" auf eine Rate, die schon anliegt
+  // (Vollbild für nichts). NVENC unverändert.
+  if (weg_ != Backend::kNvenc) {
+    target_bitrate_bps_ = ratenregeln::Startrate(target_bitrate_bps_, max_bitrate_bps_,
+                                                 width_, height_);
+  }
   gefordert_offen_ = target_bitrate_bps_;
   forderung_roh_ = target_bitrate_bps_;
   fz_zuletzt_ = std::clamp<uint32_t>(framerate_, std::min<uint32_t>(20, max_fps_),
@@ -363,8 +375,9 @@ int HwH264Encoder::InitEncode(
   bildschirm_ = codec_settings->mode == webrtc::VideoCodecMode::kScreensharing;
   bitrate_adjuster_.SetTargetBitrateBps(target_bitrate_bps_);
   frame_index_ = 0;
-  // ★ 17.10.2026: Anlaufphase (s. SetRates).
+  // ★ 17.10.2026: Anlaufphase (s. SetRates); O34: Rampe (s. `LageAuswerten` 1).
   anlauf_bis_ms_ = webrtc::TimeMillis() + kAnlaufMs;
+  rampe_bis_ms_ = webrtc::TimeMillis() + ratenregeln::kRampeMs;
 
   return CodecOeffnen();
 }
@@ -701,9 +714,11 @@ int32_t HwH264Encoder::Encode(
       ausstehend_bildrate_ = bildrate;
       ausstehend_folge_ = hoch_folge;
       ausstehend_nur_folge_ = true;
-      ausstehend_sperre_ms_ = (bildrate && bildrate_richtung_ > 0) ? 3000
-                              : (hoch_folge || unterschuss)        ? 5000
-                                                                   : 10000;
+      // O34: in der Rampe aufwärts 2 s (dieselbe Sperre wie in `SetRates`).
+      ausstehend_sperre_ms_ = (hoch_folge && jetzt < rampe_bis_ms_)   ? ratenregeln::kRampeSperreMs
+                              : (bildrate && bildrate_richtung_ > 0) ? 3000
+                              : (hoch_folge || unterschuss)          ? 5000
+                                                                     : 10000;
     } else if (aufsetzen_ausstehend_ && ausstehend_nur_folge_ && !folge_lage) {
       // Die Folge ist abgerissen: ein nur aus ihr gemerkter Sprung verfällt.
       aufsetzen_ausstehend_ = false;
@@ -1031,8 +1046,12 @@ void HwH264Encoder::SetRates(
   // zehn Sekunden Matsch bei jedem Start. In der Anlaufphase darf es deshalb
   // alle zwei Sekunden HOCH gehen; ein Vollbild kostet bei diesen Raten wenig.
   // Abwärts bleibt es bei zehn Sekunden (der Kreis vom 21.09.).
-  const bool im_anlauf = hoch && !runter && jetzt < anlauf_bis_ms_;
-  const int64_t sperrzeit_ms = im_anlauf                                ? 2000
+  // ★★ O34: Das Fenster heißt jetzt Rampe und dauert 60 s (Jim: die Schätzung
+  // stieg 100 s lang alle 2 s um 15 %, der Encoder hing einen Schritt
+  // hinterher). Die Schwelle 1,1× ohne Haltezeit liefert `LageAuswerten` als
+  // `hoch_folge`; hier nur die Sperre von 2 s.
+  const bool im_anlauf = hoch && !runter && jetzt < rampe_bis_ms_;
+  const int64_t sperrzeit_ms = im_anlauf                                ? ratenregeln::kRampeSperreMs
                                : bildrate_hoch                          ? 3000
                                : (hoch_folge || unterschuss) && !runter ? 5000
                                                                         : 10000;
@@ -1154,6 +1173,13 @@ void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrat
   //
   // In der Anlaufphase gilt nur der bisherige 1,5×-Sprung mit 2-s-Sperre
   // (17.10.); die Uhr läuft aber schon mit.
+  //
+  // ★★ O34 (Jim, Bündel 120): In den ersten 60 s (RAMPE) zusätzlich SOFORT ab
+  // 1,1× der Forderung beim Öffnen, ohne Haltezeit — die Schätzung hebt alle
+  // ~2 s um ~15 %, und wer der Rampe hinterherläuft, bremst sie (app-limitiert
+  // wächst sie nur mit dem, was gesendet wird). Die Sperre von 2 s begrenzt
+  // die Vollbilder (`SetRates`/`Encode`). Regel und Begründung der Schwelle
+  // in `ratenregeln.h`. Abwärts unberührt.
   const bool ueber = gefordert_offen_ > 0 &&
                      static_cast<uint64_t>(forderung_roh_) * 5 >=
                          static_cast<uint64_t>(gefordert_offen_) * 6;
@@ -1162,7 +1188,12 @@ void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrat
   } else if (hoch_seit_ms_ == 0) {
     hoch_seit_ms_ = jetzt;
   }
-  if (ueber && jetzt >= anlauf_bis_ms_ && jetzt - hoch_seit_ms_ >= kFolgeMs) {
+  if (jetzt < rampe_bis_ms_) {
+    *hoch_folge = ratenregeln::RampeHoch(forderung_roh_, gefordert_offen_,
+                                         bitrate_adjuster_.GetAdjustedBitrateBps(),
+                                         target_bitrate_bps_);
+  }
+  if (!*hoch_folge && ueber && jetzt >= anlauf_bis_ms_ && jetzt - hoch_seit_ms_ >= kFolgeMs) {
     const uint32_t neu = bitrate_adjuster_.GetAdjustedBitrateBps();
     *hoch_folge = static_cast<uint64_t>(neu) * 10 >=
                   static_cast<uint64_t>(target_bitrate_bps_) * 11;
@@ -1252,14 +1283,17 @@ void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrat
 
   // ── 4. DIAGNOSE „Encoder haengt" ──
   // Liegen rohe Forderung und Encoder-Ziel länger als zehn Sekunden um mehr
-  // als 30 % auseinander, steht es im hwenc.log — höchstens alle 30 s. Genau
-  // diese Lage war bei jimtonics nur aus 2 Minuten SetRates-Zeilen
-  // herauszurechnen. (Der Ausgleicher allein macht 5–50 % Abstand; die Zeile
-  // ist ein Hinweis, kein Fehler.)
-  const uint32_t zg = std::max(forderung_roh_, target_bitrate_bps_);
-  const uint32_t zk = std::min(forderung_roh_, target_bitrate_bps_);
-  const bool klafft = zk > 0 && static_cast<uint64_t>(zg) * 100 >
-                                    static_cast<uint64_t>(zk) * 130;  // 30 %: die tote Zone nach einer Folge reicht bis ~1,26 (Prüfbefund N3)
+  // als 30 % auseinander UND geht dabei weniger als 0,8× der Forderung
+  // hinaus, steht es im hwenc.log — höchstens alle 30 s. Genau diese Lage war
+  // bei jimtonics nur aus 2 Minuten SetRates-Zeilen herauszurechnen. (Der
+  // Ausgleicher allein macht 5–50 % Abstand; die Zeile ist ein Hinweis, kein
+  // Fehler.)
+  // ★★ O34 (3): Jim 23:01:19 „Forderung 908, Encoder 1306, gesendet 1030" —
+  // der Encoder sendete MEHR als gefordert, kein Hänger, trotzdem gemeldet.
+  // Seitdem zählt die GESENDETE Rate (`ratenregeln::HaengtLage`); ohne volles
+  // Fenster (nach jedem Öffnen 5 s, in der Rampe also nie) keine Meldung.
+  const bool klafft = ratenregeln::HaengtLage(forderung_roh_, target_bitrate_bps_,
+                                              gesendet_bps_);
   if (!klafft) {
     haengt_seit_ms_ = 0;
   } else if (haengt_seit_ms_ == 0) {
@@ -1267,16 +1301,12 @@ void HwH264Encoder::LageAuswerten(int64_t jetzt, bool* hoch_folge, bool* bildrat
   } else if (jetzt - haengt_seit_ms_ >= 10000 &&
              jetzt - haengt_gemeldet_ms_ >= 30000) {
     haengt_gemeldet_ms_ = jetzt;
-    // hwenc.11: dazu, was wirklich herauskam („?" = Fenster nach dem
-    // letzten Öffnen noch nicht voll).
-    char gesendet[24] = "?";
-    if (gesendet_bps_ > 0) {
-      std::snprintf(gesendet, sizeof(gesendet), "%u", gesendet_bps_ / 1000);
-    }
     Protokoll("Encoder haengt: Forderung %u kbit/s @%u, Encoder %u kbit/s @%u, "
-              "gesendet %s kbit/s seit %lld s",
+              "gesendet %u kbit/s = %u %% der Forderung seit %lld s",
               forderung_roh_ / 1000, fz_zuletzt_, target_bitrate_bps_ / 1000,
-              framerate_offen_, gesendet,
+              framerate_offen_, gesendet_bps_ / 1000,
+              static_cast<unsigned>(static_cast<uint64_t>(gesendet_bps_) * 100 /
+                                    std::max<uint32_t>(1, forderung_roh_)),
               static_cast<long long>((jetzt - haengt_seit_ms_) / 1000));
   }
 }
@@ -1299,7 +1329,10 @@ void HwH264Encoder::VaapiNeuAufsetzen(uint32_t neu, uint32_t gefordert, bool hoc
   Protokoll("VA-API %sneu aufsetzen: %u -> %u kbit/s, @%u -> @%u fps (%s%s%s%s%s, gefordert %u, "
             "beim letzten Oeffnen %u, %lld ms seit dem letzten)",
             wie, target_bitrate_bps_ / 1000, soll / 1000, framerate_offen_, fz,
-            hoch ? "hoch " : "", folge ? "(Folge) " : "", runter ? "runter " : "",
+            hoch ? "hoch " : "",
+            // O34: in der Rampe heißt die Folge im Protokoll „(Rampe)".
+            folge ? (jetzt < rampe_bis_ms_ ? "(Rampe) " : "(Folge) ") : "",
+            runter ? "runter " : "",
             bildrate ? "bildrate" : "", unterschuss, gefordert / 1000,
             gefordert_offen_ / 1000, static_cast<long long>(jetzt - letztes_aufsetzen_ms_));
   target_bitrate_bps_ = soll;

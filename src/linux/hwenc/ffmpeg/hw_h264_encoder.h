@@ -170,7 +170,8 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   // (0 = nicht).
   int64_t hoch_seit_ms_ = 0;
   // Diagnose „Encoder haengt": seit wann Forderung und Encoder-Ziel um mehr
-  // als 15 % auseinanderliegen, und wann zuletzt gemeldet.
+  // als 30 % auseinanderliegen UND weniger als 0,8× der Forderung gesendet
+  // wird (O34), und wann zuletzt gemeldet.
   int64_t haengt_seit_ms_ = 0;
   int64_t haengt_gemeldet_ms_ = 0;
   // So lange muss eine Abweichung durchgehend bestehen, bevor sie zählt.
@@ -215,8 +216,14 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   // echten Sprüngen und nicht öfter als alle paar Sekunden.
   int64_t letztes_aufsetzen_ms_ = 0;
   // ★ 17.10.2026: Anlaufphase nach InitEncode — aufwärts schneller neu aufsetzen.
+  // Seit O34 sperrt sie nur noch Folge und Unterschuss-Ausgleich (deren
+  // Fenster brauchen Ruhe); die 2-s-Regel aufwärts hängt an der Rampe.
   static constexpr int64_t kAnlaufMs = 8000;
   int64_t anlauf_bis_ms_ = 0;
+  // ★★ O34 (06.11.2026, Jim, Bündel 120): Rampe — 60 s nach InitEncode folgt
+  // VA-API einer höheren Forderung sofort (1,1×, keine Haltezeit, Sperre 2 s);
+  // Regeln in `ratenregeln.h`.
+  int64_t rampe_bis_ms_ = 0;
   // Intel-iHD erkannt (Qualitätsstufe 1).
   bool intel_ = false;
   // ★★ 09.10.2026 (Haltoan, „720p mit 0,1 Mbit", hwenc.log Bündel 85): Ein

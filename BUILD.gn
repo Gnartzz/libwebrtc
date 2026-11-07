@@ -223,6 +223,7 @@ rtc_shared_library("libwebrtc") {
       "src/linux/hwenc/ffmpeg/ffmpeg_lader.h",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.h",
+      "src/linux/hwenc/ffmpeg/ratenregeln.h",
       "src/linux/hwenc/hw_encoder_factory.cc",
       "src/linux/hwenc/hw_encoder_factory.h",
     ]
