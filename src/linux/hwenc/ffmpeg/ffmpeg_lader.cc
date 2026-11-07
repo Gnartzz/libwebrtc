@@ -110,6 +110,8 @@ void LadenEinmal() {
   dek &= Hole(avcodec, "avcodec_send_packet", &g_api.avcodec_send_packet);
   dek &= Hole(avcodec, "avcodec_receive_frame", &g_api.avcodec_receive_frame);
   dek &= Hole(avutil, "av_get_pix_fmt_name", &g_api.av_get_pix_fmt_name);
+  dek &= Hole(avutil, "av_hwframe_map", &g_api.av_hwframe_map);
+  dek &= Hole(avutil, "av_image_copy_plane_uc_from", &g_api.av_image_copy_plane_uc_from);
   g_api.dekoder_ok = dek;
   if (!dek) {
     RTC_LOG(LS_WARNING) << "[hwenc] FFmpeg ohne vollständige Dekoder-Funktionen — "

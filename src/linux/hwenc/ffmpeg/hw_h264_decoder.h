@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "api/video/encoded_image.h"
 #include "api/video_codecs/video_decoder.h"
@@ -70,6 +71,10 @@ class HwH264Decoder : public webrtc::VideoDecoder {
   // Ein fertiges VA-API-Bild herunterladen, umformen, ausliefern.
   int32_t BildAusliefern(const webrtc::EncodedImage& input_image,
                          std::optional<uint8_t> qp);
+  // Weg „abbilden": Oberfläche lesend abbilden und mit Streaming-Loads
+  // (`av_image_copy_plane_uc_from`) direkt in den I420-Puffer kopieren.
+  // false = Abbilden geht hier nicht, Aufrufer nimmt „holen".
+  bool Abbilden(webrtc::I420Buffer* puffer, int w, int h);
   // Zählt einen Fehler; liefert FALLBACK_SOFTWARE, wenn es zu viele in Folge
   // waren, sonst ERROR (WebRTC fordert dann ein Schlüsselbild an).
   int32_t Fehler(const char* wo, int r);
@@ -88,6 +93,12 @@ class HwH264Decoder : public webrtc::VideoDecoder {
   AVPacket* packet_ = nullptr;
   AVFrame* hw_frame_ = nullptr;
   AVFrame* sw_frame_ = nullptr;
+  AVFrame* map_frame_ = nullptr;
+  std::vector<uint8_t> uv_zwischen_;  // NV12-Farbebene, zwischengespeichert
+  // Welcher Weg aus dem Grafikspeicher: true = abbilden, false = holen
+  // (av_hwframe_transfer_data). Vorgabe aus HONEYCORD_HWDEC_WEG; scheitert
+  // das Abbilden einmal, bleibt es für diesen Decoder bei „holen".
+  bool abbilden_ = true;
 
   // Von FormatWaehlen gesetzt (läuft innerhalb von send_packet/receive_frame
   // auf demselben Faden wie Decode — keine Sperre nötig).

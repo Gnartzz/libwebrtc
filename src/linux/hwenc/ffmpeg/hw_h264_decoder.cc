@@ -12,6 +12,7 @@
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
 #include "libyuv/convert.h"
+#include "libyuv/planar_functions.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/time_utils.h"
@@ -152,6 +153,7 @@ void HwH264Decoder::Schliessen() {
   if (packet_) api.av_packet_free(&packet_);
   if (hw_frame_) api.av_frame_free(&hw_frame_);
   if (sw_frame_) api.av_frame_free(&sw_frame_);
+  if (map_frame_) api.av_frame_free(&map_frame_);
   ctx_ = nullptr;
   rueckfall_ = false;
   vaapi_aktiv_ = false;
@@ -211,7 +213,12 @@ bool HwH264Decoder::Configure(const Settings& settings) {
   packet_ = api.av_packet_alloc();
   hw_frame_ = api.av_frame_alloc();
   sw_frame_ = api.av_frame_alloc();
-  if (!packet_ || !hw_frame_ || !sw_frame_) {
+  map_frame_ = api.av_frame_alloc();
+  {
+    const char* weg = std::getenv("HONEYCORD_HWDEC_WEG");
+    abbilden_ = !(weg && ::strcasecmp(weg, "holen") == 0);
+  }
+  if (!packet_ || !hw_frame_ || !sw_frame_ || !map_frame_) {
     Schliessen();
     return false;
   }
@@ -222,9 +229,9 @@ bool HwH264Decoder::Configure(const Settings& settings) {
     }
   }
   zeit_start_ms_ = webrtc::TimeMillis();
-  Protokoll("Decoder #%d offen (VA-API, höchstens %dx%d)", nummer_,
+  Protokoll("Decoder #%d offen (VA-API, höchstens %dx%d, Weg %s)", nummer_,
             groesse.Valid() ? groesse.Width() : 0,
-            groesse.Valid() ? groesse.Height() : 0);
+            groesse.Valid() ? groesse.Height() : 0, abbilden_ ? "abbilden" : "holen");
   return true;
 }
 
@@ -383,33 +390,48 @@ int32_t HwH264Decoder::BildAusliefern(const webrtc::EncodedImage& input_image,
   // ★ Den Zwischenpuffer behalten, solange die Maße gleich bleiben: Mit
   // gefülltem buf[0] lädt FFmpeg direkt hinein, statt je Bild ~3 MB (1080p)
   // neu anzufordern.
-  const int64_t t1 = webrtc::TimeMicros();
-  if (sw_frame_->buf[0] &&
-      (sw_frame_->width != w || sw_frame_->height != h ||
-       sw_frame_->format != AV_PIX_FMT_NV12)) {
-    api.av_frame_unref(sw_frame_);
-  }
-  if (!sw_frame_->buf[0]) {
-    sw_frame_->format = AV_PIX_FMT_NV12;
-    sw_frame_->width = w;
-    sw_frame_->height = h;
-  }
-  int r = api.av_hwframe_transfer_data(sw_frame_, hw_frame_, 0);
-  if (r < 0 || sw_frame_->format != AV_PIX_FMT_NV12) {
-    api.av_frame_unref(sw_frame_);
-    // Systematisch: Gelingt das einmal nicht, gelingt es beim nächsten Bild
-    // auch nicht — sofort abgeben statt Sekunden ohne Bild.
-    return Abgeben("Herunterladen scheitert", r);
-  }
-  const int64_t t2 = webrtc::TimeMicros();
-
   webrtc::scoped_refptr<webrtc::I420Buffer> puffer = pool_.CreateI420Buffer(w, h);
   if (!puffer) return Fehler("Bildvorrat erschöpft", 0);
-  libyuv::NV12ToI420(sw_frame_->data[0], sw_frame_->linesize[0],
-                     sw_frame_->data[1], sw_frame_->linesize[1],
-                     puffer->MutableDataY(), puffer->StrideY(),
-                     puffer->MutableDataU(), puffer->StrideU(),
-                     puffer->MutableDataV(), puffer->StrideV(), w, h);
+
+  const int64_t t1 = webrtc::TimeMicros();
+  int64_t t2 = t1;
+  bool fertig = false;
+  if (abbilden_) {
+    fertig = Abbilden(puffer.get(), w, h);
+    t2 = webrtc::TimeMicros();
+    if (!fertig) {
+      abbilden_ = false;
+      Protokoll("Decoder #%d: Abbilden geht hier nicht — Weg holen", nummer_);
+    }
+  }
+  if (!fertig) {
+    // ★ Weg „holen": den Zwischenpuffer behalten, solange die Maße gleich
+    // bleiben — mit gefülltem buf[0] lädt FFmpeg direkt hinein, statt je
+    // Bild ~3 MB (1080p) neu anzufordern.
+    if (sw_frame_->buf[0] &&
+        (sw_frame_->width != w || sw_frame_->height != h ||
+         sw_frame_->format != AV_PIX_FMT_NV12)) {
+      api.av_frame_unref(sw_frame_);
+    }
+    if (!sw_frame_->buf[0]) {
+      sw_frame_->format = AV_PIX_FMT_NV12;
+      sw_frame_->width = w;
+      sw_frame_->height = h;
+    }
+    int r = api.av_hwframe_transfer_data(sw_frame_, hw_frame_, 0);
+    if (r < 0 || sw_frame_->format != AV_PIX_FMT_NV12) {
+      api.av_frame_unref(sw_frame_);
+      // Systematisch: Gelingt das einmal nicht, gelingt es beim nächsten Bild
+      // auch nicht — sofort abgeben statt Sekunden ohne Bild.
+      return Abgeben("Herunterladen scheitert", r);
+    }
+    t2 = webrtc::TimeMicros();
+    libyuv::NV12ToI420(sw_frame_->data[0], sw_frame_->linesize[0],
+                       sw_frame_->data[1], sw_frame_->linesize[1],
+                       puffer->MutableDataY(), puffer->StrideY(),
+                       puffer->MutableDataU(), puffer->StrideU(),
+                       puffer->MutableDataV(), puffer->StrideV(), w, h);
+  }
   const int64_t t3 = webrtc::TimeMicros();
 
   // ★ Farbraum NICHT über `ExtractH264ColorSpace` (h264_color_space.h): Die
@@ -448,6 +470,43 @@ int32_t HwH264Decoder::BildAusliefern(const webrtc::EncodedImage& input_image,
   breite_ = w;
   hoehe_ = h;
   return WEBRTC_VIDEO_CODEC_OK;
+}
+
+// ★ WARUM ABBILDEN (07.11.2026, gemessen): Mit `av_hwframe_transfer_data`
+// kostete ein 1080p-Bild 3,2 ms (AMD 780M) bzw. ~4 ms CPU (UHD 630) — fast
+// alles im Kopieren. FFmpeg kopiert dort mit gewöhnlichem memcpy aus der
+// abgebildeten Oberfläche; die liegt aber in nicht zwischengespeichertem
+// (write-combined) Speicher, aus dem gewöhnliche Lesezugriffe sehr langsam
+// sind. `av_image_copy_plane_uc_from` liest mit Streaming-Loads (SSE4.1
+// MOVNTDQA) — genau für diesen Speicher gebaut. Die Helligkeitsebene geht
+// so direkt in den I420-Puffer, die Farbebene über einen kleinen
+// zwischengespeicherten Puffer und libyuv in U und V.
+bool HwH264Decoder::Abbilden(webrtc::I420Buffer* puffer, int w, int h) {
+  const auto& api = ffmpeg::Zugriff();
+  api.av_frame_unref(map_frame_);
+  map_frame_->format = AV_PIX_FMT_NV12;
+  int r = api.av_hwframe_map(map_frame_, hw_frame_, AV_HWFRAME_MAP_READ);
+  if (r < 0 || map_frame_->format != AV_PIX_FMT_NV12 || !map_frame_->data[0] ||
+      !map_frame_->data[1]) {
+    if (r < 0) {
+      Protokoll("Decoder #%d: av_hwframe_map: %s", nummer_, ffmpeg::FehlerText(r).c_str());
+    }
+    api.av_frame_unref(map_frame_);
+    return false;
+  }
+  api.av_image_copy_plane_uc_from(puffer->MutableDataY(), puffer->StrideY(),
+                                  map_frame_->data[0], map_frame_->linesize[0], w, h);
+  const int cw = (w + 1) / 2;
+  const int ch = (h + 1) / 2;
+  const size_t uv_zeile = static_cast<size_t>(cw) * 2;
+  uv_zwischen_.resize(uv_zeile * ch);
+  api.av_image_copy_plane_uc_from(uv_zwischen_.data(), uv_zeile, map_frame_->data[1],
+                                  map_frame_->linesize[1], uv_zeile, ch);
+  api.av_frame_unref(map_frame_);
+  libyuv::SplitUVPlane(uv_zwischen_.data(), static_cast<int>(uv_zeile),
+                       puffer->MutableDataU(), puffer->StrideU(),
+                       puffer->MutableDataV(), puffer->StrideV(), cw, ch);
+  return true;
 }
 
 void HwH264Decoder::ZeitenMelden(int64_t jetzt_ms) {

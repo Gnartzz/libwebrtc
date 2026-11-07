@@ -43,6 +43,7 @@ extern "C" {
 #include "libavutil/opt.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/imgutils.h"
 }
 
 // ★ MERKE, WESSEN HEADER DAS SIND (19.09.2026 gemessen): Als der Include-Pfad
@@ -101,6 +102,9 @@ struct Api {
   int (*avcodec_send_packet)(AVCodecContext*, const AVPacket*) = nullptr;
   int (*avcodec_receive_frame)(AVCodecContext*, AVFrame*) = nullptr;
   const char* (*av_get_pix_fmt_name)(enum AVPixelFormat) = nullptr;
+  int (*av_hwframe_map)(AVFrame*, const AVFrame*, int) = nullptr;
+  void (*av_image_copy_plane_uc_from)(uint8_t*, ptrdiff_t, const uint8_t*, ptrdiff_t,
+                                      ptrdiff_t, int) = nullptr;
 };
 
 // Lädt libavcodec/libavutil genau einmal. Mehrfach aufrufbar, fadensicher,
