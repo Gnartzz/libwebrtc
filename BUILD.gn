@@ -320,3 +320,37 @@ rtc_shared_library("libwebrtc") {
     }
   }
 }
+
+# Vergleichstest VA-API-Decoder gegen Software (07.11.2026). Wird nur auf
+# ausdrücklichen Wunsch gebaut:  ninja -C out/Release-x64 libwebrtc:hwdec_vergleich
+if (is_linux && libwebrtc_hwenc) {
+  rtc_executable("hwdec_vergleich") {
+    testonly = true
+    sources = [
+      "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
+      "src/linux/hwenc/ffmpeg/hw_h264_decoder.cc",
+      "src/linux/hwenc/hw_decoder_factory.cc",
+      "src/linux/hwenc/hw_gemeinsam.cc",
+      "test/hwdec_vergleich.cc",
+    ]
+    include_dirs = [
+      ".",
+      "src/linux/hwenc/ffmpeg/include",
+    ]
+    libs = [ "dl" ]
+    deps = [
+      "../api/environment:environment_factory",
+      "../api/video:encoded_image",
+      "../api/video:video_frame",
+      "../api/video_codecs:builtin_video_decoder_factory",
+      "../api/video_codecs:rtc_software_fallback_wrappers",
+      "../api/video_codecs:video_codecs_api",
+      "../common_video",
+      "../modules/video_coding:video_codec_interface",
+      "../rtc_base:logging",
+      "../rtc_base:timeutils",
+      "//third_party/abseil-cpp/absl/strings",
+      "//third_party/libyuv",
+    ]
+  }
+}
