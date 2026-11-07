@@ -103,6 +103,19 @@ void LadenEinmal() {
     return;
   }
 
+  // Dekoder-Gruppe: getrennt geprüft, ein Fehlen schaltet nur sie ab.
+  bool dek = true;
+  dek &= Hole(avcodec, "avcodec_find_decoder", &g_api.avcodec_find_decoder);
+  dek &= Hole(avcodec, "avcodec_get_hw_config", &g_api.avcodec_get_hw_config);
+  dek &= Hole(avcodec, "avcodec_send_packet", &g_api.avcodec_send_packet);
+  dek &= Hole(avcodec, "avcodec_receive_frame", &g_api.avcodec_receive_frame);
+  dek &= Hole(avutil, "av_get_pix_fmt_name", &g_api.av_get_pix_fmt_name);
+  g_api.dekoder_ok = dek;
+  if (!dek) {
+    RTC_LOG(LS_WARNING) << "[hwenc] FFmpeg ohne vollständige Dekoder-Funktionen — "
+                           "Hardware-Dekodierung aus, Encoder unberührt";
+  }
+
   g_name = kAvcodecName;
   g_geladen = true;
   RTC_LOG(LS_INFO) << "[hwenc] " << g_name << " geladen";

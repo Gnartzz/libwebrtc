@@ -42,6 +42,7 @@ extern "C" {
 #include "libavutil/hwcontext.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixfmt.h"
+#include "libavutil/pixdesc.h"
 }
 
 // ★ MERKE, WESSEN HEADER DAS SIND (19.09.2026 gemessen): Als der Include-Pfad
@@ -90,6 +91,16 @@ struct Api {
   int (*av_opt_set_int)(void*, const char*, int64_t, int) = nullptr;
   int (*av_strerror)(int, char*, size_t) = nullptr;
   unsigned (*avutil_version)() = nullptr;
+
+  // ★ DEKODIEREN (07.11.2026). Eine eigene Gruppe: Fehlt hier etwas, fällt
+  // nur der Hardware-Decoder weg — der Encoder lädt wie bisher. So kann der
+  // Decoder den Encoder nie mitreißen. Gültig nur, wenn `dekoder_ok`.
+  bool dekoder_ok = false;
+  const AVCodec* (*avcodec_find_decoder)(enum AVCodecID) = nullptr;
+  const AVCodecHWConfig* (*avcodec_get_hw_config)(const AVCodec*, int) = nullptr;
+  int (*avcodec_send_packet)(AVCodecContext*, const AVPacket*) = nullptr;
+  int (*avcodec_receive_frame)(AVCodecContext*, AVFrame*) = nullptr;
+  const char* (*av_get_pix_fmt_name)(enum AVPixelFormat) = nullptr;
 };
 
 // Lädt libavcodec/libavutil genau einmal. Mehrfach aufrufbar, fadensicher,

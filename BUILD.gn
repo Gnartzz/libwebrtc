@@ -221,11 +221,17 @@ rtc_shared_library("libwebrtc") {
     sources += [
       "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
       "src/linux/hwenc/ffmpeg/ffmpeg_lader.h",
+      "src/linux/hwenc/ffmpeg/hw_h264_decoder.cc",
+      "src/linux/hwenc/ffmpeg/hw_h264_decoder.h",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.h",
       "src/linux/hwenc/ffmpeg/ratenregeln.h",
+      "src/linux/hwenc/hw_decoder_factory.cc",
+      "src/linux/hwenc/hw_decoder_factory.h",
       "src/linux/hwenc/hw_encoder_factory.cc",
       "src/linux/hwenc/hw_encoder_factory.h",
+      "src/linux/hwenc/hw_gemeinsam.cc",
+      "src/linux/hwenc/hw_gemeinsam.h",
     ]
     # Die oeffentlichen FFmpeg-Header liegen im Baum (siehe ffmpeg_lader.h).
     # NICHT gegen libavcodec binden -- geladen wird zur Laufzeit per dlopen.
@@ -275,7 +281,12 @@ rtc_shared_library("libwebrtc") {
   if (is_linux && libwebrtc_hwenc) {
     # Der SimulcastEncoderAdapter umhuellt unsere Encoder (Lagen + Rueckfall),
     # genau wie in der eingebauten Fabrik.
-    deps += [ "../media:rtc_simulcast_encoder_adapter" ]
+    deps += [
+      "../media:rtc_simulcast_encoder_adapter",
+      # Decoder (07.11.2026): Rueckfall-Wrapper, Bildvorrat, H.264-Parser.
+      "../api/video_codecs:rtc_software_fallback_wrappers",
+      "../common_video",
+    ]
   }
 
   # screen capture device

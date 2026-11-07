@@ -22,6 +22,7 @@
 #include "src/win/msdkvideoencoderfactory.h"
 #endif
 #if defined(USE_LINUX_HWENC)
+#include "src/linux/hwenc/hw_decoder_factory.h"
 #include "src/linux/hwenc/hw_encoder_factory.h"
 #endif
 #if defined(WEBRTC_IOS)
@@ -91,13 +92,13 @@ bool RTCPeerConnectionFactoryImpl::Initialize() {
         CreateIntelVideoEncoderFactory(), CreateIntelVideoDecoderFactory(),
 #elif defined(USE_LINUX_HWENC)
         // Linux: H.264 ueber die Grafikkarte, alles andere unveraendert.
-        // Die Huelle meldet dieselben Formate wie die eingebaute Fabrik und
-        // greift nur beim Erzeugen ein -- ohne brauchbare Hardware bleibt es
-        // bei OpenH264. Dekodiert wird weiter in Software: Das ist die
-        // guenstigere Richtung, und ein halb fertiger Hardware-Decoder waere
-        // ein Risiko ohne Gegenwert.
+        // Beide Huellen melden dieselben Formate wie die eingebauten Fabriken
+        // und greifen nur beim Erzeugen ein -- ohne brauchbare Hardware bleibt
+        // es bei OpenH264 bzw. dem eingebauten FFmpeg-Decoder. Seit
+        // 07.11.2026 dekodiert H.264 ueber VA-API (Jim: Meteor Lake, Last
+        // 3,1/4 nur fuers Dekodieren); Software bleibt als Rueckfall dahinter.
         CreateLinuxVideoEncoderFactory(),
-        webrtc::CreateBuiltinVideoDecoderFactory(),
+        CreateLinuxVideoDecoderFactory(),
 #else
         webrtc::CreateBuiltinVideoEncoderFactory(),
         webrtc::CreateBuiltinVideoDecoderFactory(),
