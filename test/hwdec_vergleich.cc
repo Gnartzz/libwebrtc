@@ -72,8 +72,11 @@ std::vector<Einheit> Zerlegen(const std::vector<uint8_t>& s) {
 
 struct Sammler : webrtc::DecodedImageCallback {
   std::map<uint32_t, webrtc::scoped_refptr<webrtc::I420BufferInterface>> bilder;
+  bool behalten = true;  // Dauerlauf: nur zählen, sonst läuft der Speicher voll
+  size_t gezaehlt = 0;
   int32_t Decoded(webrtc::VideoFrame& f) override {
-    bilder[f.rtp_timestamp()] = f.video_frame_buffer()->ToI420();
+    ++gezaehlt;
+    if (behalten) bilder[f.rtp_timestamp()] = f.video_frame_buffer()->ToI420();
     return 0;
   }
 };
@@ -194,12 +197,13 @@ int main(int argc, char** argv) {
   if (dauer > 0) {
     libwebrtc::HwH264Decoder hw;
     Sammler s;
+    s.behalten = false;
     if (!hw.Configure(einst)) return 1;
     hw.RegisterDecodeCompleteCallback(&s);
     const Lauf l = Dekodieren(&hw, einheiten, 0, 0, dauer);
     hw.Release();
-    std::printf("Dauer VA-API: %d ok, %d Fehler, CPU %.2f ms/Bild\n", l.ok, l.fehler,
-                l.cpu_ms / (einheiten.size() * dauer));
+    std::printf("Dauer VA-API: %d ok, %d Fehler, %zu Bilder, CPU %.2f ms/Bild\n", l.ok,
+                l.fehler, s.gezaehlt, l.cpu_ms / (einheiten.size() * dauer));
     return 0;
   }
 
