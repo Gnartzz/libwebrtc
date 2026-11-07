@@ -91,14 +91,15 @@ struct Lauf {
 };
 
 Lauf Dekodieren(webrtc::VideoDecoder* d, const std::vector<Einheit>& e, int w,
-                int h) {
+                int h, size_t runden = 1) {
   Lauf l;
   const double c0 = CpuMs();
-  for (size_t i = 0; i < e.size(); ++i) {
+  for (size_t k = 0; k < e.size() * runden; ++k) {
+    const size_t i = k % e.size();
     webrtc::EncodedImage img;
     img.SetEncodedData(
         webrtc::EncodedImageBuffer::Create(e[i].daten.data(), e[i].daten.size()));
-    img.SetRtpTimestamp(static_cast<uint32_t>(i * 3000));
+    img.SetRtpTimestamp(static_cast<uint32_t>(k * 3000));
     img._frameType = e[i].schluessel ? webrtc::VideoFrameType::kVideoFrameKey
                                      : webrtc::VideoFrameType::kVideoFrameDelta;
     img._encodedWidth = w;
@@ -141,6 +142,10 @@ int main(int argc, char** argv) {
     return 2;
   }
   const bool nur_wrapper = argc > 2 && std::strcmp(argv[2], "--nur-wrapper") == 0;
+  // --dauer N: nur VA-API, den Strom N-mal hintereinander (für die
+  // 30-s-Zeitenzeile im hwenc.log), CPU-Zeit je Bild.
+  const size_t dauer = argc > 3 && std::strcmp(argv[2], "--dauer") == 0
+                           ? static_cast<size_t>(std::atoi(argv[3])) : 0;
   FILE* f = std::fopen(argv[1], "rb");
   if (!f) {
     std::perror("Datei");
@@ -184,6 +189,18 @@ int main(int argc, char** argv) {
   if (!libwebrtc::HwH264Decoder::IstVerfuegbar()) {
     std::printf("FEHL: VA-API-Decoder nicht verfügbar (siehe hwenc.log)\n");
     return 1;
+  }
+
+  if (dauer > 0) {
+    libwebrtc::HwH264Decoder hw;
+    Sammler s;
+    if (!hw.Configure(einst)) return 1;
+    hw.RegisterDecodeCompleteCallback(&s);
+    const Lauf l = Dekodieren(&hw, einheiten, 0, 0, dauer);
+    hw.Release();
+    std::printf("Dauer VA-API: %d ok, %d Fehler, CPU %.2f ms/Bild\n", l.ok, l.fehler,
+                l.cpu_ms / (einheiten.size() * dauer));
+    return 0;
   }
 
   // Software (eingebaut).
