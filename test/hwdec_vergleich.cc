@@ -147,7 +147,8 @@ int main(int argc, char** argv) {
   const bool nur_wrapper = argc > 2 && std::strcmp(argv[2], "--nur-wrapper") == 0;
   // --dauer N: nur VA-API, den Strom N-mal hintereinander (für die
   // 30-s-Zeitenzeile im hwenc.log), CPU-Zeit je Bild.
-  const size_t dauer = argc > 3 && std::strcmp(argv[2], "--dauer") == 0
+  const bool dauer_sw = argc > 3 && std::strcmp(argv[2], "--dauer-sw") == 0;
+  const size_t dauer = argc > 3 && (std::strcmp(argv[2], "--dauer") == 0 || dauer_sw)
                            ? static_cast<size_t>(std::atoi(argv[3])) : 0;
   FILE* f = std::fopen(argv[1], "rb");
   if (!f) {
@@ -194,6 +195,18 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  if (dauer > 0 && dauer_sw) {
+    auto d = webrtc::CreateBuiltinVideoDecoderFactory()->Create(env, format);
+    Sammler s;
+    s.behalten = false;
+    if (!d || !d->Configure(einst)) return 1;
+    d->RegisterDecodeCompleteCallback(&s);
+    const Lauf l = Dekodieren(d.get(), einheiten, 0, 0, dauer);
+    d->Release();
+    std::printf("Dauer Software: %d ok, %d Fehler, %zu Bilder, CPU %.2f ms/Bild\n", l.ok,
+                l.fehler, s.gezaehlt, l.cpu_ms / (einheiten.size() * dauer));
+    return 0;
+  }
   if (dauer > 0) {
     libwebrtc::HwH264Decoder hw;
     Sammler s;
