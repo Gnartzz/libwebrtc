@@ -73,6 +73,8 @@ class HwH264Decoder : public webrtc::VideoDecoder {
   // Zählt einen Fehler; liefert FALLBACK_SOFTWARE, wenn es zu viele in Folge
   // waren, sonst ERROR (WebRTC fordert dann ein Schlüsselbild an).
   int32_t Fehler(const char* wo, int r);
+  // Systematischer Fehler: sofort FALLBACK_SOFTWARE, mit Grund im Protokoll.
+  int32_t Abgeben(const char* grund, int r);
   void ZeitenMelden(int64_t jetzt_ms);
   void Schliessen();
 
@@ -91,6 +93,7 @@ class HwH264Decoder : public webrtc::VideoDecoder {
   // auf demselben Faden wie Decode — keine Sperre nötig).
   bool rueckfall_ = false;
   bool vaapi_aktiv_ = false;
+  bool gemeldet_ = false;  // „VA-API dekodiert" einmal je Öffnen
   std::string rueckfall_grund_;
 
   int fehler_in_folge_ = 0;

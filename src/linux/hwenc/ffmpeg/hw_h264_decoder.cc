@@ -54,6 +54,29 @@ bool H264MitVaapi(const ffmpeg::Api& api) {
   return false;
 }
 
+bool HerunterladenGeht(const ffmpeg::Api& api, AVBufferRef* geraet) {
+  AVBufferRef* vorrat = api.av_hwframe_ctx_alloc(geraet);
+  if (!vorrat) return false;
+  auto* fc = reinterpret_cast<AVHWFramesContext*>(vorrat->data);
+  fc->format = AV_PIX_FMT_VAAPI;
+  fc->sw_format = AV_PIX_FMT_NV12;
+  fc->width = 64;
+  fc->height = 64;
+  fc->initial_pool_size = 1;
+  bool ok = api.av_hwframe_ctx_init(vorrat) >= 0;
+  AVFrame* hw = ok ? api.av_frame_alloc() : nullptr;
+  AVFrame* sw = ok ? api.av_frame_alloc() : nullptr;
+  ok = ok && hw && sw && api.av_hwframe_get_buffer(vorrat, hw, 0) >= 0;
+  if (ok) {
+    sw->format = AV_PIX_FMT_NV12;
+    ok = api.av_hwframe_transfer_data(sw, hw, 0) >= 0 && sw->format == AV_PIX_FMT_NV12;
+  }
+  if (hw) api.av_frame_free(&hw);
+  if (sw) api.av_frame_free(&sw);
+  api.av_buffer_unref(&vorrat);
+  return ok;
+}
+
 bool Pruefen() {
   if (AbgeschaltetPerUmgebung()) {
     Protokoll("Decoder: HONEYCORD_HWDEC=%s — Hardware-Dekodierung abgeschaltet",
@@ -80,6 +103,26 @@ bool Pruefen() {
     return false;
   }
   const std::string treiber = VaTreiber(geraet);
+  // ★ NVIDIA bleibt draußen (Prüfbefund M2): Dort kodiert NVENC, und der
+  // VA-Treiber (nvidia-vaapi-driver) ist ein Aufsatz auf NVDEC, den wir nie
+  // gemessen haben. Software ist dort der bekannte Weg.
+  if (treiber.find("NVDEC") != std::string::npos ||
+      treiber.find("nvidia") != std::string::npos ||
+      treiber.find("NVIDIA") != std::string::npos) {
+    api.av_buffer_unref(&geraet);
+    Protokoll("Decoder: VA-Treiber %s ist NVIDIA — Software wie bisher", treiber.c_str());
+    return false;
+  }
+  // ★ PROBE MIT ECHTEM HERUNTERLADEN (Prüfbefund M1): Ein Treiber, der zwar
+  // dekodiert, aber kein Bild zurückgibt, fiele sonst erst im Gespräch auf —
+  // und WebRTC reicht nach einem Fehler nur noch Schlüsselbilder durch, also
+  // Sekunden ohne Bild je Spur. Hier kostet es einmal ein 64×64-Bild.
+  if (!HerunterladenGeht(api, geraet)) {
+    api.av_buffer_unref(&geraet);
+    Protokoll("Decoder: VA-API-Bild lässt sich nicht herunterladen (Treiber %s) — "
+              "Software wie bisher", treiber.c_str());
+    return false;
+  }
   api.av_buffer_unref(&geraet);
   Protokoll("Decoder: H.264 über VA-API verfügbar (%s, Treiber %s, %s)",
             ffmpeg::GeladeneBibliothek().c_str(), treiber.c_str(),
@@ -112,6 +155,7 @@ void HwH264Decoder::Schliessen() {
   ctx_ = nullptr;
   rueckfall_ = false;
   vaapi_aktiv_ = false;
+  gemeldet_ = false;
   rueckfall_grund_.clear();
   fehler_in_folge_ = 0;
 }
@@ -145,6 +189,12 @@ bool HwH264Decoder::Configure(const Settings& settings) {
   // ★ Sofort ausgeben: WebRTC-H.264 hat keine B-Bilder, ein Umsortierpuffer
   // hielte nur Bilder zurück, wenn der SPS nichts dazu sagt.
   ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
+  // ★ Reines Baseline (Profil 66 ohne constraint_set1) kennt FFmpegs
+  // VA-API-Abbildung sonst nicht und ginge still in Software (Prüfbefund N4).
+  // WebRTC-Ströme benutzen weder FMO noch ASO — der Unterschied zu
+  // Constrained Baseline existiert für uns nicht. Der Vergleichstest prüft
+  // bitgleich gegen Software.
+  ctx_->hwaccel_flags |= AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
   const webrtc::RenderResolution& groesse = settings.max_render_resolution();
   if (groesse.Valid()) {
     ctx_->coded_width = groesse.Width();
@@ -184,10 +234,6 @@ enum AVPixelFormat HwH264Decoder::FormatWaehlen(
   auto* self = static_cast<HwH264Decoder*>(ctx->opaque);
   for (const enum AVPixelFormat* p = formate; *p != AV_PIX_FMT_NONE; ++p) {
     if (*p == AV_PIX_FMT_VAAPI) {
-      if (!self->vaapi_aktiv_) {
-        Protokoll("Decoder #%d: VA-API greift (%dx%d, Profil %d)", self->nummer_,
-                  ctx->coded_width, ctx->coded_height, ctx->profile);
-      }
       self->vaapi_aktiv_ = true;
       return *p;
     }
@@ -233,6 +279,13 @@ webrtc::VideoDecoder::DecoderInfo HwH264Decoder::GetDecoderInfo() const {
 
 const char* HwH264Decoder::ImplementationName() const { return kName; }
 
+int32_t HwH264Decoder::Abgeben(const char* grund, int r) {
+  rueckfall_ = true;
+  rueckfall_grund_ = std::string(grund) + " (" + ffmpeg::FehlerText(r) + ")";
+  Protokoll("Decoder #%d: Rückfall auf Software — %s", nummer_, rueckfall_grund_.c_str());
+  return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+}
+
 int32_t HwH264Decoder::Fehler(const char* wo, int r) {
   ++fehler_in_folge_;
   ++zeit_fehler_;
@@ -241,9 +294,10 @@ int32_t HwH264Decoder::Fehler(const char* wo, int r) {
               ffmpeg::FehlerText(r).c_str(), fehler_in_folge_);
   }
   // ★ Einzelne Fehler sind normal (Verlust, fehlende Referenz) — WebRTC
-  // fordert dann ein Schlüsselbild an. Der Rückfall-Wrapper wechselt selbst
-  // nach vier gescheiterten SCHLÜSSELBILDERN. Diese Grenze hier fängt den
-  // Fall, dass auch Zwischenbilder dauerhaft scheitern (Treiber hängt).
+  // fordert dann ein Schlüsselbild an und reicht bis dahin NUR Schlüsselbilder
+  // durch. Der Rückfall-Wrapper wechselt selbst nach vier gescheiterten
+  // Schlüsselbildern. Diese Grenze ist nur der Gurt dahinter; systematische
+  // Fehler (Herunterladen, Format, Maße) geben sofort ab, s. `Abgeben`.
   if (fehler_in_folge_ >= kMaxFehlerInFolge) {
     rueckfall_ = true;
     rueckfall_grund_ = std::string(wo) + " scheitert dauerhaft";
@@ -324,7 +378,7 @@ int32_t HwH264Decoder::BildAusliefern(const webrtc::EncodedImage& input_image,
   }
   const int w = hw_frame_->width;
   const int h = hw_frame_->height;
-  if (w <= 0 || h <= 0) return Fehler("Bildmaße", 0);
+  if (w <= 0 || h <= 0) return Abgeben("Bild ohne Maße", 0);
 
   // ★ Den Zwischenpuffer behalten, solange die Maße gleich bleiben: Mit
   // gefülltem buf[0] lädt FFmpeg direkt hinein, statt je Bild ~3 MB (1080p)
@@ -343,7 +397,9 @@ int32_t HwH264Decoder::BildAusliefern(const webrtc::EncodedImage& input_image,
   int r = api.av_hwframe_transfer_data(sw_frame_, hw_frame_, 0);
   if (r < 0 || sw_frame_->format != AV_PIX_FMT_NV12) {
     api.av_frame_unref(sw_frame_);
-    return Fehler("Herunterladen", r);
+    // Systematisch: Gelingt das einmal nicht, gelingt es beim nächsten Bild
+    // auch nicht — sofort abgeben statt Sekunden ohne Bild.
+    return Abgeben("Herunterladen scheitert", r);
   }
   const int64_t t2 = webrtc::TimeMicros();
 
@@ -380,6 +436,11 @@ int32_t HwH264Decoder::BildAusliefern(const webrtc::EncodedImage& input_image,
                                 .build();
   callback_->Decoded(bild, std::nullopt, qp);
 
+  if (!gemeldet_) {
+    Protokoll("Decoder #%d: VA-API dekodiert (%dx%d, Profil %d)", nummer_, w, h,
+              ctx_->profile);
+    gemeldet_ = true;
+  }
   fehler_in_folge_ = 0;
   zeit_holen_us_ += t2 - t1;
   zeit_umformen_us_ += t3 - t2;
