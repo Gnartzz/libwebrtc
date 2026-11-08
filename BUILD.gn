@@ -132,6 +132,7 @@ if (is_win) {
     deps = [
       ":libwebrtc_nvenc",
       "../api/environment",
+      "../api/video_codecs:rtc_software_fallback_wrappers",
       "../api/video_codecs:builtin_video_encoder_factory",
       "../api/video_codecs:video_codecs_api",
       "../rtc_base:logging",

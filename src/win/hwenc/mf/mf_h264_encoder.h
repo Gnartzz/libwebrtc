@@ -76,6 +76,8 @@ class MfH264Encoder : public webrtc::VideoEncoder {
   };
 
   int32_t Oeffnen();       // MFT, Gerät, Typen, Ereignisfaden
+  // Liegengebliebene Ereignisse ohne Warten abarbeiten.
+  void EreignisseAbarbeiten();
   void Schliessen();
   bool RateSetzen(uint32_t bps);
   // Neue Rate nach den Regeln unten anwenden, wenn sie sich lohnt (jede
@@ -106,7 +108,7 @@ class MfH264Encoder : public webrtc::VideoEncoder {
   bool keyframe_angefordert_ = false;
   bool neu_aufsetzen_ = false;
   int64_t frame_index_ = 0;
-  std::map<int64_t, Stempel> stempel_;
+  std::map<LONGLONG, Stempel> stempel_;   // Schlüssel: Sample-Zeit (100 ns)
 
   // Ratenüberwachung: Ausgabe der letzten Sekunden gegen das Ziel.
   int64_t fenster_start_ms_ = 0;
@@ -123,10 +125,15 @@ class MfH264Encoder : public webrtc::VideoEncoder {
   Microsoft::WRL::ComPtr<IMFTransform> mft_;
   Microsoft::WRL::ComPtr<ICodecAPI> codec_;
   Microsoft::WRL::ComPtr<IMFMediaEventGenerator> events_;
-  Microsoft::WRL::ComPtr<ID3D11Texture2D> textur_[2];
+  // Vier im Wechsel (Prüfbefund): der asynchrone MFT kann eine Textur noch
+  // lesen, wenn eine Ausgabe sich verspätet.
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> textur_[4];
   int textur_index_ = 0;
   std::vector<uint8_t> nv12_;
   int eingabe_frei_ = 0;        // gesammelte METransformNeedInput
+  int zeitueberschreitungen_ = 0;   // Bilder in Folge ohne Eingabefreigabe
+  int64_t erste_zeit_us_ = -1;      // erste Aufnahmezeit seit dem Öffnen
+  LONGLONG letzte_probe_zeit_ = -1; // streng steigende Sample-Zeit
 
   // Ereignisfaden: GetEvent blockiert; was er holt, landet hier.
   std::thread ereignis_faden_;

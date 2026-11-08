@@ -168,6 +168,7 @@ int32_t MfH264Encoder::InitEncode(const webrtc::VideoCodec* codec_settings,
   encoder_bps_ = bitrate_adjuster_.GetAdjustedBitrateBps();
   frame_index_ = 0;
   stempel_.clear();
+  offen_seit_ms_ = webrtc::TimeMillis();   // Anlauf zählt ab InitEncode, nicht je Neuaufsetzen
   return Oeffnen();
 }
 
@@ -216,7 +217,9 @@ void MfH264Encoder::RateNachRegeln(uint32_t soll, int64_t jetzt, const char* anl
   const double schwelle = anlauf ? 0.10 : 0.25;
   const int64_t sperre = anlauf ? 2000 : 3000;
   if (!einbruch && (q < 1.0 + schwelle && q > 1.0 - schwelle)) return;
-  if (!einbruch && jetzt - letzte_rate_ms_ < sperre) return;
+  // Auch ein Einbruch höchstens einmal je Sekunde: fällt die Rate im Stau
+  // Schritt für Schritt, gäbe es sonst ein Schlüsselbild je Sekunde (Prüfbefund).
+  if (jetzt - letzte_rate_ms_ < (einbruch ? 1000 : sperre)) return;
   const uint32_t alt = encoder_bps_;
   if (RateSetzen(soll)) {
     letzte_rate_ms_ = jetzt;
@@ -370,8 +373,10 @@ int32_t MfH264Encoder::Oeffnen() {
   fenster_bytes_ = 0;
   ueber_folge_ = 0;
   letztes_aufsetzen_ms_ = webrtc::TimeMillis();
-  offen_seit_ms_ = letztes_aufsetzen_ms_;
   letzte_rate_ms_ = letztes_aufsetzen_ms_;
+  zeitueberschreitungen_ = 0;
+  erste_zeit_us_ = -1;
+  letzte_probe_zeit_ = -1;
   Protokoll("offen: %ux%u @%u  Ziel %u kbit/s (WebRTC %u)  %s  Profil %u", width_, height_, framerate_,
             encoder_bps_ / 1000, target_bps_ / 1000, screensharing_ ? "Bildschirm" : "Kamera",
             ProfilAus(format_));
@@ -379,14 +384,20 @@ int32_t MfH264Encoder::Oeffnen() {
 }
 
 void MfH264Encoder::Schliessen() {
+  bool beendet = true;
   if (mft_) {
     mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+    mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     mft_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
     // Shutdown löst das blockierende GetEvent im Ereignisfaden (MF_E_SHUTDOWN).
     ComPtr<IMFShutdown> aus;
-    if (SUCCEEDED(mft_.As(&aus))) aus->Shutdown();
+    beendet = SUCCEEDED(mft_.As(&aus)) && SUCCEEDED(aus->Shutdown());
   }
-  if (ereignis_faden_.joinable()) ereignis_faden_.join();
+  if (ereignis_faden_.joinable()) {
+    // Ohne Shutdown käme GetEvent nie zurück — dann nicht warten (der Faden
+    // hält seinen eigenen Verweis auf den Ereignisgeber).
+    if (beendet) ereignis_faden_.join(); else ereignis_faden_.detach();
+  }
   events_.Reset();
   codec_.Reset();
   mft_.Reset();
@@ -429,6 +440,9 @@ int32_t MfH264Encoder::Encode(const webrtc::VideoFrame& frame,
   if (neu_aufsetzen_ || !mft_) {
     neu_aufsetzen_ = false;
     Schliessen();
+    if (const uint32_t a = bitrate_adjuster_.GetAdjustedBitrateBps()) encoder_bps_ = a;
+    // Scheitert das Öffnen, übernimmt die Rückfall-Hülle der Fabrik
+    // (VideoEncoderSoftwareFallbackWrapper → OpenH264) — dauerhaft.
     if (Oeffnen() != WEBRTC_VIDEO_CODEC_OK) return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   }
 
@@ -444,7 +458,7 @@ int32_t MfH264Encoder::Encode(const webrtc::VideoFrame& frame,
   libyuv::I420ToNV12(i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(), i420->DataV(),
                      i420->StrideV(), nv12_.data(), width_, nv12_.data() + width_ * height_, width_,
                      width_, height_);
-  textur_index_ ^= 1;
+  textur_index_ = (textur_index_ + 1) % 4;
   ID3D11Texture2D* tex = textur_[textur_index_].Get();
   context_->UpdateSubresource(tex, 0, nullptr, nv12_.data(), width_, 0);
 
@@ -456,14 +470,23 @@ int32_t MfH264Encoder::Encode(const webrtc::VideoFrame& frame,
   }
   puffer->SetCurrentLength(static_cast<DWORD>(nv12_.size()));
   probe->AddBuffer(puffer.Get());
-  // Die laufende Nummer als Zeit: eindeutig, und die Zuordnung zum Stempel
-  // klappt auch, wenn der MFT ein Bild später herausgibt.
+  // ★ Echte Aufnahmezeit als Sample-Zeit (Prüfbefund M3): Die
+  // Ratensteuerung verteilt sonst Bits nach der deklarierten Bildrate und
+  // liefert zu wenig, wenn weniger Bilder kommen (Bildschirm 5–15 fps).
+  // Streng steigend, und ohne Zeitstempel die laufende Nummer.
   const LONGLONG dauer = 10000000LL / std::max<uint32_t>(framerate_, 1);
   const int64_t nummer = frame_index_++;
-  probe->SetSampleTime(nummer * dauer);
+  LONGLONG zeit = nummer * dauer;
+  if (frame.timestamp_us() > 0) {
+    if (erste_zeit_us_ < 0) erste_zeit_us_ = frame.timestamp_us();
+    zeit = (frame.timestamp_us() - erste_zeit_us_) * 10;
+  }
+  if (zeit <= letzte_probe_zeit_) zeit = letzte_probe_zeit_ + 1;
+  letzte_probe_zeit_ = zeit;
+  probe->SetSampleTime(zeit);
   probe->SetSampleDuration(dauer);
-  stempel_[nummer] = Stempel{frame.rtp_timestamp(), frame.ntp_time_ms(), frame.render_time_ms(),
-                             frame.rotation()};
+  stempel_[zeit] = Stempel{frame.rtp_timestamp(), frame.ntp_time_ms(), frame.render_time_ms(),
+                           frame.rotation()};
 
   // Auf die Freigabe zur Eingabe warten (kommt praktisch sofort).
   const int64_t start = webrtc::TimeMillis();
@@ -472,8 +495,20 @@ int32_t MfH264Encoder::Encode(const webrtc::VideoFrame& frame,
     HRESULT st = S_OK;
     const int rest = static_cast<int>(100 - (webrtc::TimeMillis() - start));
     if (rest <= 0 || !EreignisHolen(&typ, &st, rest)) {
-      // Kein Platz im Encoder: dieses Bild fallen lassen statt zu stauen.
-      stempel_.erase(nummer);
+      // Kein Platz im Encoder: dieses Bild fallen lassen statt zu stauen —
+      // und WebRTC sagen, dass es verworfen ist (Prüfbefund M2).
+      stempel_.erase(zeit);
+      callback_->OnDroppedFrame(webrtc::EncodedImageCallback::DropReason::kDroppedByEncoder);
+      bool ende = false;
+      {
+        std::lock_guard<std::mutex> l(ereignis_mutex_);
+        ende = ereignis_ende_;
+      }
+      if (++zeitueberschreitungen_ >= 5 || ende) {
+        Protokoll("Encoder antwortet nicht (%d Bilder in Folge%s), neu aufsetzen", zeitueberschreitungen_,
+                  ende ? ", Ereignisfaden beendet" : "");
+        neu_aufsetzen_ = true;
+      }
       return WEBRTC_VIDEO_CODEC_OK;
     }
     if (FAILED(st)) {
@@ -486,9 +521,10 @@ int32_t MfH264Encoder::Encode(const webrtc::VideoFrame& frame,
   }
   HRESULT hr = mft_->ProcessInput(0, probe.Get(), 0);
   --eingabe_frei_;
+  zeitueberschreitungen_ = 0;
   if (FAILED(hr)) {
     Protokoll("FEHLER: ProcessInput 0x%08lx", (unsigned long)hr);
-    stempel_.erase(nummer);
+    stempel_.erase(zeit);
     neu_aufsetzen_ = true;
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
@@ -508,7 +544,24 @@ int32_t MfH264Encoder::Encode(const webrtc::VideoFrame& frame,
     if (typ == METransformNeedInput) ++eingabe_frei_;
     else if (typ == METransformHaveOutput) geliefert = AusgabeAbholen();
   }
+  // Was sich angestaut hat (eine verspätete Ausgabe), gleich mitnehmen —
+  // sonst bliebe der Strom dauerhaft ein Bild zurück (Prüfbefund).
+  EreignisseAbarbeiten();
   return WEBRTC_VIDEO_CODEC_OK;
+}
+
+void MfH264Encoder::EreignisseAbarbeiten() {
+  MediaEventType typ = MEUnknown;
+  HRESULT st = S_OK;
+  while (EreignisHolen(&typ, &st, 0)) {
+    if (FAILED(st)) {
+      Protokoll("FEHLER: Encoder meldet 0x%08lx, neu aufsetzen", (unsigned long)st);
+      neu_aufsetzen_ = true;
+      return;
+    }
+    if (typ == METransformNeedInput) ++eingabe_frei_;
+    else if (typ == METransformHaveOutput) AusgabeAbholen();
+  }
 }
 
 bool MfH264Encoder::AusgabeAbholen() {
@@ -543,12 +596,10 @@ bool MfH264Encoder::AusgabeAbholen() {
 
   LONGLONG zeit = 0;
   s->GetSampleTime(&zeit);
-  const LONGLONG dauer = 10000000LL / std::max<uint32_t>(framerate_, 1);
-  const int64_t nummer = dauer ? zeit / dauer : 0;
   Stempel st;
-  auto it = stempel_.find(nummer);
+  auto it = stempel_.find(zeit);
   if (it != stempel_.end()) st = it->second;
-  stempel_.erase(stempel_.begin(), stempel_.upper_bound(nummer));
+  stempel_.erase(stempel_.begin(), stempel_.upper_bound(zeit));
 
   ComPtr<IMFMediaBuffer> buf;
   if (FAILED(s->ConvertToContiguousBuffer(&buf))) return false;
@@ -637,6 +688,7 @@ webrtc::VideoEncoder::EncoderInfo MfH264Encoder::GetEncoderInfo() const {
   info.implementation_name = "Intel QSV (MF)";
   info.is_hardware_accelerated = true;
   info.scaling_settings = webrtc::VideoEncoder::ScalingSettings(28, 38);
+  info.requested_resolution_alignment = 2;   // NV12 und H.264 wollen gerade Maße
   return info;
 }
 

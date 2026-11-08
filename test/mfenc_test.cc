@@ -88,6 +88,10 @@ int main(int argc, char** argv) {
   }
   const int w = std::atoi(argv[1]), h = std::atoi(argv[2]), fps = std::atoi(argv[3]);
   const int kbit = std::atoi(argv[4]), sek = std::atoi(argv[5]);
+  // MF_EINSPEISUNG_FPS: weniger Bilder einspeisen als angemeldet (Bildschirm
+  // mit 5–15 fps bei maxFramerate 30) — prüft, ob die Rate dann noch stimmt.
+  const char* ef = std::getenv("MF_EINSPEISUNG_FPS");
+  const int feed = ef && std::atoi(ef) > 0 ? std::atoi(ef) : fps;
   if (!libwebrtc::MfH264Encoder::IsSupported()) {
     std::printf("FEHL: Intel Quick Sync nicht verfuegbar (siehe %%LOCALAPPDATA%%\\HoneyCord\\mfenc.log)\n");
     return 1;
@@ -116,7 +120,7 @@ int main(int argc, char** argv) {
   };
   rate(kbit);
 
-  const int n = fps * sek;
+  const int n = feed * sek;
   std::vector<webrtc::scoped_refptr<webrtc::I420Buffer>> vorrat;
   for (int i = 0; i < 30; ++i) {
     vorrat.push_back(webrtc::I420Buffer::Create(w, h));
@@ -128,7 +132,7 @@ int main(int argc, char** argv) {
   double encode_ms = 0, encode_max = 0;
   int fehler = 0;
   for (int i = 0; i < n; ++i) {
-    const double soll = t0 + i * 1000.0 / fps;
+    const double soll = t0 + i * 1000.0 / feed;
     while (Jetzt() < soll) Sleep(1);
     if (i == wechsel) {
       rate(kbit / 2);
@@ -136,8 +140,8 @@ int main(int argc, char** argv) {
     }
     webrtc::VideoFrame f = webrtc::VideoFrame::Builder()
                                .set_video_frame_buffer(vorrat[i % 30])
-                               .set_rtp_timestamp(static_cast<uint32_t>(i * 90000 / fps))
-                               .set_timestamp_us(static_cast<int64_t>(i) * 1000000 / fps)
+                               .set_rtp_timestamp(static_cast<uint32_t>(i * 90000 / feed))
+                               .set_timestamp_us(1000000 + static_cast<int64_t>(i) * 1000000 / feed)
                                .build();
     std::vector<webrtc::VideoFrameType> typ{i == anforderung ? webrtc::VideoFrameType::kVideoFrameKey
                                                              : webrtc::VideoFrameType::kVideoFrameDelta};
@@ -150,8 +154,9 @@ int main(int argc, char** argv) {
   const double dt = Jetzt() - t0, dc = CpuMs() - c0;
   enc.Release();
   if (s.datei) std::fclose(s.datei);
-  const double s1 = (double)wechsel / fps, s2 = (double)(n - wechsel) / fps;
+  const double s1 = (double)wechsel / feed, s2 = (double)(n - wechsel) / feed;
   const double r1 = s.bytes[0] * 8 / s1 / 1000.0, r2 = s.bytes[1] * 8 / s2 / 1000.0;
+  std::printf("Einspeisung: %d fps (angemeldet %d)\n", feed, fps);
   std::printf("Bilder: %d hinein, %d heraus, %d Fehler, %d Schluesselbilder\n", n, s.bilder, fehler, s.schluessel);
   std::printf("Schluesselbild angefordert bei %d -> erstes danach bei %d\n", anforderung, s.erstes_schluessel_nach_anforderung);
   std::printf("Encode: Mittel %.2f ms, max %.2f ms; CPU %.2f ms je Bild; Wand %.1f s\n", encode_ms / n, encode_max,

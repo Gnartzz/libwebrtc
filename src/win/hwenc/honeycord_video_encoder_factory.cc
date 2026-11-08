@@ -20,8 +20,12 @@
 #endif
 
 #if defined(USE_MFENC)
+#include "api/video_codecs/video_encoder_software_fallback_wrapper.h"
 #include "mf/mf_h264_encoder.h"
+#include <algorithm>
+#include <cctype>
 #include <fstream>
+#include <iterator>
 #endif
 
 namespace libwebrtc {
@@ -73,6 +77,41 @@ uint32_t DetectPrimaryGpuVendor() {
 }
 #endif
 
+#if defined(USE_MFENC)
+// Steckt irgendwo eine Intel-Grafik (nicht nur als „primär" erkannt)? Auf
+// Umschalt-Laptops gewinnt NVIDIA/AMD die Wahl; scheitert deren Probe, soll
+// Intel übernehmen statt Software. Und ein vorher aufgezählter virtueller
+// Adapter (Hyper-V, IDD) darf Intel nicht verdecken (Prüfbefund M4).
+bool IntelAdapterVorhanden() {
+  using Microsoft::WRL::ComPtr;
+  ComPtr<IDXGIFactory1> f;
+  if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(f.GetAddressOf()))))
+    return false;
+  for (UINT i = 0;; ++i) {
+    ComPtr<IDXGIAdapter1> a;
+    if (FAILED(f->EnumAdapters1(i, a.GetAddressOf()))) break;
+    DXGI_ADAPTER_DESC1 d{};
+    if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.VendorId == 0x8086)
+      return true;
+  }
+  return false;
+}
+
+// Abschalter: %LOCALAPPDATA%\HoneyCord\intel-encoder.txt mit „aus". Liest auch
+// UTF-16 mit BOM (PowerShell 5 schreibt so) und ignoriert Groß-/Kleinschreibung.
+bool IntelEncoderAbgeschaltet() {
+  char basis[MAX_PATH] = {0};
+  if (!GetEnvironmentVariableA("LOCALAPPDATA", basis, MAX_PATH)) return false;
+  std::ifstream f(std::string(basis) + "\\HoneyCord\\intel-encoder.txt", std::ios::binary);
+  if (!f) return false;
+  std::string roh((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  std::string w;
+  for (unsigned char c : roh)
+    if (c >= 'A' && c <= 'z') w += static_cast<char>(std::tolower(c));
+  return w.rfind("aus", 0) == 0 || w.rfind("off", 0) == 0 || (!roh.empty() && roh[0] == '0');
+}
+#endif
+
 const char* VendorName(uint32_t vendor_id) {
   switch (vendor_id) {
     case kVendorIdNvidia: return "NVIDIA";
@@ -120,18 +159,10 @@ HoneycordVideoEncoderFactory::HoneycordVideoEncoderFactory()
 #endif
 
 #if defined(USE_MFENC)
-  // #94 (November 2026): Intel-Grafik → Quick Sync über Media Foundation.
-  // Abschalter für Vergleichsmessungen: %LOCALAPPDATA%\HoneyCord\intel-encoder.txt
-  // mit dem Inhalt „aus" → Software wie bisher.
-  if (gpu_vendor_id_ == kVendorIdIntel) {
-    bool aus = false;
-    char basis[MAX_PATH] = {0};
-    if (GetEnvironmentVariableA("LOCALAPPDATA", basis, MAX_PATH)) {
-      std::ifstream f(std::string(basis) + "\\HoneyCord\\intel-encoder.txt");
-      std::string w;
-      if (f >> w) aus = (w == "aus" || w == "off" || w == "0");
-    }
-    if (aus) {
+  // #94 (November 2026): Intel-Grafik → Quick Sync über Media Foundation —
+  // als primäre Karte ODER als Rückfall, wenn NVENC/AMF scheiterten.
+  if (gpu_vendor_id_ == kVendorIdIntel || IntelAdapterVorhanden()) {
+    if (IntelEncoderAbgeschaltet()) {
       RTC_LOG(LS_INFO) << "HoneycordVideoEncoderFactory: Intel encoder switched off (intel-encoder.txt)";
     } else if (MfH264Encoder::IsSupported()) {
       backend_ = Backend::kMf;
@@ -185,6 +216,13 @@ std::unique_ptr<webrtc::VideoEncoder> HoneycordVideoEncoderFactory::Create(
 #if defined(USE_MFENC)
   if (backend_ == Backend::kMf && absl::EqualsIgnoreCase(format.name, "H264")) {
     RTC_LOG(LS_INFO) << "HoneycordVideoEncoderFactory: instantiated Intel QSV (MF) H264 encoder";
+    // ★ In WebRTCs Rückfall-Hülle (Prüfbefund M1): Nur sie wertet
+    // FALLBACK_SOFTWARE aus — scheitert Quick Sync beim Öffnen oder später,
+    // übernimmt OpenH264 für diesen Strom, statt dass das Bild steht.
+    if (auto sw = builtin_factory_->Create(env, format)) {
+      return webrtc::CreateVideoEncoderSoftwareFallbackWrapper(
+          env, std::move(sw), std::make_unique<MfH264Encoder>(format), /*prefer_temporal_support=*/false);
+    }
     return std::make_unique<MfH264Encoder>(format);
   }
 #endif
