@@ -670,7 +670,10 @@ void MfH264Encoder::RateUeberwachen(size_t bytes, int64_t jetzt) {
 
   // Der Ausgleicher passt sein Ziel laufend an; der MFT folgt nur nach den
   // Regeln (jede Änderung kostet ein Schlüsselbild).
-  RateNachRegeln(MftZiel(), jetzt, "Ausgleich");
+  // Nach einer Ratenänderung 4 s Ruhe: das Fenster enthält sonst noch Bytes
+  // der alten Rate, der Ausgleicher drückt kurz ab und hebt wieder an — zwei
+  // unnötige Schlüsselbilder (gemessen 08.11.: 1250 → 633 → 1228 kbit/s).
+  if (jetzt - letzte_rate_ms_ >= 4000) RateNachRegeln(MftZiel(), jetzt, "Ausgleich");
 
   // ★ Gemessen: bei 60 Bildern/s folgt der MFT einer neuen Rate nicht immer.
   // Liegt die Ausgabe drei Fenster (je 2 s) in Folge über dem 1,5-Fachen der
