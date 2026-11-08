@@ -78,6 +78,9 @@ class MfH264Encoder : public webrtc::VideoEncoder {
   int32_t Oeffnen();       // MFT, Gerät, Typen, Ereignisfaden
   void Schliessen();
   bool RateSetzen(uint32_t bps);
+  // Neue Rate nach den Regeln unten anwenden, wenn sie sich lohnt (jede
+  // Änderung kostet beim Intel-MFT ein Schlüsselbild, gemessen 08.11.).
+  void RateNachRegeln(uint32_t soll, int64_t jetzt_ms, const char* anlass);
   bool WertSetzen(const GUID& was, uint32_t wert);
   bool AusgabeTypSetzen();
   // Wartet auf ein Ereignis des MFT (höchstens `ms`). false = Zeit um oder Ende.
@@ -110,6 +113,8 @@ class MfH264Encoder : public webrtc::VideoEncoder {
   uint64_t fenster_bytes_ = 0;
   int ueber_folge_ = 0;          // Sekunden in Folge deutlich über dem Ziel
   int64_t letztes_aufsetzen_ms_ = 0;
+  int64_t offen_seit_ms_ = 0;          // für die Anlaufphase
+  int64_t letzte_rate_ms_ = 0;         // letzte Ratenänderung am MFT
 
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
