@@ -468,3 +468,33 @@ rtc_shared_library("libwebrtc") {
     }
   }
 }
+
+# #94 Pruefprogramm fuer den Intel-MF-Encoder. Nur auf ausdruecklichen Wunsch:
+#   ninja -C out\win-x64-alpha libwebrtc:mfenc_test
+if (is_win && libwebrtc_mfenc) {
+  rtc_executable("mfenc_test") {
+    testonly = true
+    sources = [
+      "src/win/hwenc/mf/mf_h264_encoder.cc",
+      "src/win/hwenc/mf/mf_h264_encoder.h",
+      "test/mfenc_test.cc",
+    ]
+    include_dirs = [ "." ]
+    libs = [
+      "mfplat.lib",
+      "mfuuid.lib",
+      "strmiids.lib",
+      "d3d11.lib",
+      "dxgi.lib",
+    ]
+    deps = [
+      "../api/video:video_frame",
+      "../api/video_codecs:video_codecs_api",
+      "../common_video",
+      "../modules/video_coding:video_codec_interface",
+      "../rtc_base:logging",
+      "../rtc_base:timeutils",
+      "//third_party/libyuv",
+    ]
+  }
+}
