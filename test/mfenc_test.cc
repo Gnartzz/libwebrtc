@@ -116,7 +116,8 @@ int main(int argc, char** argv) {
   auto rate = [&](int k) {
     webrtc::VideoBitrateAllocation a;
     a.SetBitrate(0, 0, k * 1000);
-    enc.SetRates(webrtc::VideoEncoder::RateControlParameters(a, fps));
+    // WebRTC meldet in SetRates die EINGANGSbildrate — hier die Einspeisung.
+    enc.SetRates(webrtc::VideoEncoder::RateControlParameters(a, feed));
   };
   rate(kbit);
 

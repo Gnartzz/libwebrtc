@@ -34,6 +34,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -140,12 +141,21 @@ class MfH264Encoder : public webrtc::VideoEncoder {
   int64_t erste_zeit_us_ = -1;      // erste Aufnahmezeit seit dem Öffnen
   LONGLONG letzte_probe_zeit_ = -1; // streng steigende Sample-Zeit
 
-  // Ereignisfaden: GetEvent blockiert; was er holt, landet hier.
+  // Ereignisfaden: GetEvent blockiert; was er holt, landet in der Schlange.
+  // ★ Die Schlange gehört dem Faden mit (shared_ptr): Muss er nach einem
+  // gescheiterten Shutdown abgetrennt werden, schreibt er nie in ein
+  // freigegebenes Objekt oder in die Schlange der nächsten Sitzung.
+  struct Schlange {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::pair<MediaEventType, HRESULT>> q;
+    bool ende = false;
+  };
+  std::shared_ptr<Schlange> schlange_;
   std::thread ereignis_faden_;
-  std::mutex ereignis_mutex_;
-  std::condition_variable ereignis_cv_;
-  std::deque<std::pair<MediaEventType, HRESULT>> ereignisse_;
-  bool ereignis_ende_ = false;
+  bool kaputt_ = false;            // Shutdown scheiterte: nie wieder öffnen
+  int stumme_neustarts_ = 0;       // Neuaufsetzen ohne eine Ausgabe dazwischen
+  double eingangs_fps_ = 0;        // WebRTCs Eingangsbildrate (SetRates)
 };
 
 }  // namespace libwebrtc

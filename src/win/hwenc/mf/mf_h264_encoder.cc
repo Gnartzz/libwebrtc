@@ -237,6 +237,7 @@ bool MfH264Encoder::AusgabeTypSetzen() {
 }
 
 int32_t MfH264Encoder::Oeffnen() {
+  if (kaputt_) return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   MfStarten();
   ComPtr<IMFActivate> akt = IntelMftFinden();
   if (!akt) return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
@@ -343,27 +344,23 @@ int32_t MfH264Encoder::Oeffnen() {
     Schliessen();
     return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
   }
-  {
-    std::lock_guard<std::mutex> l(ereignis_mutex_);
-    ereignisse_.clear();
-    ereignis_ende_ = false;
-  }
-  ereignis_faden_ = std::thread([this, gen = events_] {
+  schlange_ = std::make_shared<Schlange>();
+  ereignis_faden_ = std::thread([sch = schlange_, gen = events_] {
     for (;;) {
       ComPtr<IMFMediaEvent> ev;
       const HRESULT r = gen->GetEvent(0, &ev);
-      std::lock_guard<std::mutex> l(ereignis_mutex_);
+      std::lock_guard<std::mutex> l(sch->m);
       if (FAILED(r)) {
-        ereignis_ende_ = true;
-        ereignis_cv_.notify_all();
+        sch->ende = true;
+        sch->cv.notify_all();
         return;
       }
       MediaEventType typ = MEUnknown;
       HRESULT st = S_OK;
       ev->GetType(&typ);
       ev->GetStatus(&st);
-      ereignisse_.emplace_back(typ, st);
-      ereignis_cv_.notify_all();
+      sch->q.emplace_back(typ, st);
+      sch->cv.notify_all();
     }
   });
   mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
@@ -395,10 +392,18 @@ void MfH264Encoder::Schliessen() {
     beendet = SUCCEEDED(mft_.As(&aus)) && SUCCEEDED(aus->Shutdown());
   }
   if (ereignis_faden_.joinable()) {
-    // Ohne Shutdown käme GetEvent nie zurück — dann nicht warten (der Faden
-    // hält seinen eigenen Verweis auf den Ereignisgeber).
-    if (beendet) ereignis_faden_.join(); else ereignis_faden_.detach();
+    // Ohne Shutdown käme GetEvent nie zurück — dann nicht warten. Der Faden
+    // hält Ereignisgeber und Schlange selbst; dieser Encoder öffnet danach
+    // nie wieder (die Rückfall-Hülle übernimmt).
+    if (beendet) {
+      ereignis_faden_.join();
+    } else {
+      ereignis_faden_.detach();
+      kaputt_ = true;
+      Protokoll("FEHLER: Shutdown des MFT scheiterte, Encoder bleibt aus");
+    }
   }
+  schlange_.reset();
   events_.Reset();
   codec_.Reset();
   mft_.Reset();
@@ -410,15 +415,16 @@ void MfH264Encoder::Schliessen() {
 }
 
 bool MfH264Encoder::EreignisHolen(MediaEventType* typ, HRESULT* status, int ms) {
-  std::unique_lock<std::mutex> l(ereignis_mutex_);
-  if (!ereignis_cv_.wait_for(l, std::chrono::milliseconds(ms),
-                             [this] { return !ereignisse_.empty() || ereignis_ende_; })) {
+  std::shared_ptr<Schlange> sch = schlange_;
+  if (!sch) return false;
+  std::unique_lock<std::mutex> l(sch->m);
+  if (!sch->cv.wait_for(l, std::chrono::milliseconds(ms), [&] { return !sch->q.empty() || sch->ende; })) {
     return false;
   }
-  if (ereignisse_.empty()) return false;   // Ende
-  *typ = ereignisse_.front().first;
-  *status = ereignisse_.front().second;
-  ereignisse_.pop_front();
+  if (sch->q.empty()) return false;   // Ende
+  *typ = sch->q.front().first;
+  *status = sch->q.front().second;
+  sch->q.pop_front();
   return true;
 }
 
@@ -441,7 +447,15 @@ int32_t MfH264Encoder::Encode(const webrtc::VideoFrame& frame,
   if (neu_aufsetzen_ || !mft_) {
     neu_aufsetzen_ = false;
     Schliessen();
-    if (const uint32_t a = bitrate_adjuster_.GetAdjustedBitrateBps()) encoder_bps_ = a;
+    // Gleich mit dem angehobenen Ziel (Bestätigungsprüfung M-c), sonst kostet
+    // die Anhebung kurz danach ein weiteres Schlüsselbild.
+    if (const uint32_t a = MftZiel()) encoder_bps_ = a;
+    // Öffnet der MFT, bleibt aber stumm, nicht endlos weiter versuchen:
+    // nach drei Neustarts ohne eine einzige Ausgabe übernimmt Software.
+    if (stumme_neustarts_ >= 3) {
+      Protokoll("FEHLER: Encoder dreimal ohne Ausgabe neu aufgesetzt, Software uebernimmt");
+      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+    }
     // Scheitert das Öffnen, übernimmt die Rückfall-Hülle der Fabrik
     // (VideoEncoderSoftwareFallbackWrapper → OpenH264) — dauerhaft.
     if (Oeffnen() != WEBRTC_VIDEO_CODEC_OK) return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
@@ -505,12 +519,13 @@ int32_t MfH264Encoder::Encode(const webrtc::VideoFrame& frame,
       // und WebRTC sagen, dass es verworfen ist (Prüfbefund M2).
       stempel_.erase(zeit);
       callback_->OnDroppedFrame(webrtc::EncodedImageCallback::DropReason::kDroppedByEncoder);
-      bool ende = false;
-      {
-        std::lock_guard<std::mutex> l(ereignis_mutex_);
-        ende = ereignis_ende_;
+      bool ende = true;
+      if (std::shared_ptr<Schlange> sch = schlange_) {
+        std::lock_guard<std::mutex> l(sch->m);
+        ende = sch->ende;
       }
       if (++zeitueberschreitungen_ >= 5 || ende) {
+        ++stumme_neustarts_;
         Protokoll("Encoder antwortet nicht (%d Bilder in Folge%s), neu aufsetzen", zeitueberschreitungen_,
                   ende ? ", Ereignisfaden beendet" : "");
         neu_aufsetzen_ = true;
@@ -639,6 +654,7 @@ bool MfH264Encoder::AusgabeAbholen() {
     RTC_LOG(LS_ERROR) << "MfH264Encoder: OnEncodedImage error=" << r.error;
   }
   bitrate_adjuster_.Update(len);
+  stumme_neustarts_ = 0;
   RateUeberwachen(len, webrtc::TimeMillis());
   return true;
 }
@@ -650,8 +666,12 @@ bool MfH264Encoder::AusgabeAbholen() {
 // Also das Ziel um angemeldete ÷ tatsächliche Bildrate anheben (höchstens 4×).
 uint32_t MfH264Encoder::MftZiel() const {
   const uint32_t basis = bitrate_adjuster_.GetAdjustedBitrateBps();
-  if (ist_fps_ < 1.0 || framerate_ == 0) return basis;
-  const double faktor = std::min(4.0, std::max(1.0, framerate_ / ist_fps_));
+  // ★ Die EINGANGSbildrate, die WebRTC in SetRates meldet (vor seinem
+  // Bildverwerfer) — nicht die ausgegebenen Bilder. Sonst ein Kreislauf:
+  // Übererfüllung → WebRTC verwirft → weniger Ausgaben → Faktor steigt
+  // (Bestätigungsprüfung M-a).
+  if (eingangs_fps_ < 1.0 || framerate_ == 0) return basis;
+  const double faktor = std::min(4.0, std::max(1.0, framerate_ / eingangs_fps_));
   const double ziel = basis * faktor;
   return ziel > 200e6 ? 200000000u : static_cast<uint32_t>(ziel);
 }
@@ -673,7 +693,10 @@ void MfH264Encoder::RateUeberwachen(size_t bytes, int64_t jetzt) {
   // Nach einer Ratenänderung 4 s Ruhe: das Fenster enthält sonst noch Bytes
   // der alten Rate, der Ausgleicher drückt kurz ab und hebt wieder an — zwei
   // unnötige Schlüsselbilder (gemessen 08.11.: 1250 → 633 → 1228 kbit/s).
-  if (jetzt - letzte_rate_ms_ >= 4000) RateNachRegeln(MftZiel(), jetzt, "Ausgleich");
+  // Ein Einbruch geht durch (Stau wartet nicht, Bestätigungsprüfung M-b).
+  const uint32_t ziel = MftZiel();
+  if (jetzt - letzte_rate_ms_ >= 4000 || (encoder_bps_ && ziel <= encoder_bps_ * 6ull / 10))
+    RateNachRegeln(ziel, jetzt, "Ausgleich");
 
   // ★ Gemessen: bei 60 Bildern/s folgt der MFT einer neuen Rate nicht immer.
   // Liegt die Ausgabe drei Fenster (je 2 s) in Folge über dem 1,5-Fachen der
@@ -697,6 +720,7 @@ void MfH264Encoder::SetRates(const webrtc::VideoEncoder::RateControlParameters& 
   std::lock_guard<std::mutex> halt(mutex_);
   const uint32_t neu = parameters.bitrate.get_sum_bps();
   if (neu == 0) return;
+  if (parameters.framerate_fps >= 1.0) eingangs_fps_ = parameters.framerate_fps;
   const uint32_t alt = target_bps_;
   target_bps_ = neu;
   bitrate_adjuster_.SetTargetBitrateBps(neu);
