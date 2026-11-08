@@ -32,7 +32,7 @@ class HoneycordVideoEncoderFactory : public webrtc::VideoEncoderFactory {
       const webrtc::SdpVideoFormat& format) override;
 
   // For logging / Sidebar-Footer-Variant display.
-  enum class Backend { kNvenc, kAmf, kBuiltin };
+  enum class Backend { kNvenc, kAmf, kMf, kBuiltin };
   Backend selected_backend() const { return backend_; }
   const char* selected_backend_name() const;
 

@@ -19,6 +19,11 @@
 #include "amf/amf_h264_encoder.h"
 #endif
 
+#if defined(USE_MFENC)
+#include "mf/mf_h264_encoder.h"
+#include <fstream>
+#endif
+
 namespace libwebrtc {
 
 namespace {
@@ -114,6 +119,28 @@ HoneycordVideoEncoderFactory::HoneycordVideoEncoderFactory()
   }
 #endif
 
+#if defined(USE_MFENC)
+  // #94 (November 2026): Intel-Grafik → Quick Sync über Media Foundation.
+  // Abschalter für Vergleichsmessungen: %LOCALAPPDATA%\HoneyCord\intel-encoder.txt
+  // mit dem Inhalt „aus" → Software wie bisher.
+  if (gpu_vendor_id_ == kVendorIdIntel) {
+    bool aus = false;
+    char basis[MAX_PATH] = {0};
+    if (GetEnvironmentVariableA("LOCALAPPDATA", basis, MAX_PATH)) {
+      std::ifstream f(std::string(basis) + "\\HoneyCord\\intel-encoder.txt");
+      std::string w;
+      if (f >> w) aus = (w == "aus" || w == "off" || w == "0");
+    }
+    if (aus) {
+      RTC_LOG(LS_INFO) << "HoneycordVideoEncoderFactory: Intel encoder switched off (intel-encoder.txt)";
+    } else if (MfH264Encoder::IsSupported()) {
+      backend_ = Backend::kMf;
+      RTC_LOG(LS_INFO) << "HoneycordVideoEncoderFactory: Intel Quick Sync (Media Foundation) enabled";
+      return;
+    }
+  }
+#endif
+
 #if defined(USE_NVENC) || defined(USE_AMF)
   RTC_LOG(LS_INFO) << "HoneycordVideoEncoderFactory: " << VendorName(gpu_vendor_id_)
                    << " GPU without HW encoder pathway, software fallback";
@@ -155,6 +182,12 @@ std::unique_ptr<webrtc::VideoEncoder> HoneycordVideoEncoderFactory::Create(
     return encoder;
   }
 #endif
+#if defined(USE_MFENC)
+  if (backend_ == Backend::kMf && absl::EqualsIgnoreCase(format.name, "H264")) {
+    RTC_LOG(LS_INFO) << "HoneycordVideoEncoderFactory: instantiated Intel QSV (MF) H264 encoder";
+    return std::make_unique<MfH264Encoder>(format);
+  }
+#endif
   return builtin_factory_->Create(env, format);
 }
 
@@ -162,6 +195,7 @@ const char* HoneycordVideoEncoderFactory::selected_backend_name() const {
   switch (backend_) {
     case Backend::kNvenc:   return "nvenc";
     case Backend::kAmf:     return "amf";
+    case Backend::kMf:      return "mf";
     case Backend::kBuiltin: return "builtin";
   }
   return "unknown";

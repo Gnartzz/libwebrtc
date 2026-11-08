@@ -5,6 +5,7 @@ declare_args() {
   libwebrtc_nvenc = true
   libwebrtc_amf = true   # HoneyCord: stub-encoder for bisect of 0xc0000005
   libwebrtc_hwdec = true # HoneyCord: vendor-neutral D3D11VA/MF H.264 HW decoder
+  libwebrtc_mfenc = true # HoneyCord #94: Intel Quick Sync H.264 encoder via Media Foundation
   libwebrtc_desktop_capture = true
 }
 
@@ -123,6 +124,10 @@ if (is_win) {
     defines = [ "USE_NVENC" ]
     if (libwebrtc_amf) {
       defines += [ "USE_AMF" ]
+    }
+    if (libwebrtc_mfenc) {
+      defines += [ "USE_MFENC" ]
+      include_dirs += [ "src/win/hwenc/mf" ]
     }
     deps = [
       ":libwebrtc_nvenc",
@@ -347,6 +352,21 @@ rtc_shared_library("libwebrtc") {
   # Pure system MFT/D3D11 (no SDK, no exceptions) -> can live in the main lib.
   # Outputs honeycord::D3D11FrameBuffer (zero-copy) like the screen-capture path.
   # d3d11.lib/dxgi.lib come from the nvenc block above (both default true).
+  # #94: Intel Quick Sync H.264 ENCODER ueber Media Foundation (System-MFT,
+  # kein SDK, keine Ausnahmen) — lebt wie der Decoder im Hauptziel; die
+  # Fabrik (libwebrtc_hwenc_factory) waehlt ihn fuer Intel-Grafik.
+  if (is_win && libwebrtc_mfenc) {
+    sources += [
+      "src/win/hwenc/mf/mf_h264_encoder.cc",
+      "src/win/hwenc/mf/mf_h264_encoder.h",
+    ]
+    libs += [
+      "mfplat.lib",
+      "mfuuid.lib",
+      "strmiids.lib",
+    ]
+  }
+
   if (is_win && libwebrtc_hwdec) {
     defines += [ "USE_HWDEC" ]
     sources += [
