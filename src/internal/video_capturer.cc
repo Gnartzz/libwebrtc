@@ -40,9 +40,11 @@ void VideoCapturer::OnFrame(const VideoFrame& frame) {
     // honeycord (Null-Kopie Linux, 08.11.2026): ein GPU-Bild skaliert sich
     // selbst (VPP). Fuer andere native Puffer ist Scale() derselbe Weg wie
     // unten (ToI420 + Skalieren), nur ohne Zwischenpuffer hier.
+    scoped_refptr<VideoFrameBuffer> klein =
+        frame.video_frame_buffer()->Scale(out_width, out_height);
+    if (!klein) return;  // Zurueckholen gescheitert (GPU-Reset): verwerfen
     broadcaster_.OnFrame(VideoFrame::Builder()
-                             .set_video_frame_buffer(
-                                 frame.video_frame_buffer()->Scale(out_width, out_height))
+                             .set_video_frame_buffer(klein)
                              .set_rotation(kVideoRotation_0)
                              .set_timestamp_us(frame.timestamp_us())
                              .set_id(frame.id())

@@ -63,7 +63,17 @@
  #include "modules/desktop_capture/linux/wayland/screencast_stream_utils.h"
  #include "modules/desktop_capture/mouse_cursor.h"
  #include "modules/desktop_capture/screen_capture_frame_queue.h"
-@@ -911,7 +912,58 @@
+@@ -143,6 +144,9 @@
+   std::unique_ptr<EglDmaBuf> egl_dmabuf_;
+   // List of modifiers we query as supported by the graphics card/driver
+   std::vector<uint64_t> modifiers_;
++  // HoneyCord (Null-Kopie): Neuverhandlungen wegen eines Modifiers, den die
++  // Grafikkarte nicht uebernimmt -- hoechstens eine je Strom.
++  int honeycord_neuverhandelt_ = 0;
+ 
+   // PipeWire types
+   std::unique_ptr<PipeWireInitializer> pw_initializer_;
+@@ -911,7 +915,60 @@
    }
  
    bool bufferProcessed = false;
@@ -100,7 +110,8 @@
 +        bufferProcessed = true;
 +      } else if (modifier_ != static_cast<int64_t>(DRM_FORMAT_MOD_INVALID) &&
 +                 pw_server_version_ >= kDropSingleModifierMinVersion &&
-+                 wandler->ModifierUnbrauchbar(bild.modifier)) {
++                 honeycord_neuverhandelt_ == 0 &&
++                 wandler->ModifierUnbrauchbar(bild)) {
 +        size_t feste = 0;
 +        for (uint64_t m : modifiers_) {
 +          if (m != DRM_FORMAT_MOD_INVALID) ++feste;
@@ -110,6 +121,7 @@
 +                             modifiers_.end()) {
 +          RTC_LOG(LS_INFO) << "HoneyCord: Modifier " << modifier_
 +                           << " ohne Null-Kopie, verhandle neu";
++          ++honeycord_neuverhandelt_;
 +          std::erase(modifiers_, modifier_);
 +          pw_loop_signal_event(pw_thread_loop_get_loop(pw_main_loop_),
 +                               renegotiate_);
@@ -123,7 +135,7 @@
      bufferProcessed =
          ProcessMemFDBuffer(buffer, *queue_.current_frame(), offset);
    } else if (spa_buffer->datas[0].type == SPA_DATA_DmaBuf) {
-@@ -929,8 +981,9 @@
+@@ -929,8 +986,9 @@
  
    // TODO(bugs.webrtc.org/436974448): Remove this conversion when arbitrary
    // pixel formats are supported.
@@ -137,7 +149,7 @@
        // If both sides decided to go with the RGBx format we need to convert
 --- a/modules/desktop_capture/linux/wayland/honeycord_dmabuf.h
 +++ b/modules/desktop_capture/linux/wayland/honeycord_dmabuf.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,66 @@
 +/*
 + * HoneyCord (Null-Kopie Linux, 08.11.2026): Haken zwischen dem PipeWire-
 + * Aufnehmer und der Grafikkarte.
@@ -184,11 +196,12 @@
 +  // an den Compositor zurueck und wird neu beschrieben.
 +  virtual scoped_refptr<RefCountInterface> Wandeln(const HcDmaBufBild& bild) = 0;
 +
-+  // Wahr, wenn dieser Modifier dauerhaft nicht zu uebernehmen ist. Dann
-+  // streicht der Aufnehmer ihn (wie bei einem EGL-Fehler) und verhandelt neu,
-+  // solange noch ein anderer fester Modifier bleibt -- sonst liefe die ganze
++  // Wahr, wenn dieses Bild (Modifier, Format, Groesse) dauerhaft nicht zu
++  // uebernehmen ist. Dann streicht der Aufnehmer den Modifier (wie bei einem
++  // EGL-Fehler) und verhandelt neu -- hoechstens EINMAL je Strom und nur,
++  // solange ein anderer fester Modifier bleibt. Sonst liefe die ganze
 +  // Freigabe ueber die CPU, nur weil der Compositor zuerst diesen gewaehlt hat.
-+  virtual bool ModifierUnbrauchbar(uint64_t modifier) = 0;
++  virtual bool ModifierUnbrauchbar(const HcDmaBufBild& bild) = 0;
 +
 + protected:
 +  virtual ~HcDmaBufWandler() = default;

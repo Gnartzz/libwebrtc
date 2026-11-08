@@ -52,6 +52,11 @@ const AVFrame* AlsVaRahmen(const webrtc::VideoFrameBuffer& puffer,
 // Zählt ein Bild, das ohne Umweg in den Encoder ging (für die 30-s-Zeile).
 void EncoderDirektGezaehlt();
 
+// Eine Bildschirmaufnahme beginnt / endet. Endet die letzte, gibt der Wandler
+// seine Bildvorräte und VPP-Kontexte frei.
+void AufnahmeBeginnt();
+void AufnahmeEndet();
+
 }  // namespace nullkopie
 }  // namespace libwebrtc
 

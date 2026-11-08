@@ -182,6 +182,8 @@ int HwH264Encoder::InitEncode(
   std::lock_guard<std::mutex> sperre(mutex_);
   width_ = codec_settings->width;
   height_ = codec_settings->height;
+  soll_breite_ = width_;
+  soll_hoehe_ = height_;
   framerate_ = codec_settings->maxFramerate ? codec_settings->maxFramerate : 30;
   max_fps_ = framerate_;
   bildrate_richtung_ = 0;
@@ -509,11 +511,36 @@ int32_t HwH264Encoder::Encode(
   // für den Rest des Gesprächs schwarz. Also alle 30 Bilder (rund eine
   // Sekunde) ein neuer Anlauf; nach zehn vergeblichen geben wir an WebRTC
   // ab, damit der umhüllende Adapter in Software weitermacht.
+  // ★ Null-Kopie (Prüfbefund S1, 08.11.2026): Mit supports_native_handle
+  // überspringt WebRTC für GPU-Bilder das Zuschneiden und Verkleinern auf die
+  // Encoder-Größe (VideoStreamEncoder, ebenso der SimulcastEncoderAdapter) —
+  // die Auflösungsstufe der App (scaleResolutionDownBy, 1080p→720p→540p)
+  // ginge verloren und der Encoder setzte sich auf die volle Größe neu auf.
+  // Also hier dieselbe Regel wie dort, auf der Grafikkarte.
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> eingang = frame.video_frame_buffer();
+  if (weg_ == Backend::kVaapi && eingang->type() == webrtc::VideoFrameBuffer::Type::kNative &&
+      soll_breite_ > 0 && soll_hoehe_ > 0 &&
+      (eingang->width() != soll_breite_ || eingang->height() != soll_hoehe_)) {
+    const int dw = eingang->width() - soll_breite_, dh = eingang->height() - soll_hoehe_;
+    if (dw >= 0 && dh >= 0 && dw < 4 && dh < 4) {
+      int ox = (dw + 1) / 2, oy = (dh + 1) / 2;
+      ox -= ox % 2;
+      oy -= oy % 2;
+      eingang = eingang->CropAndScale(ox, oy, soll_breite_, soll_hoehe_, soll_breite_, soll_hoehe_);
+    } else {
+      eingang = eingang->Scale(soll_breite_, soll_hoehe_);
+    }
+    if (!eingang) {
+      RTC_LOG(LS_ERROR) << "[hwenc] GPU-Bild nicht auf Encoder-Größe zu bringen — verworfen";
+      return WEBRTC_VIDEO_CODEC_OK;
+    }
+  }
+
   if (!ctx_ && oeffnen_scheiterte_) {
     if (misslungene_versuche_ >= 10) return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
     if (++wiederanlauf_zaehler_ % 30 != 0) return WEBRTC_VIDEO_CODEC_ERROR;
-    width_ = frame.width();
-    height_ = frame.height();
+    width_ = eingang->width();
+    height_ = eingang->height();
     if (CodecOeffnen() != WEBRTC_VIDEO_CODEC_OK) {
       oeffnen_scheiterte_ = true;
       ++misslungene_versuche_;
@@ -525,9 +552,9 @@ int32_t HwH264Encoder::Encode(
 
   // Größenwechsel: neu aufsetzen. Das kommt bei jeder Stufenänderung vor, und
   // der Bildspeicher der Hardware liegt auf eine feste Größe fest.
-  if (frame.width() != width_ || frame.height() != height_) {
-    width_ = frame.width();
-    height_ = frame.height();
+  if (eingang->width() != width_ || eingang->height() != height_) {
+    width_ = eingang->width();
+    height_ = eingang->height();
     const int32_t r = CodecOeffnen();
     if (r != WEBRTC_VIDEO_CODEC_OK) {
       oeffnen_scheiterte_ = true;
@@ -614,13 +641,13 @@ int32_t HwH264Encoder::Encode(
   // der Grafikkarte liegt (gleiches VA-Gerät, gleiche Größe), geht ohne
   // Zurücklesen, Umrechnen und Hochladen hinein.
   const AVFrame* gpu = weg_ == Backend::kVaapi
-                           ? nullkopie::AlsVaRahmen(*frame.video_frame_buffer(), hw_device_,
+                           ? nullkopie::AlsVaRahmen(*eingang, hw_device_,
                                                     width_, height_)
                            : nullptr;
   int r = 0;
   int64_t t1 = t0;
   if (!gpu) {
-    auto puffer = frame.video_frame_buffer()->ToI420();
+    auto puffer = eingang->ToI420();
     if (!puffer) return WEBRTC_VIDEO_CODEC_ERROR;
     t1 = webrtc::TimeMicros();
     r = api.av_frame_make_writable(sw_frame_);
@@ -714,7 +741,7 @@ int32_t HwH264Encoder::Encode(
               "hochladen %.1f ms · kodieren+abholen %.1f ms · %s",
               zeit_bilder_, width_, height_,
               gpu ? "kam als GPU-Bild"
-              : frame.video_frame_buffer()->type() == webrtc::VideoFrameBuffer::Type::kI420
+              : eingang->type() == webrtc::VideoFrameBuffer::Type::kI420
                   ? "kam als I420" : "musste gewandelt werden",
               zeit_i420_us_ / n / 1000.0, zeit_nv12_us_ / n / 1000.0,
               zeit_hoch_us_ / n / 1000.0, zeit_kod_us_ / n / 1000.0,

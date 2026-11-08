@@ -16,6 +16,8 @@
 
 #include "rtc_desktop_capturer_impl.h"
 
+#include <algorithm>
+
 #include "api/sequence_checker.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
@@ -59,8 +61,13 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
   // (DesktopAndCursorComposer arbeitet auf den Pixeln). Also soll ihn der
   // Compositor selbst in den Strom legen. Das gilt dann auch fuer den alten
   // Weg, falls ein Bild doch ueber die CPU geht.
-  if (libwebrtc::nullkopie::Einrichten() && showCursor) {
-    options_.set_prefer_cursor_embedded(true);
+  if (libwebrtc::nullkopie::Einrichten()) {
+    if (showCursor) options_.set_prefer_cursor_embedded(true);
+    // ★ Prüfbefund M1: Der Differ-Wrapper vergliche je Bild zwei Pixelpuffer,
+    // die bei GPU-Bildern gar nicht gefuellt sind (2x ~20 MB Lesen fuer
+    // nichts). Unter Wayland meldet PipeWire den Schaden ohnehin selbst.
+    options_.set_detect_updated_region(false);
+    nullkopie_ = true;
   }
 #endif
 #endif
@@ -83,6 +90,10 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
 RTCDesktopCapturerImpl::~RTCDesktopCapturerImpl() {
   thread_->Stop();
   capturer_.reset();
+#if defined(WEBRTC_LINUX) && defined(USE_LINUX_HWENC)
+  letztes_aus_ = nullptr;
+  if (aufnahme_gezaehlt_) libwebrtc::nullkopie::AufnahmeEndet();
+#endif
 }
 
 RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
@@ -138,6 +149,12 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
   }
   thread_->BlockingCall([this] { capturer_->Start(this); });
   capture_state_ = CS_RUNNING;
+#if defined(WEBRTC_LINUX) && defined(USE_LINUX_HWENC)
+  if (nullkopie_ && !aufnahme_gezaehlt_) {
+    aufnahme_gezaehlt_ = true;
+    libwebrtc::nullkopie::AufnahmeBeginnt();
+  }
+#endif
   thread_->PostTask([this] { CaptureFrame(); });
   if (observer_) {
     signaling_thread_->BlockingCall([&, this]() { observer_->OnStart(this); });
@@ -154,6 +171,17 @@ void RTCDesktopCapturerImpl::Stop() {
     }
   }
   capture_state_ = CS_STOPPED;
+#if defined(WEBRTC_LINUX) && defined(USE_LINUX_HWENC)
+  // Pruefbefund M5: die letzte Aufnahme gibt die Bildvorraete frei.
+  thread_->BlockingCall([this] {
+    letztes_nativ_ = nullptr;
+    letztes_aus_ = nullptr;
+  });
+  if (aufnahme_gezaehlt_) {
+    aufnahme_gezaehlt_ = false;
+    libwebrtc::nullkopie::AufnahmeEndet();
+  }
+#endif
 }
 
 bool RTCDesktopCapturerImpl::IsRunning() {
@@ -206,13 +234,22 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
   // Zuschnitt und Deckel laufen dort (VPP), die Pixel in frame->data() sind
   // NICHT gefuellt und werden nicht angefasst.
   if (frame->honeycord_nativ()) {
+    if (frame->honeycord_nativ() == letztes_nativ_ && letztes_aus_) {
+      OnFrame(webrtc::VideoFrame(letztes_aus_, 0, webrtc::TimeMillis(),
+                                 webrtc::kVideoRotation_0));
+      return;
+    }
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> gpu(
         static_cast<webrtc::VideoFrameBuffer*>(frame->honeycord_nativ().get()));
-    const int bx = static_cast<int>(x_), by = static_cast<int>(y_);
-    const int bw = static_cast<int>(w_) & ~1, bh = static_cast<int>(h_) & ~1;
-    if (bw > 0 && bh > 0 && bx + bw <= gpu->width() && by + bh <= gpu->height() &&
+    // Region ins Bild begrenzen (Pruefbefund N1), gerade Masse fuer NV12.
+    const int bx = std::min(static_cast<int>(x_), gpu->width() - 2) & ~1;
+    const int by = std::min(static_cast<int>(y_), gpu->height() - 2) & ~1;
+    const int bw = std::min(static_cast<int>(w_), gpu->width() - bx) & ~1;
+    const int bh = std::min(static_cast<int>(h_), gpu->height() - by) & ~1;
+    if (w_ > 0 && h_ > 0 && bw >= 2 && bh >= 2 &&
         (bw != gpu->width() || bh != gpu->height())) {
       gpu = gpu->CropAndScale(bx, by, bw, bh, bw, bh);
+      if (!gpu) return;  // Pruefbefund S2: verwerfen statt abstuerzen
     }
     if (max_width_ > 0 && max_height_ > 0 &&
         (gpu->width() > static_cast<int>(max_width_) ||
@@ -223,7 +260,10 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
       int dst_w = static_cast<int>(gpu->width() * scale) & ~1;
       int dst_h = static_cast<int>(gpu->height() * scale) & ~1;
       gpu = gpu->Scale(dst_w, dst_h);
+      if (!gpu) return;
     }
+    letztes_nativ_ = frame->honeycord_nativ();
+    letztes_aus_ = gpu;
     OnFrame(webrtc::VideoFrame(gpu, 0, webrtc::TimeMillis(),
                                webrtc::kVideoRotation_0));
     return;

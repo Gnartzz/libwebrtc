@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <utility>
 
 extern "C" {
@@ -99,6 +100,8 @@ std::atomic<bool> g_aktiv{false};
 // Zahlen für die 30-s-Zeile in hwenc.log.
 std::atomic<uint64_t> z_bilder{0}, z_fehl{0}, z_skal{0}, z_i420{0}, z_direkt{0};
 std::atomic<uint64_t> z_wandel_us{0}, z_i420_us{0};
+// Für die Aussetz-Regel (Prüfbefund M3): erzeugte und zurückgelesene Pixel.
+std::atomic<uint64_t> p_erzeugt{0}, p_gelesen{0};
 
 class Va {
  public:
@@ -152,6 +155,18 @@ class Va {
       return nullptr;
     }
     return f;
+  }
+
+  // Alle Kontexte und Vorräte abgeben (Prüfbefund M5). Bilder, die noch
+  // leben, halten ihren Vorrat selbst; ein neuer Bedarf legt neu an.
+  void Leeren() {
+    const auto& api = ffmpeg::Zugriff();
+    std::lock_guard<std::mutex> sperre(m_);
+    for (auto& [groesse, z] : ziele_) {
+      fn.vaDestroyContext(dpy, z.ctx);
+      api.av_buffer_unref(&z.vorrat);
+    }
+    ziele_.clear();
   }
 
   void FehlerEinmal(const char* wo, VAStatus s) {
@@ -250,6 +265,7 @@ class HcVaBild : public webrtc::VideoFrameBuffer {
     api.av_frame_free(&sw);
     i420_ = puffer;
     z_i420++;
+    p_gelesen += static_cast<uint64_t>(breite_) * hoehe_;
     z_i420_us += static_cast<uint64_t>((CpuMs() - c0) * 1000);
     return i420_;
   }
@@ -274,8 +290,12 @@ class HcVaBild : public webrtc::VideoFrameBuffer {
         return webrtc::make_ref_counted<HcVaBild>(f, sb, sh);
       }
     }
-    // Rückfall: der allgemeine Weg über I420 (langsam, aber richtig).
-    return webrtc::VideoFrameBuffer::CropAndScale(ox, oy, cb, ch, sb, sh);
+    // Rückfall: über I420 (langsam, aber richtig). ★ Prüfbefund S2: Der
+    // allgemeine Weg in WebRTC dereferenziert ToI420() ungeprüft — scheitert
+    // auch das Zurücklesen (GPU-Reset, Suspend), wird das Bild verworfen.
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 = ToI420();
+    if (!i420) return nullptr;
+    return i420->CropAndScale(ox, oy, cb, ch, sb, sh);
   }
 
  private:
@@ -303,15 +323,52 @@ class Wandler : public webrtc::HcDmaBufWandler {
     return ergebnis;
   }
 
-  bool ModifierUnbrauchbar(uint64_t modifier) override {
+  bool ModifierUnbrauchbar(const webrtc::HcDmaBufBild& b) override {
     std::lock_guard<std::mutex> sperre(m_);
-    return gescheitert_.count(modifier) > 0;
+    return gescheitert_.count(Schluessel(b)) > 0;
   }
 
  private:
+  // ★ Prüfbefund M3, GEMESSEN 08.11. (Intel UHD 630): Nimmt kein VA-Encoder
+  // das GPU-Bild (VP8, Software-Rückfall), liest jeder Verbraucher es zurück.
+  // Bei 1080p ohne Verkleinerung kostet das 6,0 statt 5,0 ms je Bild — also
+  // mehr als der alte Weg; mit Verkleinerung (2880×1800 → 1152×720) 3,1
+  // statt 12,4 ms — weniger. Die Kosten wachsen mit den zurückgelesenen
+  // Pixeln. Regel: Wird in 5 s mehr als 30 % der erzeugten Fläche
+  // zurückgelesen, setzt der GPU-Weg 30 s aus (alter Weg), dann neuer Versuch.
+  // Die Vorschau in Kachelgröße (15 fps) liegt weit darunter.
+  bool Ausgesetzt() {
+    const int64_t jetzt = webrtc::TimeMillis();
+    if (jetzt < pause_bis_ms_) return true;
+    if (pause_bis_ms_ != 0) {
+      pause_bis_ms_ = 0;
+      fenster_ms_ = jetzt;
+      p_erzeugt = 0;
+      p_gelesen = 0;
+      Protokoll("Null-Kopie: neuer Versuch über die Grafikkarte");
+    }
+    if (fenster_ms_ == 0) fenster_ms_ = jetzt;
+    if (jetzt - fenster_ms_ >= 5000) {
+      const uint64_t e = p_erzeugt.exchange(0), g = p_gelesen.exchange(0);
+      fenster_ms_ = jetzt;
+      if (e > 0 && g * 10 > e * 3) {
+        pause_bis_ms_ = jetzt + 30000;
+        Protokoll("Null-Kopie: %.0f %% der Bildfläche zurückgelesen (kein VA-Encoder nimmt die "
+                  "GPU-Bilder) — 30 s alter Weg",
+                  100.0 * static_cast<double>(g) / static_cast<double>(e));
+        return true;
+      }
+    }
+    return false;
+  }
+
   webrtc::scoped_refptr<webrtc::RefCountInterface> Machen(const webrtc::HcDmaBufBild& b) {
     Va* va = g_va;
     if (!va) return nullptr;
+    {
+      std::lock_guard<std::mutex> sperre(m_);
+      if (Ausgesetzt()) return nullptr;
+    }
     uint32_t drm = 0, vaf = 0;
     if (!FormatAus(b.spa_format, &drm, &vaf)) {
       Einmal(&warn_format_, "Null-Kopie: Format %u nicht unterstützt — alter Weg", b.spa_format);
@@ -325,7 +382,7 @@ class Wandler : public webrtc::HcDmaBufWandler {
     }
     {
       std::lock_guard<std::mutex> sperre(m_);
-      if (gescheitert_.count(b.modifier)) return nullptr;
+      if (gescheitert_.count(Schluessel(b))) return nullptr;
     }
     const int ab = b.breite & ~1, ah = b.hoehe & ~1;
     if (ab < 2 || ah < 2 || b.x < 0 || b.y < 0 || b.x + b.breite > b.strom_breite ||
@@ -372,10 +429,11 @@ class Wandler : public webrtc::HcDmaBufWandler {
     VAStatus s = va->fn.vaCreateSurfaces(va->dpy, VA_RT_FORMAT_RGB32, d.width, d.height,
                                          &quelle, 1, at, 2);
     if (s != VA_STATUS_SUCCESS) {
-      // Dreimal in Folge mit demselben Modifier: für diesen Strom aufgeben.
+      // Dreimal in Folge mit demselben Modifier, Format und derselben Größe:
+      // aufgeben (Prüfbefund M4: nicht für jeden Strom und jede Größe).
       std::lock_guard<std::mutex> sperre(m_);
-      if (++fehl_folge_[b.modifier] >= 3) {
-        gescheitert_.insert(b.modifier);
+      if (++fehl_folge_[Schluessel(b)] >= 3) {
+        gescheitert_.insert(Schluessel(b));
         Protokoll("Null-Kopie: Modifier 0x%llx lässt sich nicht übernehmen (%s) — "
                   "neu verhandeln, sonst alter Weg",
                   static_cast<unsigned long long>(b.modifier), va->fn.vaErrorStr(s));
@@ -392,7 +450,7 @@ class Wandler : public webrtc::HcDmaBufWandler {
     if (!f) return nullptr;
     {
       std::lock_guard<std::mutex> sperre(m_);
-      fehl_folge_[b.modifier] = 0;
+      fehl_folge_[Schluessel(b)] = 0;
       if (!erstes_) {
         erstes_ = true;
         Protokoll("Null-Kopie: erstes Bild %dx%d (Strom %dx%d, Format %u, Modifier 0x%llx, "
@@ -401,8 +459,14 @@ class Wandler : public webrtc::HcDmaBufWandler {
                   static_cast<unsigned long long>(b.modifier), b.ebenen);
       }
     }
+    p_erzeugt += static_cast<uint64_t>(ab) * ah;
     return webrtc::scoped_refptr<webrtc::RefCountInterface>(
         webrtc::make_ref_counted<HcVaBild>(f, ab, ah));
+  }
+
+  using Key = std::tuple<uint64_t, uint32_t, int, int>;
+  static Key Schluessel(const webrtc::HcDmaBufBild& b) {
+    return Key(b.modifier, b.spa_format, b.strom_breite, b.strom_hoehe);
   }
 
   // Zwei Deskriptoren, dieselbe Datei? (PipeWire reicht je Ebene einen eigenen.)
@@ -444,9 +508,10 @@ class Wandler : public webrtc::HcDmaBufWandler {
   }
 
   std::mutex m_;
-  std::set<uint64_t> gescheitert_;
-  std::map<uint64_t, int> fehl_folge_;
+  std::set<Key> gescheitert_;
+  std::map<Key, int> fehl_folge_;
   bool warn_format_ = false, warn_mod_ = false, erstes_ = false;
+  int64_t pause_bis_ms_ = 0, fenster_ms_ = 0;   // unter m_
   std::atomic<int64_t> bericht_ms_{0};
 };
 
@@ -551,6 +616,20 @@ const AVFrame* AlsVaRahmen(const webrtc::VideoFrameBuffer& puffer, const AVBuffe
 }
 
 void EncoderDirektGezaehlt() { z_direkt++; }
+
+namespace {
+std::atomic<int> g_aufnahmen{0};
+}
+
+void AufnahmeBeginnt() { g_aufnahmen++; }
+
+void AufnahmeEndet() {
+  if (--g_aufnahmen <= 0 && g_va) {
+    g_aufnahmen = 0;
+    g_va->Leeren();
+    Protokoll("Null-Kopie: keine Aufnahme mehr — Bildvorräte freigegeben");
+  }
+}
 
 }  // namespace nullkopie
 }  // namespace libwebrtc

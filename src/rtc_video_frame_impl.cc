@@ -74,6 +74,7 @@ int VideoFrameBufferImpl::ConvertToARGB(Type type, uint8_t* dst_buffer,
         (dest_width == buffer_->width() && dest_height == buffer_->height())
             ? buffer_
             : buffer_->Scale(dest_width, dest_height);
+    if (!klein) return 0;
     // ToI420 des GPU-Bildes merkt sich sein Ergebnis selbst.
     webrtc::scoped_refptr<webrtc::I420BufferInterface> k = klein->ToI420();
     if (!k) return 0;

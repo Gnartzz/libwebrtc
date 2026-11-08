@@ -229,6 +229,10 @@ int main(int argc, char** argv) {
         puffer = webrtc::scoped_refptr<webrtc::VideoFrameBuffer>(
             static_cast<webrtc::VideoFrameBuffer*>(nativ.get()));
         if (zb != qb || zh != qh) puffer = puffer->Scale(zb, zh);
+        // NK_NUR_I420=1: so tun, als nähme kein VA-Encoder das GPU-Bild
+        // (VP8, Software-Rückfall) — dann liest jeder Verbraucher zurück.
+        if (std::getenv("NK_NUR_I420")) puffer = puffer->ToI420();
+        if (!puffer) { ++l.fehler; continue; }
       } else {
         auto i420 = webrtc::I420Buffer::Create(qb, qh);
         libyuv::ARGBToI420(ref.data(), qb * 4, i420->MutableDataY(), i420->StrideY(), i420->MutableDataU(),

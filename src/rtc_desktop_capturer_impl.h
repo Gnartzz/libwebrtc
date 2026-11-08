@@ -89,6 +89,15 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   uint32_t h_ = 0;
   uint32_t max_width_ = 0;
   uint32_t max_height_ = 0;
+  // honeycord (Null-Kopie Linux, 08.11.2026)
+  bool nullkopie_ = false;           // Wandler aktiv (Einrichten)
+  bool aufnahme_gezaehlt_ = false;   // AufnahmeBeginnt ohne AufnahmeEndet
+  // Dasselbe GPU-Bild kommt bei der doppelten Abfragerate mehrfach; das
+  // gedeckelte Ergebnis wird dann wiederverwendet statt neu gerechnet.
+  // Referenz, nicht nur Adresse: sonst koennte ein neues Bild die Adresse
+  // eines freigegebenen erben und das alte Ergebnis bekommen.
+  webrtc::scoped_refptr<webrtc::RefCountInterface> letztes_nativ_;
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> letztes_aus_;
   webrtc::scoped_refptr<webrtc::I420Buffer> scaled_buffer_;
 };
 

@@ -136,6 +136,10 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   webrtc::EncodedImage encoded_image_;
 
   Backend weg_ = Backend::kVaapi;
+  // Größe aus InitEncode (WebRTCs Ziel). width_/height_ folgen dem Bild, das
+  // wirklich kommt; GPU-Bilder werden auf diese hier gebracht (Prüfbefund S1).
+  int soll_breite_ = 0;
+  int soll_hoehe_ = 0;
   int profil_ = 0;  // AV_PROFILE_H264_*, aus dem ausgehandelten SDP-Format
   webrtc::H264PacketizationMode packetization_mode_ =
       webrtc::H264PacketizationMode::NonInterleaved;
