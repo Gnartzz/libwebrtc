@@ -482,9 +482,14 @@ int32_t MfH264Encoder::Encode(const webrtc::VideoFrame& frame,
     zeit = (frame.timestamp_us() - erste_zeit_us_) * 10;
   }
   if (zeit <= letzte_probe_zeit_) zeit = letzte_probe_zeit_ + 1;
+  // Die Dauer ist der echte Abstand zum vorigen Bild (gedeckelt auf 1 s) —
+  // gemessen 08.11.: mit fester 1/fps verteilt der MFT die Rate auf die
+  // angemeldete Bildrate und liefert bei 10 statt 30 Bildern/s ein Drittel.
+  LONGLONG abstand = letzte_probe_zeit_ >= 0 ? zeit - letzte_probe_zeit_ : dauer;
+  if (abstand <= 0 || abstand > 10000000LL) abstand = dauer;
   letzte_probe_zeit_ = zeit;
   probe->SetSampleTime(zeit);
-  probe->SetSampleDuration(dauer);
+  probe->SetSampleDuration(abstand);
   stempel_[zeit] = Stempel{frame.rtp_timestamp(), frame.ntp_time_ms(), frame.render_time_ms(),
                            frame.rotation()};
 
