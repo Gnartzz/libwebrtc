@@ -23,6 +23,9 @@
 #ifdef WEBRTC_WIN
 #include "modules/desktop_capture/win/window_capture_utils.h"
 #endif
+#if defined(WEBRTC_LINUX) && defined(USE_LINUX_HWENC)
+#include "src/linux/hwenc/ffmpeg/hw_nullkopie.h"
+#endif
 
 namespace libwebrtc {
 
@@ -50,6 +53,16 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
   // unten. Die Auswahl trifft dort ohnehin der Portal-Dialog des Systems.
   (void)type;
   options_.set_allow_pipewire(true);
+#if defined(USE_LINUX_HWENC)
+  // honeycord (Null-Kopie, 08.11.2026): Bleiben die Bilder auf der
+  // Grafikkarte, malt niemand mehr den Zeiger ins ausgelesene Bild
+  // (DesktopAndCursorComposer arbeitet auf den Pixeln). Also soll ihn der
+  // Compositor selbst in den Strom legen. Das gilt dann auch fuer den alten
+  // Weg, falls ein Bild doch ueber die CPU geht.
+  if (libwebrtc::nullkopie::Einrichten() && showCursor) {
+    options_.set_prefer_cursor_embedded(true);
+  }
+#endif
 #endif
   thread_->BlockingCall([this, type, showCursor] {
     if (type == kScreen) {
@@ -187,6 +200,35 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
   if (result == webrtc::DesktopCapturer::Result::ERROR_TEMPORARY) {
     return;
   }
+
+#if defined(WEBRTC_LINUX) && defined(USE_LINUX_HWENC)
+  // honeycord (Null-Kopie): Das Bild liegt schon als NV12 auf der Grafikkarte.
+  // Zuschnitt und Deckel laufen dort (VPP), die Pixel in frame->data() sind
+  // NICHT gefuellt und werden nicht angefasst.
+  if (frame->honeycord_nativ()) {
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> gpu(
+        static_cast<webrtc::VideoFrameBuffer*>(frame->honeycord_nativ().get()));
+    const int bx = static_cast<int>(x_), by = static_cast<int>(y_);
+    const int bw = static_cast<int>(w_) & ~1, bh = static_cast<int>(h_) & ~1;
+    if (bw > 0 && bh > 0 && bx + bw <= gpu->width() && by + bh <= gpu->height() &&
+        (bw != gpu->width() || bh != gpu->height())) {
+      gpu = gpu->CropAndScale(bx, by, bw, bh, bw, bh);
+    }
+    if (max_width_ > 0 && max_height_ > 0 &&
+        (gpu->width() > static_cast<int>(max_width_) ||
+         gpu->height() > static_cast<int>(max_height_))) {
+      double sx = static_cast<double>(max_width_) / gpu->width();
+      double sy = static_cast<double>(max_height_) / gpu->height();
+      double scale = sx < sy ? sx : sy;
+      int dst_w = static_cast<int>(gpu->width() * scale) & ~1;
+      int dst_h = static_cast<int>(gpu->height() * scale) & ~1;
+      gpu = gpu->Scale(dst_w, dst_h);
+    }
+    OnFrame(webrtc::VideoFrame(gpu, 0, webrtc::TimeMillis(),
+                               webrtc::kVideoRotation_0));
+    return;
+  }
+#endif
 
   int width = frame->size().width();
   int height = frame->size().height();

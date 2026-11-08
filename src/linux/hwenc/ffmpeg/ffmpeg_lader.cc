@@ -67,6 +67,7 @@ void LadenEinmal() {
   ok &= Hole(avutil, "av_frame_alloc", &g_api.av_frame_alloc);
   ok &= Hole(avutil, "av_frame_free", &g_api.av_frame_free);
   ok &= Hole(avutil, "av_frame_unref", &g_api.av_frame_unref);
+  ok &= Hole(avutil, "av_frame_ref", &g_api.av_frame_ref);
   ok &= Hole(avutil, "av_frame_get_buffer", &g_api.av_frame_get_buffer);
   ok &= Hole(avutil, "av_frame_make_writable", &g_api.av_frame_make_writable);
   ok &= Hole(avutil, "av_hwdevice_ctx_create", &g_api.av_hwdevice_ctx_create);

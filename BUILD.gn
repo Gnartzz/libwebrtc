@@ -225,6 +225,8 @@ rtc_shared_library("libwebrtc") {
       "src/linux/hwenc/ffmpeg/hw_h264_decoder.h",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.h",
+      "src/linux/hwenc/ffmpeg/hw_nullkopie.cc",
+      "src/linux/hwenc/ffmpeg/hw_nullkopie.h",
       "src/linux/hwenc/ffmpeg/ratenregeln.h",
       "src/linux/hwenc/hw_decoder_factory.cc",
       "src/linux/hwenc/hw_decoder_factory.h",
@@ -318,6 +320,44 @@ rtc_shared_library("libwebrtc") {
         "//third_party/libjpeg_turbo:libjpeg",
       ]
     }
+  }
+}
+
+# Pruefprogramm Null-Kopie (08.11.2026): Wandler + VA-API-Encoder mit einem
+# gekachelten GBM-Puffer gegen den alten Weg.
+#   ninja -C out/Release-x64 libwebrtc:nullkopie_test
+if (is_linux && libwebrtc_hwenc) {
+  rtc_executable("nullkopie_test") {
+    testonly = true
+    sources = [
+      "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
+      "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
+      "src/linux/hwenc/ffmpeg/hw_nullkopie.cc",
+      "src/linux/hwenc/hw_gemeinsam.cc",
+      "test/nullkopie_test.cc",
+    ]
+    include_dirs = [
+      ".",
+      "src/linux/hwenc/ffmpeg/include",
+    ]
+    defines = [ "USE_LINUX_HWENC" ]
+    libs = [ "dl" ]
+    deps = [
+      "../api:make_ref_counted",
+      "../api/environment:environment_factory",
+      "../api/video:encoded_image",
+      "../api/video:video_frame",
+      "../api/video:video_bitrate_allocation",
+      "../api/video_codecs:video_codecs_api",
+      "../common_video",
+      "../media:media_constants",
+      "../modules/video_coding:video_codec_interface",
+      "../modules/video_coding:codec_globals_headers",
+      "../rtc_base:logging",
+      "../rtc_base:timeutils",
+      "//third_party/abseil-cpp/absl/strings",
+      "//third_party/libyuv",
+    ]
   }
 }
 

@@ -35,7 +35,19 @@ void VideoCapturer::OnFrame(const VideoFrame& frame) {
     return;
   }
 
-  if (out_height != frame.height() || out_width != frame.width()) {
+  if ((out_height != frame.height() || out_width != frame.width()) &&
+      frame.video_frame_buffer()->type() == VideoFrameBuffer::Type::kNative) {
+    // honeycord (Null-Kopie Linux, 08.11.2026): ein GPU-Bild skaliert sich
+    // selbst (VPP). Fuer andere native Puffer ist Scale() derselbe Weg wie
+    // unten (ToI420 + Skalieren), nur ohne Zwischenpuffer hier.
+    broadcaster_.OnFrame(VideoFrame::Builder()
+                             .set_video_frame_buffer(
+                                 frame.video_frame_buffer()->Scale(out_width, out_height))
+                             .set_rotation(kVideoRotation_0)
+                             .set_timestamp_us(frame.timestamp_us())
+                             .set_id(frame.id())
+                             .build());
+  } else if (out_height != frame.height() || out_width != frame.width()) {
     // Video adapter has requested a down-scale. Allocate a new buffer and
     // return scaled version.
     webrtc::scoped_refptr<I420Buffer> scaled_buffer =

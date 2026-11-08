@@ -78,6 +78,7 @@ struct Api {
   AVFrame* (*av_frame_alloc)() = nullptr;
   void (*av_frame_free)(AVFrame**) = nullptr;
   void (*av_frame_unref)(AVFrame*) = nullptr;
+  int (*av_frame_ref)(AVFrame*, const AVFrame*) = nullptr;   // Null-Kopie (08.11.)
   int (*av_frame_get_buffer)(AVFrame*, int) = nullptr;
   int (*av_frame_make_writable)(AVFrame*) = nullptr;
   int (*av_hwdevice_ctx_create)(AVBufferRef**, enum AVHWDeviceType, const char*,

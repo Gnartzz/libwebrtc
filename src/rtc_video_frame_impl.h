@@ -1,6 +1,8 @@
 #ifndef LIB_WEBRTC_VIDEO_FRAME_IMPL_HXX
 #define LIB_WEBRTC_VIDEO_FRAME_IMPL_HXX
 
+#include <mutex>
+
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame_buffer.h"
 #include "api/video/video_rotation.h"
@@ -53,6 +55,11 @@ class VideoFrameBufferImpl : public RTCVideoFrame {
 
  private:
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer_;
+  // honeycord (Null-Kopie Linux, 08.11.2026): Ein natives Bild (GPU) hat kein
+  // GetI420(). Die Daten-Zugriffe holen es dann EINMAL ueber ToI420().
+  const webrtc::I420BufferInterface* I420() const;
+  mutable std::mutex i420_m_;
+  mutable webrtc::scoped_refptr<webrtc::I420BufferInterface> i420_;
   int64_t timestamp_us_ = 0;
   webrtc::VideoRotation rotation_ = webrtc::kVideoRotation_0;
 };

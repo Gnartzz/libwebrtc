@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include "src/linux/hwenc/ffmpeg/ratenregeln.h"
+#include "src/linux/hwenc/ffmpeg/hw_nullkopie.h"
 #include "src/linux/hwenc/hw_gemeinsam.h"
 #include <unistd.h>
 
@@ -234,9 +235,14 @@ int32_t HwH264Encoder::CodecOeffnen() {
     // ★ NUR VA-API braucht diesen Vorbau. NVENC nimmt Bilder aus dem
     // Arbeitsspeicher entgegen und lädt sie selbst hoch — ein eigener
     // Bildspeicher waere dort nur Ballast.
-    r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI,
-                                   nullptr, nullptr, 0);
-    if (r < 0) {
+    // ★ Null-Kopie (08.11.2026): dasselbe VA-Gerät wie der Wandler am
+    // Bildschirm-Aufnehmer — nur dann darf eine Oberfläche von dort ohne
+    // Umweg hier hinein. Ist die Null-Kopie aus, wie bisher ein eigenes.
+    hw_device_ = nullkopie::GeraetRef();
+    if (!hw_device_)
+      r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI,
+                                     nullptr, nullptr, 0);
+    if (r < 0 || !hw_device_) {
       RTC_LOG(LS_ERROR) << "[hwenc] VA-API-Gerät: " << ffmpeg::FehlerText(r);
       CodecSchliessen();
       return WEBRTC_VIDEO_CODEC_ERROR;
@@ -604,16 +610,26 @@ int32_t HwH264Encoder::Encode(
   if (frame_index_ == 0) keyframe = true;
 
   const int64_t t0 = webrtc::TimeMicros();
-  auto puffer = frame.video_frame_buffer()->ToI420();
-  if (!puffer) return WEBRTC_VIDEO_CODEC_ERROR;
-  const int64_t t1 = webrtc::TimeMicros();
-
-  int r = api.av_frame_make_writable(sw_frame_);
-  if (r < 0) {
-    RTC_LOG(LS_ERROR) << "[hwenc] make_writable: " << ffmpeg::FehlerText(r);
-    return WEBRTC_VIDEO_CODEC_ERROR;
+  // ★ Null-Kopie (08.11.2026): Ein Bildschirmbild, das schon als NV12 auf
+  // der Grafikkarte liegt (gleiches VA-Gerät, gleiche Größe), geht ohne
+  // Zurücklesen, Umrechnen und Hochladen hinein.
+  const AVFrame* gpu = weg_ == Backend::kVaapi
+                           ? nullkopie::AlsVaRahmen(*frame.video_frame_buffer(), hw_device_,
+                                                    width_, height_)
+                           : nullptr;
+  int r = 0;
+  int64_t t1 = t0;
+  if (!gpu) {
+    auto puffer = frame.video_frame_buffer()->ToI420();
+    if (!puffer) return WEBRTC_VIDEO_CODEC_ERROR;
+    t1 = webrtc::TimeMicros();
+    r = api.av_frame_make_writable(sw_frame_);
+    if (r < 0) {
+      RTC_LOG(LS_ERROR) << "[hwenc] make_writable: " << ffmpeg::FehlerText(r);
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    I420NachNv12(*puffer, sw_frame_);
   }
-  I420NachNv12(*puffer, sw_frame_);
   const int64_t t2 = webrtc::TimeMicros();
   const int64_t pts = frame_index_++;
   sw_frame_->pts = pts;
@@ -633,7 +649,19 @@ int32_t HwH264Encoder::Encode(
   // VA-API will das Bild im Grafikspeicher; NVENC nimmt es aus dem
   // Arbeitsspeicher und lädt selbst hoch.
   AVFrame* hinein = sw_frame_;
-  if (weg_ == Backend::kVaapi) {
+  if (gpu) {
+    api.av_frame_unref(hw_frame_);
+    r = api.av_frame_ref(hw_frame_, gpu);
+    if (r < 0) {
+      RTC_LOG(LS_ERROR) << "[hwenc] GPU-Bild: " << ffmpeg::FehlerText(r);
+      stempel_.erase(pts);
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    hw_frame_->pts = sw_frame_->pts;
+    hw_frame_->pict_type = sw_frame_->pict_type;
+    hinein = hw_frame_;
+    nullkopie::EncoderDirektGezaehlt();
+  } else if (weg_ == Backend::kVaapi) {
     // Das Zielbild wird jedes Mal frisch geholt; ohne das vorherige Freigeben
     // hielte der Encoder Puffer fest, die er selbst noch braucht.
     api.av_frame_unref(hw_frame_);
@@ -685,7 +713,8 @@ int32_t HwH264Encoder::Encode(
     Protokoll("Zeiten je Bild (%d Bilder, %dx%d, %s): I420 %.1f ms · NV12 %.1f ms · "
               "hochladen %.1f ms · kodieren+abholen %.1f ms · %s",
               zeit_bilder_, width_, height_,
-              frame.video_frame_buffer()->type() == webrtc::VideoFrameBuffer::Type::kI420
+              gpu ? "kam als GPU-Bild"
+              : frame.video_frame_buffer()->type() == webrtc::VideoFrameBuffer::Type::kI420
                   ? "kam als I420" : "musste gewandelt werden",
               zeit_i420_us_ / n / 1000.0, zeit_nv12_us_ / n / 1000.0,
               zeit_hoch_us_ / n / 1000.0, zeit_kod_us_ / n / 1000.0,
@@ -1204,7 +1233,11 @@ webrtc::VideoEncoder::EncoderInfo HwH264Encoder::GetEncoderInfo() const {
   // (Makroblock). Ohne diese Angabe schickt WebRTC ungerade Größen, und der
   // Treiber schneidet stillschweigend ab.
   info.requested_resolution_alignment = 16;
-  info.supports_native_handle = false;
+  // ★ Null-Kopie (08.11.2026): VA-API nimmt GPU-Bilder des Bildschirm-
+  // Aufnehmers direkt. Ohne diese Angabe liest WebRTC sie VOR dem Encoder
+  // zurück (VideoStreamEncoder, ToI420) — genau der Weg, der wegfallen soll.
+  // Alles andere (Kamera, I420) nimmt Encode() wie bisher.
+  info.supports_native_handle = weg_ == Backend::kVaapi && nullkopie::Aktiv();
   // ★★ GEMESSEN 21.09.2026 auf dem UM890 (drei Läufe, Netz gut wie schlecht):
   // Der Bildschirm-Capturer lieferte 54–57 Bilder/s, dieser Encoder brauchte
   // 6–9 ms je Bild — und kodiert wurden 7 bis 9. Die Bilder verwarf WebRTC

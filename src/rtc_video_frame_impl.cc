@@ -30,34 +30,59 @@ int VideoFrameBufferImpl::width() const { return buffer_->width(); }
 int VideoFrameBufferImpl::height() const { return buffer_->height(); }
 
 const uint8_t* VideoFrameBufferImpl::DataY() const {
-  return buffer_->GetI420()->DataY();
+  return I420()->DataY();
 }
 
 const uint8_t* VideoFrameBufferImpl::DataU() const {
-  return buffer_->GetI420()->DataU();
+  return I420()->DataU();
 }
 
 const uint8_t* VideoFrameBufferImpl::DataV() const {
-  return buffer_->GetI420()->DataV();
+  return I420()->DataV();
 }
 
 int VideoFrameBufferImpl::StrideY() const {
-  return buffer_->GetI420()->StrideY();
+  return I420()->StrideY();
 }
 
 int VideoFrameBufferImpl::StrideU() const {
-  return buffer_->GetI420()->StrideU();
+  return I420()->StrideU();
 }
 
 int VideoFrameBufferImpl::StrideV() const {
-  return buffer_->GetI420()->StrideV();
+  return I420()->StrideV();
+}
+
+const webrtc::I420BufferInterface* VideoFrameBufferImpl::I420() const {
+  if (buffer_->type() == webrtc::VideoFrameBuffer::Type::kI420)
+    return buffer_->GetI420();
+  std::lock_guard<std::mutex> sperre(i420_m_);
+  if (!i420_) i420_ = buffer_->ToI420();
+  return i420_.get();
 }
 
 int VideoFrameBufferImpl::ConvertToARGB(Type type, uint8_t* dst_buffer,
                                         int dst_stride, int dest_width,
                                         int dest_height) {
-  webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
-      webrtc::I420Buffer::Rotate(*buffer_.get(), rotation_);
+  // honeycord (Null-Kopie Linux, 08.11.2026): ein GPU-Bild erst auf der
+  // Grafikkarte in Zielgroesse bringen, dann zurueckholen — die Vorschau
+  // liest so nur die Kachel, nicht den ganzen Bildschirm.
+  webrtc::scoped_refptr<webrtc::I420Buffer> i420;
+  if (buffer_->type() == webrtc::VideoFrameBuffer::Type::kNative &&
+      rotation_ == webrtc::kVideoRotation_0 && dest_width > 0 && dest_height > 0) {
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> klein =
+        (dest_width == buffer_->width() && dest_height == buffer_->height())
+            ? buffer_
+            : buffer_->Scale(dest_width, dest_height);
+    // ToI420 des GPU-Bildes merkt sich sein Ergebnis selbst.
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> k = klein->ToI420();
+    if (!k) return 0;
+    i420 = webrtc::I420Buffer::Rotate(*k, rotation_);
+  } else {
+    const webrtc::I420BufferInterface* q = I420();
+    if (!q) return 0;
+    i420 = webrtc::I420Buffer::Rotate(*q, rotation_);
+  }
 
   webrtc::scoped_refptr<webrtc::I420Buffer> dest =
       webrtc::I420Buffer::Create(dest_width, dest_height);

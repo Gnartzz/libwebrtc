@@ -1,0 +1,205 @@
+--- a/modules/desktop_capture/desktop_frame.h
++++ b/modules/desktop_capture/desktop_frame.h
+@@ -21,6 +21,8 @@
+ #include "modules/desktop_capture/desktop_geometry.h"
+ #include "modules/desktop_capture/desktop_region.h"
+ #include "modules/desktop_capture/shared_memory.h"
++#include "api/ref_count.h"
++#include "api/scoped_refptr.h"
+ #include "rtc_base/system/rtc_export.h"
+ 
+ namespace webrtc {
+@@ -94,6 +96,17 @@
+     may_contain_cursor_ = may_contain_cursor;
+   }
+ 
++  // HoneyCord (Null-Kopie Linux, 08.11.2026): die GPU-Fassung dieses Bildes
++  // (ein webrtc::VideoFrameBuffer vom Typ kNative), wenn der Aufnehmer den
++  // DMA-BUF direkt an die Grafikkarte weitergereicht hat. Dann sind die
++  // Pixel in data() NICHT gefuellt. nullptr = gewoehnliches Bild.
++  const scoped_refptr<RefCountInterface>& honeycord_nativ() const {
++    return honeycord_nativ_;
++  }
++  void set_honeycord_nativ(scoped_refptr<RefCountInterface> nativ) {
++    honeycord_nativ_ = std::move(nativ);
++  }
++
+   // Time taken to capture the frame in milliseconds.
+   int64_t capture_time_ms() const { return capture_time_ms_; }
+   void set_capture_time_ms(int64_t time_ms) { capture_time_ms_ = time_ms; }
+@@ -199,6 +212,7 @@
+   // captured surface and has distinct values possible in the range of
+   // [1,5].
+   std::optional<float> device_scale_factor_;
++  scoped_refptr<RefCountInterface> honeycord_nativ_;
+ };
+ 
+ // A DesktopFrame that stores data in the heap.
+--- a/modules/desktop_capture/desktop_frame.cc
++++ b/modules/desktop_capture/desktop_frame.cc
+@@ -146,6 +146,7 @@
+   set_icc_profile(other.icc_profile());
+   set_may_contain_cursor(other.may_contain_cursor());
+   set_device_scale_factor(other.device_scale_factor());
++  set_honeycord_nativ(other.honeycord_nativ());
+ }
+ 
+ void DesktopFrame::MoveFrameInfoFrom(DesktopFrame* other) {
+@@ -157,6 +158,7 @@
+   set_icc_profile(other->icc_profile());
+   set_may_contain_cursor(other->may_contain_cursor());
+   set_device_scale_factor(other->device_scale_factor());
++  set_honeycord_nativ(std::move(other->honeycord_nativ_));
+ }
+ 
+ bool DesktopFrame::FrameDataIsBlack() const {
+--- a/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
++++ b/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
+@@ -47,6 +47,7 @@
+ #include "modules/desktop_capture/desktop_geometry.h"
+ #include "modules/desktop_capture/desktop_region.h"
+ #include "modules/desktop_capture/linux/wayland/egl_dmabuf.h"
++#include "modules/desktop_capture/linux/wayland/honeycord_dmabuf.h"
+ #include "modules/desktop_capture/linux/wayland/screencast_stream_utils.h"
+ #include "modules/desktop_capture/mouse_cursor.h"
+ #include "modules/desktop_capture/screen_capture_frame_queue.h"
+@@ -911,7 +912,58 @@
+   }
+ 
+   bool bufferProcessed = false;
+-  if (spa_buffer->datas[0].type == SPA_DATA_MemFd) {
++  // HoneyCord (Null-Kopie): erst den Wandler fragen. Das Feld wird bei JEDEM
++  // Bild neu gesetzt -- die Rahmen der Warteschlange werden wiederverwendet,
++  // ein altes GPU-Bild darf nie an einem neuen CPU-Bild haengen bleiben.
++  bool honeycord_nativ = false;
++  queue_.current_frame()->set_honeycord_nativ(nullptr);
++  if (spa_buffer->datas[0].type == SPA_DATA_DmaBuf && spa_buffer->n_datas > 0 &&
++      spa_buffer->n_datas <= 4) {
++    if (HcDmaBufWandler* wandler =
++            HcDmaBufWandlerPlatz().load(std::memory_order_acquire)) {
++      HcDmaBufBild bild;
++      bild.strom_breite = stream_size_.width();
++      bild.strom_hoehe = stream_size_.height();
++      bild.x = offset.x();
++      bild.y = offset.y();
++      bild.breite = frame_size_.width();
++      bild.hoehe = frame_size_.height();
++      bild.spa_format = spa_video_format_.format;
++      bild.modifier = static_cast<uint64_t>(modifier_);
++      bild.ebenen = static_cast<int>(spa_buffer->n_datas);
++      for (uint32_t i = 0; i < spa_buffer->n_datas; ++i) {
++        bild.ebene[i].fd = static_cast<int>(spa_buffer->datas[i].fd);
++        bild.ebene[i].offset = spa_buffer->datas[i].chunk->offset;
++        bild.ebene[i].stride =
++            static_cast<uint32_t>(spa_buffer->datas[i].chunk->stride);
++      }
++      scoped_refptr<RefCountInterface> nativ = wandler->Wandeln(bild);
++      if (nativ) {
++        queue_.current_frame()->set_honeycord_nativ(std::move(nativ));
++        honeycord_nativ = true;
++        bufferProcessed = true;
++      } else if (modifier_ != static_cast<int64_t>(DRM_FORMAT_MOD_INVALID) &&
++                 pw_server_version_ >= kDropSingleModifierMinVersion &&
++                 wandler->ModifierUnbrauchbar(bild.modifier)) {
++        size_t feste = 0;
++        for (uint64_t m : modifiers_) {
++          if (m != DRM_FORMAT_MOD_INVALID) ++feste;
++        }
++        if (feste > 1 && std::find(modifiers_.begin(), modifiers_.end(),
++                                   static_cast<uint64_t>(modifier_)) !=
++                             modifiers_.end()) {
++          RTC_LOG(LS_INFO) << "HoneyCord: Modifier " << modifier_
++                           << " ohne Null-Kopie, verhandle neu";
++          std::erase(modifiers_, modifier_);
++          pw_loop_signal_event(pw_thread_loop_get_loop(pw_main_loop_),
++                               renegotiate_);
++        }
++      }
++    }
++  }
++  if (honeycord_nativ) {
++    // Pixel bleiben ungelesen; das GPU-Bild haengt am Rahmen.
++  } else if (spa_buffer->datas[0].type == SPA_DATA_MemFd) {
+     bufferProcessed =
+         ProcessMemFDBuffer(buffer, *queue_.current_frame(), offset);
+   } else if (spa_buffer->datas[0].type == SPA_DATA_DmaBuf) {
+@@ -929,8 +981,9 @@
+ 
+   // TODO(bugs.webrtc.org/436974448): Remove this conversion when arbitrary
+   // pixel formats are supported.
+-  if (spa_video_format_.format == SPA_VIDEO_FORMAT_RGBx ||
+-      spa_video_format_.format == SPA_VIDEO_FORMAT_RGBA) {
++  if (!honeycord_nativ &&
++      (spa_video_format_.format == SPA_VIDEO_FORMAT_RGBx ||
++       spa_video_format_.format == SPA_VIDEO_FORMAT_RGBA)) {
+     uint8_t* tmp_src = queue_.current_frame()->data();
+     for (int i = 0; i < frame_size_.height(); ++i) {
+       // If both sides decided to go with the RGBx format we need to convert
+--- a/modules/desktop_capture/linux/wayland/honeycord_dmabuf.h
++++ b/modules/desktop_capture/linux/wayland/honeycord_dmabuf.h
+@@ -0,0 +1,65 @@
++/*
++ * HoneyCord (Null-Kopie Linux, 08.11.2026): Haken zwischen dem PipeWire-
++ * Aufnehmer und der Grafikkarte.
++ *
++ * Ohne Haken liest WebRTC jedes DMA-BUF-Bild per glReadPixels in den
++ * Arbeitsspeicher, danach rechnet die CPU es zweimal um und laedt es wieder
++ * hoch (gemessen auf Intel UHD 630: 5-10 ms CPU je Bild). Ist ein Wandler
++ * gesetzt, bekommt er den DMA-BUF zuerst; liefert er ein GPU-Bild, haengt es
++ * am DesktopFrame (honeycord_nativ) und die Pixel werden NICHT gelesen.
++ * Liefert er nullptr, laeuft alles wie bisher.
++ */
++#ifndef MODULES_DESKTOP_CAPTURE_LINUX_WAYLAND_HONEYCORD_DMABUF_H_
++#define MODULES_DESKTOP_CAPTURE_LINUX_WAYLAND_HONEYCORD_DMABUF_H_
++
++#include <stdint.h>
++
++#include <atomic>
++
++#include "api/ref_count.h"
++#include "api/scoped_refptr.h"
++
++namespace webrtc {
++
++struct HcDmaBufEbene {
++  int fd = -1;
++  uint32_t offset = 0;
++  uint32_t stride = 0;
++};
++
++struct HcDmaBufBild {
++  int strom_breite = 0;      // Groesse des DMA-BUF
++  int strom_hoehe = 0;
++  int x = 0, y = 0;          // Ausschnitt (VideoCrop), sonst 0/0 und volle Groesse
++  int breite = 0, hoehe = 0;
++  uint32_t spa_format = 0;   // SPA_VIDEO_FORMAT_*
++  uint64_t modifier = 0;     // DRM_FORMAT_MOD_INVALID = implizit
++  int ebenen = 0;
++  HcDmaBufEbene ebene[4];
++};
++
++class HcDmaBufWandler {
++ public:
++  // Muss FERTIG sein, wenn es zurueckkehrt: Der PipeWire-Puffer geht danach
++  // an den Compositor zurueck und wird neu beschrieben.
++  virtual scoped_refptr<RefCountInterface> Wandeln(const HcDmaBufBild& bild) = 0;
++
++  // Wahr, wenn dieser Modifier dauerhaft nicht zu uebernehmen ist. Dann
++  // streicht der Aufnehmer ihn (wie bei einem EGL-Fehler) und verhandelt neu,
++  // solange noch ein anderer fester Modifier bleibt -- sonst liefe die ganze
++  // Freigabe ueber die CPU, nur weil der Compositor zuerst diesen gewaehlt hat.
++  virtual bool ModifierUnbrauchbar(uint64_t modifier) = 0;
++
++ protected:
++  virtual ~HcDmaBufWandler() = default;
++};
++
++// Einmal je Prozess gesetzt, lebt bis zum Ende (wird nie freigegeben).
++inline std::atomic<HcDmaBufWandler*>& HcDmaBufWandlerPlatz() {
++  static std::atomic<HcDmaBufWandler*> platz{nullptr};
++  return platz;
++}
++
++}  // namespace webrtc
++
++#endif  // MODULES_DESKTOP_CAPTURE_LINUX_WAYLAND_HONEYCORD_DMABUF_H_
