@@ -96,6 +96,10 @@ bool FormatAus(uint32_t spa, uint32_t* drm, uint32_t* va) {
 class Va;
 Va* g_va = nullptr;          // lebt bis zum Prozessende
 std::atomic<bool> g_aktiv{false};
+// Laufende Bildschirmaufnahmen (Start..Stop). Ohne eine erzeugt der Wandler
+// nichts — nach Stop() läuft der PipeWire-Strom bis zum Abbau weiter, und
+// jedes Bild legte die eben freigegebenen Vorräte neu an (Nachprüfung M5).
+std::atomic<int> g_aufnahmen{0};
 
 // Zahlen für die 30-s-Zeile in hwenc.log.
 std::atomic<uint64_t> z_bilder{0}, z_fehl{0}, z_skal{0}, z_i420{0}, z_direkt{0};
@@ -364,7 +368,7 @@ class Wandler : public webrtc::HcDmaBufWandler {
 
   webrtc::scoped_refptr<webrtc::RefCountInterface> Machen(const webrtc::HcDmaBufBild& b) {
     Va* va = g_va;
-    if (!va) return nullptr;
+    if (!va || g_aufnahmen.load() == 0) return nullptr;
     {
       std::lock_guard<std::mutex> sperre(m_);
       if (Ausgesetzt()) return nullptr;
@@ -617,15 +621,17 @@ const AVFrame* AlsVaRahmen(const webrtc::VideoFrameBuffer& puffer, const AVBuffe
 
 void EncoderDirektGezaehlt() { z_direkt++; }
 
-namespace {
-std::atomic<int> g_aufnahmen{0};
-}
-
 void AufnahmeBeginnt() { g_aufnahmen++; }
 
 void AufnahmeEndet() {
-  if (--g_aufnahmen <= 0 && g_va) {
-    g_aufnahmen = 0;
+  int n = g_aufnahmen.load();
+  while (n > 0 && !g_aufnahmen.compare_exchange_weak(n, n - 1)) {
+  }
+  AufraeumenWennRuhig();
+}
+
+void AufraeumenWennRuhig() {
+  if (g_aufnahmen.load() == 0 && g_va) {
     g_va->Leeren();
     Protokoll("Null-Kopie: keine Aufnahme mehr — Bildvorräte freigegeben");
   }

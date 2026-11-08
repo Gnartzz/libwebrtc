@@ -56,6 +56,8 @@ void EncoderDirektGezaehlt();
 // seine Bildvorräte und VPP-Kontexte frei.
 void AufnahmeBeginnt();
 void AufnahmeEndet();
+// Leert die Vorräte, wenn keine Aufnahme mehr zählt (nach dem Abbau).
+void AufraeumenWennRuhig();
 
 }  // namespace nullkopie
 }  // namespace libwebrtc

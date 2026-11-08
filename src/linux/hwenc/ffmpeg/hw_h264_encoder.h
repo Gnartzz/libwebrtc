@@ -140,6 +140,7 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   // wirklich kommt; GPU-Bilder werden auf diese hier gebracht (Prüfbefund S1).
   int soll_breite_ = 0;
   int soll_hoehe_ = 0;
+  bool schluessel_nachholen_ = false;   // Anforderung fiel auf ein verworfenes Bild
   int profil_ = 0;  // AV_PROFILE_H264_*, aus dem ausgehandelten SDP-Format
   webrtc::H264PacketizationMode packetization_mode_ =
       webrtc::H264PacketizationMode::NonInterleaved;

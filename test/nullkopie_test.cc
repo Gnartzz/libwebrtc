@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
     std::printf("FEHL: Null-Kopie nicht aktiv (siehe hwenc.log)\n");
     return 1;
   }
+  libwebrtc::nullkopie::AufnahmeBeginnt();   // wie RTCDesktopCapturerImpl::Start
   webrtc::HcDmaBufWandler* wandler = webrtc::HcDmaBufWandlerPlatz().load();
   if (!wandler) { std::printf("FEHL: kein Wandler eingetragen\n"); return 1; }
 

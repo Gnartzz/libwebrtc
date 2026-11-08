@@ -532,6 +532,11 @@ int32_t HwH264Encoder::Encode(
     }
     if (!eingang) {
       RTC_LOG(LS_ERROR) << "[hwenc] GPU-Bild nicht auf Encoder-Größe zu bringen — verworfen";
+      // Ein angefordertes Schlüsselbild darf mit dem Bild nicht verloren gehen.
+      if (frame_types) {
+        for (const auto& t : *frame_types)
+          if (t == webrtc::VideoFrameType::kVideoFrameKey) schluessel_nachholen_ = true;
+      }
       return WEBRTC_VIDEO_CODEC_OK;
     }
   }
@@ -635,6 +640,10 @@ int32_t HwH264Encoder::Encode(
   // Das erste Bild nach dem Öffnen ist immer ein Keyframe — sonst hat der
   // Empfänger nichts, worauf er aufsetzen kann.
   if (frame_index_ == 0) keyframe = true;
+  if (schluessel_nachholen_) {
+    keyframe = true;
+    schluessel_nachholen_ = false;
+  }
 
   const int64_t t0 = webrtc::TimeMicros();
   // ★ Null-Kopie (08.11.2026): Ein Bildschirmbild, das schon als NV12 auf

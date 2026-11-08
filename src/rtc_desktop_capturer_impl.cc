@@ -92,7 +92,13 @@ RTCDesktopCapturerImpl::~RTCDesktopCapturerImpl() {
   capturer_.reset();
 #if defined(WEBRTC_LINUX) && defined(USE_LINUX_HWENC)
   letztes_aus_ = nullptr;
-  if (aufnahme_gezaehlt_) libwebrtc::nullkopie::AufnahmeEndet();
+  letztes_nativ_ = nullptr;
+  if (aufnahme_gezaehlt_) {
+    libwebrtc::nullkopie::AufnahmeEndet();
+  } else if (nullkopie_) {
+    // Nach Stop() kann der Strom bis eben noch Bilder geliefert haben.
+    libwebrtc::nullkopie::AufraeumenWennRuhig();
+  }
 #endif
 }
 
@@ -147,14 +153,15 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
     capture_state_ = CS_FAILED;
     return capture_state_;
   }
-  thread_->BlockingCall([this] { capturer_->Start(this); });
-  capture_state_ = CS_RUNNING;
 #if defined(WEBRTC_LINUX) && defined(USE_LINUX_HWENC)
+  // Vor dem Start zaehlen: Der Wandler erzeugt nur bei laufender Aufnahme.
   if (nullkopie_ && !aufnahme_gezaehlt_) {
     aufnahme_gezaehlt_ = true;
     libwebrtc::nullkopie::AufnahmeBeginnt();
   }
 #endif
+  thread_->BlockingCall([this] { capturer_->Start(this); });
+  capture_state_ = CS_RUNNING;
   thread_->PostTask([this] { CaptureFrame(); });
   if (observer_) {
     signaling_thread_->BlockingCall([&, this]() { observer_->OnStart(this); });
