@@ -371,6 +371,7 @@ int32_t MfH264Encoder::Oeffnen() {
   eingabe_frei_ = 0;
   fenster_start_ms_ = 0;
   fenster_bytes_ = 0;
+  fenster_bilder_ = 0;
   ueber_folge_ = 0;
   letztes_aufsetzen_ms_ = webrtc::TimeMillis();
   letzte_rate_ms_ = letztes_aufsetzen_ms_;
@@ -643,31 +644,47 @@ bool MfH264Encoder::AusgabeAbholen() {
 }
 
 // ── Rate ────────────────────────────────────────────────────────────────────
+// ★ GEMESSEN 08.11.2026: Der Intel-MFT verteilt die Rate fest auf die
+// angemeldete Bildrate — weder echte Zeitstempel noch die Sample-Dauer ändern
+// das. Bei 10 statt 30 Bildern/s kam ein Drittel (978 statt 2500 kbit/s).
+// Also das Ziel um angemeldete ÷ tatsächliche Bildrate anheben (höchstens 4×).
+uint32_t MfH264Encoder::MftZiel() const {
+  const uint32_t basis = bitrate_adjuster_.GetAdjustedBitrateBps();
+  if (ist_fps_ < 1.0 || framerate_ == 0) return basis;
+  const double faktor = std::min(4.0, std::max(1.0, framerate_ / ist_fps_));
+  const double ziel = basis * faktor;
+  return ziel > 200e6 ? 200000000u : static_cast<uint32_t>(ziel);
+}
+
 void MfH264Encoder::RateUeberwachen(size_t bytes, int64_t jetzt) {
   if (fenster_start_ms_ == 0) fenster_start_ms_ = jetzt;
   fenster_bytes_ += bytes;
+  ++fenster_bilder_;
   const int64_t dauer = jetzt - fenster_start_ms_;
-  if (dauer < 1000) return;
+  if (dauer < 2000) return;
   const uint64_t bps = fenster_bytes_ * 8 * 1000 / static_cast<uint64_t>(dauer);
+  ist_fps_ = fenster_bilder_ * 1000.0 / dauer;
   fenster_start_ms_ = jetzt;
   fenster_bytes_ = 0;
+  fenster_bilder_ = 0;
 
   // Der Ausgleicher passt sein Ziel laufend an; der MFT folgt nur nach den
   // Regeln (jede Änderung kostet ein Schlüsselbild).
-  RateNachRegeln(bitrate_adjuster_.GetAdjustedBitrateBps(), jetzt, "Ausgleich");
+  RateNachRegeln(MftZiel(), jetzt, "Ausgleich");
 
   // ★ Gemessen: bei 60 Bildern/s folgt der MFT einer neuen Rate nicht immer.
-  // Liegt die Ausgabe drei Sekunden in Folge über dem 1,5-Fachen, wird neu
+  // Liegt die Ausgabe drei Fenster (je 2 s) in Folge über dem 1,5-Fachen der
+  // FORDERUNG (nicht des angehobenen MFT-Ziels), wird neu
   // aufgesetzt — höchstens alle 10 s (ein Neuaufsetzen kostet ein Schlüsselbild).
   // Weniger als das Ziel ist normal (ruhiges Bild) und kein Grund.
-  if (encoder_bps_ > 0 && bps > static_cast<uint64_t>(encoder_bps_) * 3 / 2) {
+  if (target_bps_ > 0 && bps > static_cast<uint64_t>(target_bps_) * 3 / 2) {
     ++ueber_folge_;
   } else {
     ueber_folge_ = 0;
   }
   if (ueber_folge_ >= 3 && jetzt - letztes_aufsetzen_ms_ > 10000) {
-    Protokoll("Rate: Ausgabe %llu kbit/s bei Ziel %u kbit/s seit %d s, neu aufsetzen",
-              (unsigned long long)(bps / 1000), encoder_bps_ / 1000, ueber_folge_);
+    Protokoll("Rate: Ausgabe %llu kbit/s bei Forderung %u kbit/s (%d Fenster), neu aufsetzen",
+              (unsigned long long)(bps / 1000), target_bps_ / 1000, ueber_folge_);
     ueber_folge_ = 0;
     neu_aufsetzen_ = true;
   }
@@ -680,7 +697,7 @@ void MfH264Encoder::SetRates(const webrtc::VideoEncoder::RateControlParameters& 
   const uint32_t alt = target_bps_;
   target_bps_ = neu;
   bitrate_adjuster_.SetTargetBitrateBps(neu);
-  RateNachRegeln(bitrate_adjuster_.GetAdjustedBitrateBps(), webrtc::TimeMillis(), "WebRTC");
+  RateNachRegeln(MftZiel(), webrtc::TimeMillis(), "WebRTC");
   if (alt == 0 || neu > alt * 11 / 10 || neu < alt * 9 / 10) {
     Protokoll("SetRates: WebRTC %u kbit/s @%.1f -> Encoder %u kbit/s", neu / 1000,
               parameters.framerate_fps, encoder_bps_ / 1000);

@@ -164,7 +164,8 @@ int main(int argc, char** argv) {
   std::printf("Rate 1. Haelfte %.0f kbit/s (Ziel %d), 2. Haelfte %.0f kbit/s (Ziel %d)\n", r1, kbit, r2, kbit / 2);
   const bool gut = s.bilder >= n * 95 / 100 && fehler == 0 &&
                    s.erstes_schluessel_nach_anforderung >= anforderung &&
-                   s.erstes_schluessel_nach_anforderung <= anforderung + 2 && r2 < r1 * 0.8;
+                   s.erstes_schluessel_nach_anforderung <= anforderung + 2 && r2 < r1 * 0.8 &&
+                   r1 > kbit * 0.7 && r1 < kbit * 1.3 && r2 > kbit * 0.5 * 0.7 && r2 < kbit * 0.5 * 1.3;
   std::printf("%s\n", gut ? "BESTANDEN" : "FEHL");
   return gut ? 0 : 1;
 }

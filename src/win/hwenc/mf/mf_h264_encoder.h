@@ -91,6 +91,9 @@ class MfH264Encoder : public webrtc::VideoEncoder {
   // wird hier bestätigt. Liefert true, wenn ein Bild ausgeliefert wurde.
   bool AusgabeAbholen();
   void RateUeberwachen(size_t bytes, int64_t jetzt_ms);
+  // Ziel für den MFT: Ausgleicher-Wert mal angemeldete ÷ tatsächliche
+  // Bildrate (gedeckelt 4×) — der Intel-MFT rechnet fest mit der angemeldeten.
+  uint32_t MftZiel() const;
 
   std::mutex mutex_;
   webrtc::EncodedImageCallback* callback_ = nullptr;
@@ -113,6 +116,8 @@ class MfH264Encoder : public webrtc::VideoEncoder {
   // Ratenüberwachung: Ausgabe der letzten Sekunden gegen das Ziel.
   int64_t fenster_start_ms_ = 0;
   uint64_t fenster_bytes_ = 0;
+  uint32_t fenster_bilder_ = 0;
+  double ist_fps_ = 0;             // gemessene Bildrate (0 = noch keine Messung)
   int ueber_folge_ = 0;          // Sekunden in Folge deutlich über dem Ziel
   int64_t letztes_aufsetzen_ms_ = 0;
   int64_t offen_seit_ms_ = 0;          // für die Anlaufphase
