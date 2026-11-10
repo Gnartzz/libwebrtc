@@ -29,6 +29,13 @@ const char* const kAvutilName = "libavutil.so." AV_STRINGIFY(LIBAVUTIL_VERSION_M
 // System-FFmpeg, schöben gleiche Sonamen die Bibliotheken gegenseitig unter.
 const char* const kAvcodecMit = "libavcodec_hc.so." AV_STRINGIFY(LIBAVCODEC_VERSION_MAJOR);
 const char* const kAvutilMit = "libavutil_hc.so." AV_STRINGIFY(LIBAVUTIL_VERSION_MAJOR);
+// ★ RTLD_DEEPBIND (GEMESSEN 10.11., LD_DEBUG=bindings): Die Versionsknoten
+// heißen trotz Suffix weiter LIBAVUTIL_59 — liegt eine System-avutil im
+// GLOBALEN Bereich (LD_PRELOAD, ein RTLD_GLOBAL-Laden), band libavcodec_hc
+// seine av_*-Aufrufe an DIESE statt an libavutil_hc. DEEPBIND stellt die
+// eigenen Abhängigkeiten vor den globalen Bereich. FFmpeg ist reines C mit
+// eigener Speicherverwaltung (av_malloc/av_free), also kein Allokator-Mix.
+constexpr int kMitFlags = RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND;
 
 template <typename T>
 bool Hole(void* handle, const char* name, T* ziel) {
@@ -61,20 +68,22 @@ void LadenEinmal() {
   // 9.0.2 = avcodec .63) fand der Lader kein .61 — VA-API, NVENC, Dekodieren
   // auf der Grafikkarte und beide Null-Kopie-Wege waren im Archiv AUS. Über
   // den eigenen Pfad statt über Suchpfade: dlopen sieht die RUNPATH der
-  // ausführbaren Datei nicht. Erst avutil, damit avcodec seine Abhängigkeit
-  // schon geladen vorfindet. Fehlt es, wie bisher das System-FFmpeg.
+  // ausführbaren Datei nicht. Erst libavutil_hc, damit libavcodec_hc seine
+  // Abhängigkeit (NEEDED libavutil_hc.so.59) schon geladen vorfindet; eigene
+  // Sonamen + DEEPBIND halten es von einem System-FFmpeg im Prozess getrennt.
+  // Fehlt es, wie bisher das System-FFmpeg (libavcodec.so.61).
   const std::string ordner = EigenerOrdner();
   void* avutil = nullptr;
   void* avcodec = nullptr;
   bool mitgeliefert = false;
   if (!ordner.empty() && ::access((ordner + kAvutilMit).c_str(), F_OK) == 0) {
-    avutil = dlopen((ordner + kAvutilMit).c_str(), RTLD_NOW | RTLD_LOCAL);
+    avutil = dlopen((ordner + kAvutilMit).c_str(), kMitFlags);
     if (!avutil) {
       // Etwa libva fehlt (NVIDIA-Rechner ohne VA-API) — dann laut, nicht still.
       Protokoll("FFmpeg: mitgeliefertes %s nicht zu laden (%s) — System-FFmpeg", kAvutilMit,
                 dlerror());
     } else {
-      avcodec = dlopen((ordner + kAvcodecMit).c_str(), RTLD_NOW | RTLD_LOCAL);
+      avcodec = dlopen((ordner + kAvcodecMit).c_str(), kMitFlags);
       if (avcodec) {
         mitgeliefert = true;
       } else {
