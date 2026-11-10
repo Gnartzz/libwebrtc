@@ -1,6 +1,7 @@
 #include "src/linux/hwenc/ffmpeg/ffmpeg_lader.h"
 
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <mutex>
 
@@ -23,6 +24,11 @@ std::once_flag g_einmal;
 // Schranke aufzuweichen.
 const char* const kAvcodecName = "libavcodec.so." AV_STRINGIFY(LIBAVCODEC_VERSION_MAJOR);
 const char* const kAvutilName = "libavutil.so." AV_STRINGIFY(LIBAVUTIL_VERSION_MAJOR);
+// Das mitgelieferte FFmpeg trägt EIGENE Sonamen (--build-suffix=_hc,
+// infra/ffmpeg-bauen.sh): Lädt GStreamer-libav im selben Prozess ein
+// System-FFmpeg, schöben gleiche Sonamen die Bibliotheken gegenseitig unter.
+const char* const kAvcodecMit = "libavcodec_hc.so." AV_STRINGIFY(LIBAVCODEC_VERSION_MAJOR);
+const char* const kAvutilMit = "libavutil_hc.so." AV_STRINGIFY(LIBAVUTIL_VERSION_MAJOR);
 
 template <typename T>
 bool Hole(void* handle, const char* name, T* ziel) {
@@ -61,18 +67,22 @@ void LadenEinmal() {
   void* avutil = nullptr;
   void* avcodec = nullptr;
   bool mitgeliefert = false;
-  if (!ordner.empty()) {
-    avutil = dlopen((ordner + kAvutilName).c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (avutil) avcodec = dlopen((ordner + kAvcodecName).c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (avutil && avcodec) {
-      mitgeliefert = true;
+  if (!ordner.empty() && ::access((ordner + kAvutilMit).c_str(), F_OK) == 0) {
+    avutil = dlopen((ordner + kAvutilMit).c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!avutil) {
+      // Etwa libva fehlt (NVIDIA-Rechner ohne VA-API) — dann laut, nicht still.
+      Protokoll("FFmpeg: mitgeliefertes %s nicht zu laden (%s) — System-FFmpeg", kAvutilMit,
+                dlerror());
     } else {
-      if (avutil) {
-        Protokoll("FFmpeg: mitgeliefertes %s nicht zu laden (%s) — System-FFmpeg", kAvcodecName,
+      avcodec = dlopen((ordner + kAvcodecMit).c_str(), RTLD_NOW | RTLD_LOCAL);
+      if (avcodec) {
+        mitgeliefert = true;
+      } else {
+        Protokoll("FFmpeg: mitgeliefertes %s nicht zu laden (%s) — System-FFmpeg", kAvcodecMit,
                   dlerror());
         dlclose(avutil);
+        avutil = nullptr;
       }
-      avutil = nullptr;
     }
   }
   if (!mitgeliefert) {
@@ -165,10 +175,10 @@ void LadenEinmal() {
                            "Hardware-Dekodierung aus, Encoder unberührt";
   }
 
-  g_name = kAvcodecName;
+  g_name = mitgeliefert ? kAvcodecMit : kAvcodecName;
   g_geladen = true;
   RTC_LOG(LS_INFO) << "[hwenc] " << g_name << " geladen";
-  Protokoll("FFmpeg: %s %u.%u.%u (%s)", kAvcodecName, g_api.avcodec_version() >> 16,
+  Protokoll("FFmpeg: %s %u.%u.%u (%s)", mitgeliefert ? kAvcodecMit : kAvcodecName, g_api.avcodec_version() >> 16,
             (g_api.avcodec_version() >> 8) & 0xff, g_api.avcodec_version() & 0xff,
             mitgeliefert ? "mitgeliefert" : "System");
   // Die Handles bleiben absichtlich offen: Die Bibliothek lebt, solange der
