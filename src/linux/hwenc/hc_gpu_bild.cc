@@ -23,9 +23,12 @@ __attribute__((visibility("default"))) int honeycord_gpu_bild(
   return libwebrtc::nullkopie::Exportieren(*puffer, aus) ? 1 : 0;
 }
 
-// Die Anzeige kann GPU-Bilder übernehmen (1) oder nicht (0).
+// Die Anzeige kann GPU-Bilder übernehmen (1) oder nicht (0); -1 = sie ist
+// am GPU-Weg gescheitert — dann bleibt er für den Prozess aus, auch wenn
+// eine andere Engine später 1 meldet.
 __attribute__((visibility("default"))) void honeycord_empfang_gpu_bereit(int an) {
-  libwebrtc::nullkopie::EmpfangMelden(an != 0);
+  if (an < 0) libwebrtc::nullkopie::EmpfangSperren("Anzeige meldet Fehlschlag");
+  else libwebrtc::nullkopie::EmpfangMelden(an != 0);
 }
 
 }  // extern "C"

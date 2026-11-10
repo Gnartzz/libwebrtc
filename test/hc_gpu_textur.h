@@ -18,6 +18,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -92,10 +93,10 @@ class Zeichner {
     HC_LADE(glShaderSource) HC_LADE(glCompileShader) HC_LADE(glGetShaderiv)
     HC_LADE(glGetShaderInfoLog) HC_LADE(glCreateProgram) HC_LADE(glAttachShader)
     HC_LADE(glBindAttribLocation) HC_LADE(glLinkProgram) HC_LADE(glGetProgramiv)
-    HC_LADE(glUseProgram) HC_LADE(glGetUniformLocation) HC_LADE(glUniform1i)
+    HC_LADE(glUseProgram) HC_LADE(glGetUniformLocation) HC_LADE(glUniform1i) HC_LADE(glUniform2f)
     HC_LADE(glGenBuffers) HC_LADE(glBindBuffer) HC_LADE(glBufferData)
     HC_LADE(glEnableVertexAttribArray) HC_LADE(glVertexAttribPointer) HC_LADE(glDrawArrays)
-    HC_LADE(glFlush) HC_LADE(glPixelStorei) HC_LADE(glGetIntegerv)
+    HC_LADE(glPixelStorei) HC_LADE(glGetIntegerv)
     HC_LADE(glEGLImageTargetTexture2DOES)
     HC_LADE(eglCreateImageKHR) HC_LADE(eglDestroyImageKHR)
     if (d == Dialekt::kCore) {
@@ -125,9 +126,10 @@ class Zeichner {
 
   bool bereit() const { return bereit_; }
 
-  // Zeichnet [b] in [ziel] (wird bei Bedarf angelegt oder vergrößert).
-  // Schließt die Deskriptoren in jedem Fall.
-  bool Zeichnen(Bild& b, GLuint* ziel, int* zb, int* zh) {
+  // Zeichnet [b] in [ziel] (wird bei Bedarf angelegt oder neu bemessen) —
+  // verkleinert auf höchstens [max_b]×[max_h] (Seitenverhältnis bleibt, nie
+  // vergrößert; 0 = Originalgröße). Schließt die Deskriptoren in jedem Fall.
+  bool Zeichnen(Bild& b, GLuint* ziel, int* zb, int* zh, int max_b = 0, int max_h = 0) {
     if (!bereit_ || b.breite < 2 || b.hoehe < 2) {
       FdsSchliessen(b);
       return false;
@@ -155,21 +157,36 @@ class Zeichner {
     }
     // Die EGLImages halten den Puffer selbst — die Deskriptoren nicht mehr.
     FdsSchliessen(b);
+    if (!ok) letzter_fehler_ = "EGLImage";
+    // Zielgröße: so groß wie die Kachel, nie größer als das Bild.
+    int w = b.breite, h = b.hoehe;
+    if (max_b > 0 && max_h > 0 && (w > max_b || h > max_h)) {
+      const double f = std::min(static_cast<double>(max_b) / w, static_cast<double>(max_h) / h);
+      w = std::max(2, static_cast<int>(w * f + 0.5));
+      h = std::max(2, static_cast<int>(h * f + 0.5));
+    }
     if (ok) {
       for (int i = 0; i < 2; ++i) {
         glBindTexture(kTexture2D, ebenen_tex_[i]);
         glEGLImageTargetTexture2DOES(kTexture2D, bilder[i]);
       }
-      ok = ZielBereit(ziel, zb, zh, b.breite, b.hoehe);
+      ok = ZielBereit(ziel, zb, zh, w, h);
+      if (!ok) letzter_fehler_ = "Zieltextur";
     }
     if (ok) {
       glBindFramebuffer(kFramebuffer, fbo_);
       glFramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, *ziel, 0);
       ok = glCheckFramebufferStatus(kFramebuffer) == kFramebufferComplete;
+      if (!ok) letzter_fehler_ = "Framebuffer";
     }
     if (ok) {
-      glViewport(0, 0, b.breite, b.hoehe);
+      glViewport(0, 0, w, h);
       glUseProgram(programm_);
+      // Beim Verkleinern vier Abtastungen je Zielpixel (je ein Viertel
+      // Zielpixel versetzt) — sonst flimmert Schrift wie beim Ausdünnen.
+      // Ab Faktor 1,5; darunter eine Abtastung, sonst würde es weich.
+      const bool klein = b.breite >= w * 3 / 2 || b.hoehe >= h * 3 / 2;
+      glUniform2f(versatz_ort_, klein ? 0.25f / w : 0.f, klein ? 0.25f / h : 0.f);
       if (dialekt_ == Dialekt::kCore) glBindVertexArray(vao_);
       glBindBuffer(kArrayBuffer, vbo_);
       glEnableVertexAttribArray(0);
@@ -181,7 +198,7 @@ class Zeichner {
       glDrawArrays(kTriangleStrip, 0, 4);
       glActiveTexture(kTexture0);
       glBindFramebuffer(kFramebuffer, 0);
-      glFlush();
+      // Kein glFlush: der Kontextwechsel danach spült ohnehin.
     }
     for (void* bi : bilder) {
       if (bi) eglDestroyImageKHR(anzeige_, bi);
@@ -202,9 +219,11 @@ class Zeichner {
     glTexImage2D(kTexture2D, 0, kRGBA, w, h, 0, kRGBA, kUByte, rgba);
     *zb = w;
     *zh = h;
-    glFlush();
     return true;
   }
+
+  // Woran das letzte Zeichnen scheiterte (für eine einzige Protokollzeile).
+  const char* letzter_fehler() const { return letzter_fehler_; }
 
   void TexturWeg(GLuint* t) {
     if (bereit_ && t && *t) glDeleteTextures(1, t);
@@ -254,12 +273,17 @@ class Zeichner {
     // Je Dialekt dieselbe Rechnung. t läuft von unten nach oben wie die
     // Zeilen der Zieltextur — Zeile 0 der Quelle landet in Zeile 0 des Ziels,
     // genau wie beim Hochladen mit glTexImage2D.
+    // Vier Abtastungen (bei versatz 0 alle am selben Ort = eine).
     static const char* kRechnung =
-        "  float Y = 1.164383 * (HC_TEX(yt, t).r - 0.0627451);\n"
-        "  vec2 c = HC_TEX(uvt, t).rg - vec2(0.5);\n"
+        "  vec2 a = vec2(versatz.x, versatz.y), b = vec2(versatz.x, -versatz.y);\n"
+        "  float y = 0.25 * (HC_TEX(yt, t + a).r + HC_TEX(yt, t - a).r +\n"
+        "                    HC_TEX(yt, t + b).r + HC_TEX(yt, t - b).r);\n"
+        "  vec2 c = 0.25 * (HC_TEX(uvt, t + a).rg + HC_TEX(uvt, t - a).rg +\n"
+        "                   HC_TEX(uvt, t + b).rg + HC_TEX(uvt, t - b).rg) - vec2(0.5);\n"
+        "  float Y = 1.164383 * (y - 0.0627451);\n"
         "  HC_AUS = vec4(Y + 1.596027 * c.y, Y - 0.391762 * c.x - 0.812968 * c.y,\n"
         "                Y + 2.017232 * c.x, 1.0);\n";
-    char vs[512], fs[1024];
+    char vs[512], fs[2048];
     if (dialekt_ == Dialekt::kCore) {
       std::snprintf(vs, sizeof vs,
                     "#version 150\nin vec2 p;\nout vec2 t;\n"
@@ -267,10 +291,15 @@ class Zeichner {
       std::snprintf(fs, sizeof fs,
                     "#version 150\n#define HC_TEX texture\n#define HC_AUS farbe\n"
                     "in vec2 t;\nout vec4 farbe;\nuniform sampler2D yt;\nuniform sampler2D uvt;\n"
+                    "uniform vec2 versatz;\n"
                     "void main() {\n%s}\n", kRechnung);
     } else {
-      const char* kopf = dialekt_ == Dialekt::kES ? "#version 100\nprecision mediump float;\n"
-                                                  : "#version 120\n";
+      // highp, wo es geht: mediump (16 Bit) trifft bei 1920 Pixeln Breite
+      // die Texel nicht mehr genau.
+      const char* kopf = dialekt_ == Dialekt::kES
+                             ? "#version 100\n#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n"
+                               "#else\nprecision mediump float;\n#endif\n"
+                             : "#version 120\n";
       std::snprintf(vs, sizeof vs,
                     "%sattribute vec2 p;\nvarying vec2 t;\n"
                     "void main() { t = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }\n",
@@ -278,6 +307,7 @@ class Zeichner {
       std::snprintf(fs, sizeof fs,
                     "%s#define HC_TEX texture2D\n#define HC_AUS gl_FragColor\n"
                     "varying vec2 t;\nuniform sampler2D yt;\nuniform sampler2D uvt;\n"
+                    "uniform vec2 versatz;\n"
                     "void main() {\n%s}\n", kopf, kRechnung);
     }
     GLuint v = Shader(kVertexShader, vs), f = Shader(kFragmentShader, fs);
@@ -293,7 +323,8 @@ class Zeichner {
     glUseProgram(programm_);
     glUniform1i(glGetUniformLocation(programm_, "yt"), 0);
     glUniform1i(glGetUniformLocation(programm_, "uvt"), 1);
-    return true;
+    versatz_ort_ = glGetUniformLocation(programm_, "versatz");
+    return versatz_ort_ >= 0;
   }
 
   void* anzeige_ = nullptr;
@@ -301,6 +332,8 @@ class Zeichner {
   bool bereit_ = false;
   GLuint programm_ = 0, vbo_ = 0, vao_ = 0, fbo_ = 0;
   GLuint ebenen_tex_[2] = {0, 0};
+  GLint versatz_ort_ = -1;
+  const char* letzter_fehler_ = "";
 
   void (*glGenTextures)(GLsizei, GLuint*) = nullptr;
   void (*glBindTexture)(GLenum, GLuint) = nullptr;
@@ -324,13 +357,13 @@ class Zeichner {
   void (*glUseProgram)(GLuint) = nullptr;
   GLint (*glGetUniformLocation)(GLuint, const GLchar*) = nullptr;
   void (*glUniform1i)(GLint, GLint) = nullptr;
+  void (*glUniform2f)(GLint, GLfloat, GLfloat) = nullptr;
   void (*glGenBuffers)(GLsizei, GLuint*) = nullptr;
   void (*glBindBuffer)(GLenum, GLuint) = nullptr;
   void (*glBufferData)(GLenum, GLsizeiptr, const void*, GLenum) = nullptr;
   void (*glEnableVertexAttribArray)(GLuint) = nullptr;
   void (*glVertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*) = nullptr;
   void (*glDrawArrays)(GLenum, GLint, GLsizei) = nullptr;
-  void (*glFlush)() = nullptr;
   void (*glPixelStorei)(GLenum, GLint) = nullptr;
   void (*glGetIntegerv)(GLenum, GLint*) = nullptr;
   void (*glEGLImageTargetTexture2DOES)(GLenum, void*) = nullptr;

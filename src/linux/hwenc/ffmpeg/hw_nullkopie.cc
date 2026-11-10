@@ -9,6 +9,7 @@
 #include <va/va_vpp.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -105,6 +106,8 @@ std::atomic<int> g_aufnahmen{0};
 // Zahlen für die 30-s-Zeile in hwenc.log.
 std::atomic<uint64_t> z_bilder{0}, z_fehl{0}, z_skal{0}, z_i420{0}, z_direkt{0};
 std::atomic<uint64_t> z_wandel_us{0}, z_i420_us{0};
+// Empfang: GPU-Bilder, die doch zurückgelesen werden mussten (sollte 0 sein).
+std::atomic<uint64_t> z_empfang_gelesen{0};
 // Für die Aussetz-Regel (Prüfbefund M3): erzeugte und zurückgelesene Pixel.
 std::atomic<uint64_t> p_erzeugt{0}, p_gelesen{0};
 
@@ -188,7 +191,9 @@ class Va {
 
   // Je Ausgabegröße ein VPP-Kontext und ein Vorrat (dynamisch: initial 0 —
   // die Bilder werden gehalten von Warteschlange, Encoder, Vorschau und
-  // WebRTCs Taktgeber, ein fester Vorrat liefe leer). Höchstens 6 Größen.
+  // WebRTCs Taktgeber, ein fester Vorrat liefe leer). Höchstens 12 Größen —
+  // seit dem Empfang ohne Umweg teilen sich Aufnahme, Skalierung UND die
+  // Decoder aller Teilnehmer (Simulcast-Stufen) diese Grenze.
   Ziel* ZielFuer(int zb, int zh) {
     const auto& api = ffmpeg::Zugriff();
     auto it = ziele_.find({zb, zh});
@@ -196,7 +201,7 @@ class Va {
       it->second.benutzt = ++uhr_;
       return &it->second;
     }
-    if (ziele_.size() >= 6) {
+    if (ziele_.size() >= 12) {
       auto alt = ziele_.begin();
       for (auto i = ziele_.begin(); i != ziele_.end(); ++i)
         if (i->second.benutzt < alt->second.benutzt) alt = i;
@@ -273,9 +278,15 @@ class HcVaBild : public webrtc::VideoFrameBuffer {
                        hoehe_);
     api.av_frame_free(&sw);
     i420_ = puffer;
-    z_i420++;
-    if (aus_aufnahme_) p_gelesen += static_cast<uint64_t>(breite_) * hoehe_;
-    z_i420_us += static_cast<uint64_t>((CpuMs() - c0) * 1000);
+    if (aus_aufnahme_) {
+      z_i420++;
+      p_gelesen += static_cast<uint64_t>(breite_) * hoehe_;
+      z_i420_us += static_cast<uint64_t>((CpuMs() - c0) * 1000);
+    } else if (z_empfang_gelesen.fetch_add(1) < 3) {
+      // Ein Empfangsbild, das die Anzeige nicht als GPU-Bild nahm.
+      Protokoll("Null-Kopie Empfang: GPU-Bild zurückgelesen (%dx%d, %.2f ms)", breite_, hoehe_,
+                CpuMs() - c0);
+    }
     return i420_;
   }
 
@@ -643,11 +654,23 @@ void EncoderDirektGezaehlt() { z_direkt++; }
 
 namespace {
 std::atomic<bool> g_empfang_gemeldet{false};
+std::atomic<bool> g_empfang_gesperrt{false};
+std::atomic<int> g_export_fehler_in_folge{0};
+// So oft hintereinander darf der Export scheitern (sonst je Bild GPU-Kopie,
+// Fehlschlag UND Zurücklesen — teurer als der alte Weg).
+constexpr int kExportBremse = 30;
 }
 
 void EmpfangMelden(bool an) {
+  if (an && g_empfang_gesperrt.load()) return;
   const bool vorher = g_empfang_gemeldet.exchange(an);
   if (vorher != an) Protokoll("Null-Kopie Empfang: Anzeige %s", an ? "übernimmt GPU-Bilder" : "ohne GPU-Weg");
+}
+
+void EmpfangSperren(const char* grund) {
+  if (g_empfang_gesperrt.exchange(true)) return;
+  g_empfang_gemeldet = false;
+  Protokoll("Null-Kopie Empfang: aus für diesen Prozess — %s", grund);
 }
 
 bool EmpfangErlaubt() {
@@ -697,11 +720,26 @@ bool Exportieren(const webrtc::VideoFrameBuffer& puffer, HcGpuBild* aus) {
       VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &d);
   if (st != VA_STATUS_SUCCESS) {
     g_va->FehlerEinmal("Export", st);
+    if (g_export_fehler_in_folge.fetch_add(1) + 1 >= kExportBremse)
+      EmpfangSperren("Export scheitert wiederholt");
     return false;
   }
   bool ok = d.num_layers == 2;
   for (uint32_t i = 0; ok && i < 2; ++i) ok = d.layers[i].num_planes == 1;
+  if (!ok) {
+    // ★ Ein Aufbau, den die Anzeige nicht kennt — etwa Intel ab Gen12 mit
+    // Medienkompression (je Schicht Haupt- UND Hilfsebene). Er ändert sich
+    // nicht von Bild zu Bild: einmal genau protokollieren, Weg sperren.
+    // UNGEMESSEN auf Gen12 (Messstand ist Gen9) — diese Zeile ist die Messung.
+    char was[160];
+    std::snprintf(was, sizeof was, "unbekannter Aufbau: %u Schichten, Ebenen %u/%u, Modifier 0x%llx",
+                  d.num_layers, d.num_layers > 0 ? d.layers[0].num_planes : 0,
+                  d.num_layers > 1 ? d.layers[1].num_planes : 0,
+                  d.num_objects > 0 ? static_cast<unsigned long long>(d.objects[0].drm_format_modifier) : 0ULL);
+    EmpfangSperren(was);
+  }
   if (ok) {
+    g_export_fehler_in_folge = 0;
     aus->breite = bild->width();
     aus->hoehe = bild->height();
     for (int i = 0; i < 2; ++i) {
@@ -714,7 +752,10 @@ bool Exportieren(const webrtc::VideoFrameBuffer& puffer, HcGpuBild* aus) {
       if (aus->ebene[i].fd < 0) ok = false;
     }
     if (!ok) {
-      for (int i = 0; i < 2; ++i) if (aus->ebene[i].fd >= 0) ::close(aus->ebene[i].fd);
+      for (int i = 0; i < 2; ++i) {
+        if (aus->ebene[i].fd >= 0) ::close(aus->ebene[i].fd);
+        aus->ebene[i].fd = -1;
+      }
     }
   }
   for (uint32_t k = 0; k < d.num_objects; ++k) ::close(d.objects[k].fd);

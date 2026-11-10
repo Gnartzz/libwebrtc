@@ -24,6 +24,7 @@
 #include "api/video/video_frame.h"
 #include "api/video_codecs/video_decoder.h"
 #include "libyuv/convert_argb.h"
+#include "libyuv/scale.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "src/rtc_video_frame_impl.h"
 #include "src/linux/hwenc/ffmpeg/hw_h264_decoder.h"
@@ -98,9 +99,10 @@ struct Sammler : webrtc::DecodedImageCallback {
   Gl* gl = nullptr;
   bool gpu_erwartet = false;
   int bilder = 0, gpu_bilder = 0, fehler = 0, vergleiche = 0;
-  double cpu_anzeige = 0, abw[3] = {0, 0, 0};
-  hcgpu::GLuint tex = 0;
-  int tb = 0, th = 0;
+  double cpu_anzeige = 0, abw[3] = {0, 0, 0}, abw_klein[3] = {0, 0, 0}, abw_massstab[3] = {0, 0, 0};
+  int vergleiche_klein = 0;
+  hcgpu::GLuint tex = 0, tex_klein = 0;
+  int tb = 0, th = 0, kb = 0, kh = 0;
   std::vector<uint8_t> rgba, gelesen;
 
   int32_t Decoded(webrtc::VideoFrame& f) override {
@@ -148,6 +150,42 @@ struct Sammler : webrtc::DecodedImageCallback {
                              int(rgba[(static_cast<size_t>(y) * i4->width() + x) * 4 + c]));
       for (int c = 0; c < 3; ++c) abw[c] += s[c] / (static_cast<double>(w) * h);
       ++vergleiche;
+      // Verkleinert (Kachel 640x360, wie im Gespräch) gegen libyuv-Box-Filter.
+      libwebrtc::nullkopie::HcGpuBild g2{};
+      g2.version = 1;
+      if (honeycord_gpu_bild(static_cast<libwebrtc::RTCVideoFrame*>(rahmen.get()), &g2)) {
+        hcgpu::Bild b2;
+        std::memcpy(&b2, &g2, sizeof b2);
+        if (z->Zeichnen(b2, &tex_klein, &kb, &kh, 640, 360)) {
+          auto klein = webrtc::I420Buffer::Create(kb, kh);
+          klein->ScaleFrom(*i4);
+          std::vector<uint8_t> ref(static_cast<size_t>(kb) * kh * 4), gpu(static_cast<size_t>(kb) * kh * 4);
+          libyuv::I420ToABGR(klein->DataY(), klein->StrideY(), klein->DataU(), klein->StrideU(),
+                             klein->DataV(), klein->StrideV(), ref.data(), kb * 4, kb, kh);
+          z->glBindFramebuffer(hcgpu::kFramebuffer, z->fbo());
+          z->glFramebufferTexture2D(hcgpu::kFramebuffer, hcgpu::kColorAttachment0, hcgpu::kTexture2D, tex_klein, 0);
+          gl->glReadPixels(0, 0, kb, kh, hcgpu::kRGBA, hcgpu::kUByte, gpu.data());
+          z->glBindFramebuffer(hcgpu::kFramebuffer, 0);
+          double s2[3] = {0, 0, 0};
+          for (size_t k = 0; k < static_cast<size_t>(kb) * kh; ++k)
+            for (int c = 0; c < 3; ++c) s2[c] += std::abs(int(gpu[k * 4 + c]) - int(ref[k * 4 + c]));
+          for (int c = 0; c < 3; ++c) abw_klein[c] += s2[c] / (static_cast<double>(kb) * kh);
+          ++vergleiche_klein;
+          // Maßstab: wie weit liegen zwei libyuv-Filter (Box gegen Bilinear) auseinander?
+          auto bil = webrtc::I420Buffer::Create(kb, kh);
+          libyuv::I420Scale(i4->DataY(), i4->StrideY(), i4->DataU(), i4->StrideU(), i4->DataV(),
+                            i4->StrideV(), i4->width(), i4->height(), bil->MutableDataY(), bil->StrideY(),
+                            bil->MutableDataU(), bil->StrideU(), bil->MutableDataV(), bil->StrideV(), kb, kh,
+                            libyuv::kFilterBilinear);
+          std::vector<uint8_t> ref2(static_cast<size_t>(kb) * kh * 4);
+          libyuv::I420ToABGR(bil->DataY(), bil->StrideY(), bil->DataU(), bil->StrideU(), bil->DataV(),
+                             bil->StrideV(), ref2.data(), kb * 4, kb, kh);
+          double s3[3] = {0, 0, 0};
+          for (size_t k = 0; k < static_cast<size_t>(kb) * kh; ++k)
+            for (int c = 0; c < 3; ++c) s3[c] += std::abs(int(ref2[k * 4 + c]) - int(ref[k * 4 + c]));
+          for (int c = 0; c < 3; ++c) abw_massstab[c] += s3[c] / (static_cast<double>(kb) * kh);
+        }
+      }
     }
     return 0;
   }
@@ -206,6 +244,7 @@ int main(int argc, char** argv) {
     bilder[weg] = s.bilder;
     hw.Release();
     z.TexturWeg(&s.tex);
+    z.TexturWeg(&s.tex_klein);
   }
   const Sammler& g = ergebnis[1];
   std::printf("Alter Weg: %d Bilder, CPU %.2f ms/Bild gesamt (davon Anzeige %.2f)\n", bilder[0],
@@ -215,7 +254,24 @@ int main(int argc, char** argv) {
   const double ar = g.vergleiche ? g.abw[0] / g.vergleiche : 99, ag = g.vergleiche ? g.abw[1] / g.vergleiche : 99,
                ab = g.vergleiche ? g.abw[2] / g.vergleiche : 99;
   std::printf("Farbvergleich (%d Bilder): R %.2f · G %.2f · B %.2f (mittlere Abweichung)\n", g.vergleiche, ar, ag, ab);
-  const bool gut = g.gpu_bilder == bilder[1] && bilder[1] > 0 && g.fehler == 0 && ar <= 2 && ag <= 2 && ab <= 2 &&
+  const double kr = g.vergleiche_klein ? g.abw_klein[0] / g.vergleiche_klein : 99,
+               kg = g.vergleiche_klein ? g.abw_klein[1] / g.vergleiche_klein : 99,
+               kbl = g.vergleiche_klein ? g.abw_klein[2] / g.vergleiche_klein : 99;
+  std::printf("Verkleinert auf %dx%d (%d Bilder): R %.2f · G %.2f · B %.2f (gegen libyuv-Box)\n", g.kb, g.kh,
+              g.vergleiche_klein, kr, kg, kbl);
+  if (g.vergleiche_klein)
+    std::printf("Maßstab libyuv Bilinear gegen Box:    R %.2f · G %.2f · B %.2f\n",
+                g.abw_massstab[0] / g.vergleiche_klein, g.abw_massstab[1] / g.vergleiche_klein,
+                g.abw_massstab[2] / g.vergleiche_klein);
+  // Verkleinert: höchstens so weit von libyuv-Box entfernt wie libyuv-Bilinear
+  // (+1 Spielraum) — gemessen 10.11.: GPU R 4,68 gegen Bilinear 4,10.
+  const double n_k = std::max(1, g.vergleiche_klein);
+  // Bei genau Faktor 2 rechnen Box und Bilinear gleich (Maßstab 0) — dort
+  // zählt die Untergrenze 2,5: die Referenz halbiert die Farbauflösung beim
+  // Verkleinern ein zweites Mal, der Shader nicht (gemessen 720p: R 2,81).
+  auto grenze = [&](int c) { return std::max(2.5, g.abw_massstab[c] / n_k) + 1; };
+  const bool klein_gut = g.vergleiche_klein > 0 && kr <= grenze(0) && kg <= grenze(1) && kbl <= grenze(2);
+  const bool gut = klein_gut && g.gpu_bilder == bilder[1] && bilder[1] > 0 && g.fehler == 0 && ar <= 2 && ag <= 2 && ab <= 2 &&
                    cpu[1] < cpu[0];
   std::printf("%s\n", gut ? "BESTANDEN" : "FEHL");
   return gut ? 0 : 1;

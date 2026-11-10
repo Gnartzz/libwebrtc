@@ -397,7 +397,10 @@ int32_t HwH264Decoder::BildAusliefern(const webrtc::EncodedImage& input_image,
   // übernehmen, bleibt das Bild auf der Grafikkarte (eine GPU-Kopie in einen
   // eigenen Vorrat, ~0,1 ms CPU) — statt 2,3 ms Zurückkopieren plus Umrechnen.
   // Scheitert es, für dieses Bild der heutige Weg.
-  if (nullkopie::EmpfangAktiv() && nullkopie::GeraetIstGemeinsam(hw_device_)) {
+  // Gedrehte Bilder (Telefone mit Ausrichtungs-Kopfzeile) nimmt die Anzeige
+  // nicht als GPU-Bild — sie gingen sonst über das teure Zurücklesen.
+  if (nullkopie::EmpfangAktiv() && nullkopie::GeraetIstGemeinsam(hw_device_) &&
+      input_image.rotation_ == webrtc::kVideoRotation_0) {
     const int64_t g0 = webrtc::TimeMicros();
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> gpu = nullkopie::AusDecoder(hw_frame_, w, h);
     if (gpu) {

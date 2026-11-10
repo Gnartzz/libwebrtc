@@ -67,6 +67,8 @@ struct HcGpuBild {
 
 // Das Plugin meldet, ob seine Anzeige GPU-Bilder übernehmen kann.
 void EmpfangMelden(bool an);
+// Den GPU-Weg beim Empfang für den Prozess beenden (Fehlschläge).
+void EmpfangSperren(const char* grund);
 // Sollen Decoder GPU-Bilder ausgeben? (gemeldet + Null-Kopie aktiv +
 // HONEYCORD_EMPFANG_GPU != 0)
 bool EmpfangAktiv();
