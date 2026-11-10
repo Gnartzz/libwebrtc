@@ -5,6 +5,7 @@
 #include <mutex>
 
 #include "rtc_base/logging.h"
+#include "src/linux/hwenc/hw_gemeinsam.h"
 
 namespace libwebrtc {
 namespace ffmpeg {
@@ -34,22 +35,63 @@ bool Hole(void* handle, const char* name, T* ziel) {
   return true;
 }
 
+// Ordner, in dem diese libwebrtc.so liegt (mit Schrägstrich am Ende).
+std::string EigenerOrdner() {
+  Dl_info info{};
+  if (!dladdr(reinterpret_cast<void*>(&EigenerOrdner), &info) || !info.dli_fname) return "";
+  std::string pfad(info.dli_fname);
+  const size_t s = pfad.rfind('/');
+  return s == std::string::npos ? "" : pfad.substr(0, s + 1);
+}
+
 void LadenEinmal() {
   // RTLD_LOCAL: Die Symbole sollen NICHT in den globalen Namensraum — sonst
   // könnte eine zweite FFmpeg-Fassung, die irgendein Plugin lädt, unsere
   // Aufrufe umbiegen.
-  void* avcodec = dlopen(kAvcodecName, RTLD_NOW | RTLD_LOCAL);
-  if (!avcodec) {
-    RTC_LOG(LS_INFO) << "[hwenc] " << kAvcodecName
-                     << " nicht gefunden — Software-Encoder";
-    return;
+  //
+  // ★ 10.11.2026: ZUERST das mitgelieferte FFmpeg neben dieser Bibliothek
+  // (tar.gz und Flatpak legen ein schlankes 7.1 in denselben lib/-Ordner,
+  // infra/ffmpeg-bauen.sh). GEMESSEN: Auf dem UM890-Wirt (CachyOS, FFmpeg
+  // 9.0.2 = avcodec .63) fand der Lader kein .61 — VA-API, NVENC, Dekodieren
+  // auf der Grafikkarte und beide Null-Kopie-Wege waren im Archiv AUS. Über
+  // den eigenen Pfad statt über Suchpfade: dlopen sieht die RUNPATH der
+  // ausführbaren Datei nicht. Erst avutil, damit avcodec seine Abhängigkeit
+  // schon geladen vorfindet. Fehlt es, wie bisher das System-FFmpeg.
+  const std::string ordner = EigenerOrdner();
+  void* avutil = nullptr;
+  void* avcodec = nullptr;
+  bool mitgeliefert = false;
+  if (!ordner.empty()) {
+    avutil = dlopen((ordner + kAvutilName).c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (avutil) avcodec = dlopen((ordner + kAvcodecName).c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (avutil && avcodec) {
+      mitgeliefert = true;
+    } else {
+      if (avutil) {
+        Protokoll("FFmpeg: mitgeliefertes %s nicht zu laden (%s) — System-FFmpeg", kAvcodecName,
+                  dlerror());
+        dlclose(avutil);
+      }
+      avutil = nullptr;
+    }
   }
-  void* avutil = dlopen(kAvutilName, RTLD_NOW | RTLD_LOCAL);
-  if (!avutil) {
-    RTC_LOG(LS_INFO) << "[hwenc] " << kAvutilName
-                     << " nicht gefunden — Software-Encoder";
-    dlclose(avcodec);
-    return;
+  if (!mitgeliefert) {
+    avcodec = dlopen(kAvcodecName, RTLD_NOW | RTLD_LOCAL);
+    if (!avcodec) {
+      RTC_LOG(LS_INFO) << "[hwenc] " << kAvcodecName
+                       << " nicht gefunden — Software-Encoder";
+      Protokoll("FFmpeg: weder mitgeliefert noch im System ein %s — Software-Encoder, "
+                "kein Dekodieren auf der Grafikkarte", kAvcodecName);
+      return;
+    }
+    avutil = dlopen(kAvutilName, RTLD_NOW | RTLD_LOCAL);
+    if (!avutil) {
+      RTC_LOG(LS_INFO) << "[hwenc] " << kAvutilName
+                       << " nicht gefunden — Software-Encoder";
+      Protokoll("FFmpeg: %s ohne %s — Software-Encoder", kAvcodecName, kAvutilName);
+      dlclose(avcodec);
+      return;
+    }
   }
 
   bool ok = true;
@@ -84,6 +126,8 @@ void LadenEinmal() {
 
   if (!ok) {
     RTC_LOG(LS_WARNING) << "[hwenc] FFmpeg gefunden, aber unvollständig — Software-Encoder";
+    Protokoll("FFmpeg: %s unvollständig (%s) — Software-Encoder", kAvcodecName,
+              mitgeliefert ? "mitgeliefert" : "System");
     g_api = Api();
     return;
   }
@@ -100,6 +144,8 @@ void LadenEinmal() {
                         << "/avutil " << util_haupt << ", gebaut gegen "
                         << LIBAVCODEC_VERSION_MAJOR << "/"
                         << LIBAVUTIL_VERSION_MAJOR << " — Software-Encoder";
+    Protokoll("FFmpeg: meldet avcodec %u/avutil %u statt %d/%d — Software-Encoder", codec_haupt,
+              util_haupt, LIBAVCODEC_VERSION_MAJOR, LIBAVUTIL_VERSION_MAJOR);
     g_api = Api();
     return;
   }
@@ -122,6 +168,9 @@ void LadenEinmal() {
   g_name = kAvcodecName;
   g_geladen = true;
   RTC_LOG(LS_INFO) << "[hwenc] " << g_name << " geladen";
+  Protokoll("FFmpeg: %s %u.%u.%u (%s)", kAvcodecName, g_api.avcodec_version() >> 16,
+            (g_api.avcodec_version() >> 8) & 0xff, g_api.avcodec_version() & 0xff,
+            mitgeliefert ? "mitgeliefert" : "System");
   // Die Handles bleiben absichtlich offen: Die Bibliothek lebt, solange der
   // Prozess lebt. Ein dlclose zur Laufzeit schüfe nur Fehlerquellen.
 }
