@@ -16,6 +16,7 @@
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/time_utils.h"
+#include "src/linux/hwenc/ffmpeg/hw_nullkopie.h"
 #include "src/linux/hwenc/hw_gemeinsam.h"
 
 namespace libwebrtc {
@@ -173,8 +174,13 @@ bool HwH264Decoder::Configure(const Settings& settings) {
   ctx_ = api.avcodec_alloc_context3(codec);
   if (!ctx_) return false;
 
-  int r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI,
-                                     nullptr, nullptr, 0);
+  // ★ Empfang ohne Umweg (10.11.2026): dasselbe VA-Gerät wie Wandler und
+  // Encoder — nur dann kann die Grafikkarte das Bild für die Anzeige
+  // weiterreichen, ohne dass es den Speicher verlässt.
+  int r = 0;
+  if (nullkopie::EmpfangErlaubt()) hw_device_ = nullkopie::GeraetRef();
+  if (!hw_device_)
+    r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0);
   if (r < 0 || !hw_device_) {
     Protokoll("Decoder #%d: VA-API-Gerät: %s — Rückfall auf Software", nummer_,
               ffmpeg::FehlerText(r).c_str());
@@ -387,6 +393,50 @@ int32_t HwH264Decoder::BildAusliefern(const webrtc::EncodedImage& input_image,
   const int h = hw_frame_->height;
   if (w <= 0 || h <= 0) return Abgeben("Bild ohne Maße", 0);
 
+  // ★ Empfang ohne Umweg (10.11.2026): Kann die Anzeige GPU-Bilder
+  // übernehmen, bleibt das Bild auf der Grafikkarte (eine GPU-Kopie in einen
+  // eigenen Vorrat, ~0,1 ms CPU) — statt 2,3 ms Zurückkopieren plus Umrechnen.
+  // Scheitert es, für dieses Bild der heutige Weg.
+  if (nullkopie::EmpfangAktiv() && nullkopie::GeraetIstGemeinsam(hw_device_)) {
+    const int64_t g0 = webrtc::TimeMicros();
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> gpu = nullkopie::AusDecoder(hw_frame_, w, h);
+    if (gpu) {
+      webrtc::ColorSpace fr;
+      if (input_image.ColorSpace()) {
+        fr = *input_image.ColorSpace();
+      } else {
+        fr.set_primaries_from_uint8(static_cast<uint8_t>(hw_frame_->color_primaries));
+        fr.set_transfer_from_uint8(static_cast<uint8_t>(hw_frame_->color_trc));
+        fr.set_matrix_from_uint8(static_cast<uint8_t>(hw_frame_->colorspace));
+        fr.set_range_from_uint8(static_cast<uint8_t>(hw_frame_->color_range));
+      }
+      const uint32_t rtp = hw_frame_->pts != AV_NOPTS_VALUE ? static_cast<uint32_t>(hw_frame_->pts)
+                                                            : input_image.RtpTimestamp();
+      webrtc::VideoFrame bild = webrtc::VideoFrame::Builder()
+                                    .set_video_frame_buffer(gpu)
+                                    .set_rtp_timestamp(rtp)
+                                    .set_color_space(fr)
+                                    .build();
+      callback_->Decoded(bild, std::nullopt, qp);
+      if (!gpu_gemeldet_) {
+        Protokoll("Decoder #%d: Bilder bleiben auf der Grafikkarte (%dx%d)", nummer_, w, h);
+        gpu_gemeldet_ = true;
+      }
+      if (!gemeldet_) {
+        Protokoll("Decoder #%d: VA-API dekodiert (%dx%d, Profil %d)", nummer_, w, h, ctx_->profile);
+        gemeldet_ = true;
+      }
+      fehler_in_folge_ = 0;
+      zeit_holen_us_ += webrtc::TimeMicros() - g0;
+      ++zeit_bilder_;
+      ++gpu_bilder_;
+      breite_ = w;
+      hoehe_ = h;
+      ZeitenMelden(webrtc::TimeMillis());
+      return WEBRTC_VIDEO_CODEC_OK;
+    }
+  }
+
   // ★ Den Zwischenpuffer behalten, solange die Maße gleich bleiben: Mit
   // gefülltem buf[0] lädt FFmpeg direkt hinein, statt je Bild ~3 MB (1080p)
   // neu anzufordern.
@@ -513,15 +563,16 @@ void HwH264Decoder::ZeitenMelden(int64_t jetzt_ms) {
   if (jetzt_ms - zeit_start_ms_ < 30000) return;
   if (zeit_bilder_ > 0 || zeit_fehler_ > 0) {
     const double n = zeit_bilder_ > 0 ? zeit_bilder_ : 1;
-    Protokoll("Decoder #%d %dx%d: %d Bilder/%lld s · dekodieren %.2f ms · "
-              "herunterladen %.2f ms · umformen %.2f ms · Fehler %d",
+    Protokoll("Decoder #%d %dx%d: %d Bilder/%lld s (davon %d auf der Grafikkarte) · "
+              "dekodieren %.2f ms · herunterladen %.2f ms · umformen %.2f ms · Fehler %d",
               nummer_, breite_, hoehe_, zeit_bilder_,
-              static_cast<long long>((jetzt_ms - zeit_start_ms_) / 1000),
+              static_cast<long long>((jetzt_ms - zeit_start_ms_) / 1000), gpu_bilder_,
               zeit_dek_us_ / n / 1000.0, zeit_holen_us_ / n / 1000.0,
               zeit_umformen_us_ / n / 1000.0, zeit_fehler_);
   }
   zeit_dek_us_ = zeit_holen_us_ = zeit_umformen_us_ = 0;
   zeit_bilder_ = zeit_fehler_ = 0;
+  gpu_bilder_ = 0;
   zeit_start_ms_ = jetzt_ms;
 }
 

@@ -105,6 +105,8 @@ class HwH264Decoder : public webrtc::VideoDecoder {
   bool rueckfall_ = false;
   bool vaapi_aktiv_ = false;
   bool gemeldet_ = false;  // „VA-API dekodiert" einmal je Öffnen
+  bool gpu_gemeldet_ = false;  // „Bilder bleiben auf der Grafikkarte" einmal
+  int gpu_bilder_ = 0;         // davon als GPU-Bild ausgegeben (30-s-Zeile)
   std::string rueckfall_grund_;
 
   int fehler_in_folge_ = 0;

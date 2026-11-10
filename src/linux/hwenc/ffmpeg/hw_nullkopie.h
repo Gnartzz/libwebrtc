@@ -23,6 +23,8 @@
 //
 // Abschalten: HONEYCORD_NULLKOPIE=0. Nur VA-API, nie NVIDIA.
 
+#include <cstdint>
+
 extern "C" {
 #include "libavutil/buffer.h"
 #include "libavutil/frame.h"
@@ -48,6 +50,35 @@ AVBufferRef* GeraetRef();
 // dessen Rahmen zurück (geborgt, lebt so lange wie `puffer`), sonst nullptr.
 const AVFrame* AlsVaRahmen(const webrtc::VideoFrameBuffer& puffer,
                            const AVBufferRef* geraet, int breite, int hoehe);
+
+// ── Empfang ohne Umweg (10.11.2026) ──
+// Ein GPU-Bild für die Anzeige, ABI-fest (das Plugin fragt es per dlsym ab,
+// `honeycord_gpu_bild`). NV12 als zwei Ebenen: [0] Y (DRM R8), [1] UV (GR88).
+// Die Deskriptoren gehören danach dem Aufrufer (schließen!).
+struct HcGpuBild {
+  uint32_t version;  // 1
+  int32_t breite, hoehe;
+  struct {
+    int32_t fd;
+    uint32_t drm_format, offset, pitch;
+    uint64_t modifier;
+  } ebene[2];
+};
+
+// Das Plugin meldet, ob seine Anzeige GPU-Bilder übernehmen kann.
+void EmpfangMelden(bool an);
+// Sollen Decoder GPU-Bilder ausgeben? (gemeldet + Null-Kopie aktiv +
+// HONEYCORD_EMPFANG_GPU != 0)
+bool EmpfangAktiv();
+// Darf der Decoder das gemeinsame Gerät nehmen? (Null-Kopie aktiv und
+// HONEYCORD_EMPFANG_GPU != 0 — unabhängig davon, ob die Anzeige schon bereit ist)
+bool EmpfangErlaubt();
+// Benutzt `geraet` das gemeinsame VA-Gerät?
+bool GeraetIstGemeinsam(const AVBufferRef* geraet);
+// Dekodiertes VA-Bild (gemeinsames Gerät) → eigenes GPU-Bild, oder nullptr.
+webrtc::scoped_refptr<webrtc::VideoFrameBuffer> AusDecoder(const AVFrame* hw, int breite, int hoehe);
+// GPU-Bild → DMA-BUF-Deskriptoren für die Anzeige. false = kein GPU-Bild.
+bool Exportieren(const webrtc::VideoFrameBuffer& puffer, HcGpuBild* aus);
 
 // Zählt ein Bild, das ohne Umweg in den Encoder ging (für die 30-s-Zeile).
 void EncoderDirektGezaehlt();

@@ -234,6 +234,7 @@ rtc_shared_library("libwebrtc") {
       "src/linux/hwenc/hw_encoder_factory.h",
       "src/linux/hwenc/hw_gemeinsam.cc",
       "src/linux/hwenc/hw_gemeinsam.h",
+      "src/linux/hwenc/hc_gpu_bild.cc",
     ]
     # Die oeffentlichen FFmpeg-Header liegen im Baum (siehe ffmpeg_lader.h).
     # NICHT gegen libavcodec binden -- geladen wird zur Laufzeit per dlopen.
@@ -323,6 +324,48 @@ rtc_shared_library("libwebrtc") {
   }
 }
 
+# Pruefprogramm Empfang ohne Umweg (10.11.2026): Decoder + Export + GL-Baustein
+# des Plugins gegen den alten Weg.  ninja -C out/Release-x64 libwebrtc:empfang_test
+if (is_linux && libwebrtc_hwenc) {
+  rtc_executable("empfang_test") {
+    testonly = true
+    sources = [
+      "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
+      "src/linux/hwenc/ffmpeg/hw_h264_decoder.cc",
+      "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
+      "src/linux/hwenc/ffmpeg/hw_nullkopie.cc",
+      "src/linux/hwenc/hc_gpu_bild.cc",
+      "src/linux/hwenc/hw_gemeinsam.cc",
+      "src/rtc_video_frame_impl.cc",
+      "test/empfang_test.cc",
+    ]
+    include_dirs = [
+      ".",
+      "include",
+      "src",
+      "src/linux/hwenc/ffmpeg/include",
+    ]
+    defines = [ "USE_LINUX_HWENC" ]
+    libs = [ "dl" ]
+    deps = [
+      "../api:make_ref_counted",
+      "../api/environment:environment_factory",
+      "../api/video:encoded_image",
+      "../api/video:video_bitrate_allocation",
+      "../api/video:video_frame",
+      "../api/video_codecs:video_codecs_api",
+      "../common_video",
+      "../media:media_constants",
+      "../modules/video_coding:codec_globals_headers",
+      "../modules/video_coding:video_codec_interface",
+      "../rtc_base:logging",
+      "../rtc_base:timeutils",
+      "//third_party/abseil-cpp/absl/strings",
+      "//third_party/libyuv",
+    ]
+  }
+}
+
 # Pruefprogramm Null-Kopie (08.11.2026): Wandler + VA-API-Encoder mit einem
 # gekachelten GBM-Puffer gegen den alten Weg.
 #   ninja -C out/Release-x64 libwebrtc:nullkopie_test
@@ -369,6 +412,8 @@ if (is_linux && libwebrtc_hwenc) {
     sources = [
       "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_decoder.cc",
+      "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
+      "src/linux/hwenc/ffmpeg/hw_nullkopie.cc",
       "src/linux/hwenc/hw_decoder_factory.cc",
       "src/linux/hwenc/hw_gemeinsam.cc",
       "test/hwdec_vergleich.cc",
@@ -378,14 +423,19 @@ if (is_linux && libwebrtc_hwenc) {
       "src/linux/hwenc/ffmpeg/include",
     ]
     libs = [ "dl" ]
+    defines = [ "USE_LINUX_HWENC" ]
     deps = [
+      "../api:make_ref_counted",
+      "../api/video:video_bitrate_allocation",
+      "../common_video",
+      "../media:media_constants",
+      "../modules/video_coding:codec_globals_headers",
       "../api/environment:environment_factory",
       "../api/video:encoded_image",
       "../api/video:video_frame",
       "../api/video_codecs:builtin_video_decoder_factory",
       "../api/video_codecs:rtc_software_fallback_wrappers",
       "../api/video_codecs:video_codecs_api",
-      "../common_video",
       "../modules/video_coding:video_codec_interface",
       "../rtc_base:logging",
       "../rtc_base:timeutils",

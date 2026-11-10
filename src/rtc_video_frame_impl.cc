@@ -67,7 +67,14 @@ int VideoFrameBufferImpl::ConvertToARGB(Type type, uint8_t* dst_buffer,
   // honeycord (Null-Kopie Linux, 08.11.2026): ein GPU-Bild erst auf der
   // Grafikkarte in Zielgroesse bringen, dann zurueckholen — die Vorschau
   // liest so nur die Kachel, nicht den ganzen Bildschirm.
-  webrtc::scoped_refptr<webrtc::I420Buffer> i420;
+  //
+  // ★ GEMESSEN 10.11.2026 (Intel UHD 630, 1080p): Hier lagen zwei Kopien
+  // ohne Wirkung — `I420Buffer::Rotate` kopiert auch bei 0° das ganze Bild
+  // (0,49 ms), `ScaleFrom` auch bei gleicher Groesse (0,41 ms). Zusammen
+  // 0,9 ms von 2,9 ms Anzeige-Weg je Bild. Jetzt nur noch, wenn wirklich
+  // gedreht oder skaliert wird.
+  webrtc::scoped_refptr<webrtc::I420BufferInterface> halter;
+  const webrtc::I420BufferInterface* q = nullptr;
   if (buffer_->type() == webrtc::VideoFrameBuffer::Type::kNative &&
       rotation_ == webrtc::kVideoRotation_0 && dest_width > 0 && dest_height > 0) {
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> klein =
@@ -76,19 +83,25 @@ int VideoFrameBufferImpl::ConvertToARGB(Type type, uint8_t* dst_buffer,
             : buffer_->Scale(dest_width, dest_height);
     if (!klein) return 0;
     // ToI420 des GPU-Bildes merkt sich sein Ergebnis selbst.
-    webrtc::scoped_refptr<webrtc::I420BufferInterface> k = klein->ToI420();
-    if (!k) return 0;
-    i420 = webrtc::I420Buffer::Rotate(*k, rotation_);
+    halter = klein->ToI420();
+    q = halter.get();
   } else {
-    const webrtc::I420BufferInterface* q = I420();
-    if (!q) return 0;
-    i420 = webrtc::I420Buffer::Rotate(*q, rotation_);
+    q = I420();
   }
+  if (q == nullptr || dest_width <= 0 || dest_height <= 0) return 0;
+  if (rotation_ != webrtc::kVideoRotation_0) {
+    halter = webrtc::I420Buffer::Rotate(*q, rotation_);
+    q = halter.get();
+  }
+  if (q->width() != dest_width || q->height() != dest_height) {
+    webrtc::scoped_refptr<webrtc::I420Buffer> skaliert =
+        webrtc::I420Buffer::Create(dest_width, dest_height);
+    skaliert->ScaleFrom(*q);
+    halter = skaliert;
+    q = halter.get();
+  }
+  const webrtc::I420BufferInterface* dest = q;
 
-  webrtc::scoped_refptr<webrtc::I420Buffer> dest =
-      webrtc::I420Buffer::Create(dest_width, dest_height);
-
-  dest->ScaleFrom(*i420.get());
   int buf_size = dest->width() * dest->height() * (32 >> 3);
   switch (type) {
     case libwebrtc::RTCVideoFrame::Type::kARGB:

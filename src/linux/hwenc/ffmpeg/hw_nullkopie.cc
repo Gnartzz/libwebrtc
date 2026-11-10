@@ -59,6 +59,7 @@ struct VaFn {
   VAStatus (*vaSyncSurface)(VADisplay, VASurfaceID);
   const char* (*vaQueryVendorString)(VADisplay);
   const char* (*vaErrorStr)(VAStatus);
+  VAStatus (*vaExportSurfaceHandle)(VADisplay, VASurfaceID, uint32_t, uint32_t, void*);
 };
 
 template <typename T>
@@ -236,8 +237,12 @@ class Va {
 // ── Das GPU-Bild ────────────────────────────────────────────────────────────
 class HcVaBild : public webrtc::VideoFrameBuffer {
  public:
-  HcVaBild(AVFrame* rahmen, int breite, int hoehe)
-      : rahmen_(rahmen), breite_(breite), hoehe_(hoehe) {}
+  // `aus_aufnahme`: Bild des Bildschirm-Aufnehmers (zählt für die
+  // Aussetz-Regel, Prüfbefund M3). Empfangene Bilder (Decoder) zählen nicht —
+  // sonst schaltete ein Zurücklesen beim Empfang die Null-Kopie beim Senden ab.
+  HcVaBild(AVFrame* rahmen, int breite, int hoehe, bool aus_aufnahme = true)
+      : rahmen_(rahmen), breite_(breite), hoehe_(hoehe), aus_aufnahme_(aus_aufnahme) {}
+  bool aus_aufnahme() const { return aus_aufnahme_; }
   ~HcVaBild() override { ffmpeg::Zugriff().av_frame_free(&rahmen_); }
 
   Type type() const override { return Type::kNative; }
@@ -269,7 +274,7 @@ class HcVaBild : public webrtc::VideoFrameBuffer {
     api.av_frame_free(&sw);
     i420_ = puffer;
     z_i420++;
-    p_gelesen += static_cast<uint64_t>(breite_) * hoehe_;
+    if (aus_aufnahme_) p_gelesen += static_cast<uint64_t>(breite_) * hoehe_;
     z_i420_us += static_cast<uint64_t>((CpuMs() - c0) * 1000);
     return i420_;
   }
@@ -291,7 +296,7 @@ class HcVaBild : public webrtc::VideoFrameBuffer {
           static_cast<VASurfaceID>(reinterpret_cast<uintptr_t>(rahmen_->data[3]));
       if (AVFrame* f = g_va->Vpp(quelle, r, sb, sh, false)) {
         z_skal++;
-        return webrtc::make_ref_counted<HcVaBild>(f, sb, sh);
+        return webrtc::make_ref_counted<HcVaBild>(f, sb, sh, aus_aufnahme_);
       }
     }
     // Rückfall: über I420 (langsam, aber richtig). ★ Prüfbefund S2: Der
@@ -306,6 +311,7 @@ class HcVaBild : public webrtc::VideoFrameBuffer {
   AVFrame* rahmen_;
   const int breite_;
   const int hoehe_;
+  const bool aus_aufnahme_;
   std::mutex m_;
   webrtc::scoped_refptr<webrtc::I420BufferInterface> i420_;
 };
@@ -551,6 +557,7 @@ bool EinrichtenIntern() {
   ok &= Hole(lib, "vaSyncSurface", &va->fn.vaSyncSurface);
   ok &= Hole(lib, "vaQueryVendorString", &va->fn.vaQueryVendorString);
   ok &= Hole(lib, "vaErrorStr", &va->fn.vaErrorStr);
+  ok &= Hole(lib, "vaExportSurfaceHandle", &va->fn.vaExportSurfaceHandle);
   // `lib` bleibt offen (nur ein Referenzzähler; libavutil hält sie ohnehin).
   if (!ok) {
     Protokoll("Null-Kopie: libva ohne alle Funktionen — alter Weg");
@@ -620,6 +627,99 @@ const AVFrame* AlsVaRahmen(const webrtc::VideoFrameBuffer& puffer, const AVBuffe
 }
 
 void EncoderDirektGezaehlt() { z_direkt++; }
+
+// ── Empfang ohne Umweg (10.11.2026) ─────────────────────────────────────────
+//
+// ★ GEMESSEN (CT 107, UHD 630, 1080p): Dekodieren 0,2 ms, aber Zurückkopieren
+// 2,3 ms, Wrapper-Kopien + I420ToABGR 2,1 ms, glTexImage2D 0,9 ms — rund
+// 5,9 ms CPU je fremdem Bild. Bleibt das Bild auf der Grafikkarte und
+// übernimmt die Anzeige es als DMA-BUF, bleibt ~0,5 ms.
+//
+// Der Decoder gibt GPU-Bilder NUR aus, wenn die Anzeige sie übernehmen kann:
+// Das Plugin meldet sich (`honeycord_empfang_gpu_bereit`), sobald sein
+// GL-Teil steht. Sonst (X11, abgelöstes Fenster ohne GL, Fehler) bleibt
+// alles beim heutigen Weg — ein GPU-Bild, das doch zurückgelesen werden
+// müsste, wäre nur ein Umweg mehr.
+
+namespace {
+std::atomic<bool> g_empfang_gemeldet{false};
+}
+
+void EmpfangMelden(bool an) {
+  const bool vorher = g_empfang_gemeldet.exchange(an);
+  if (vorher != an) Protokoll("Null-Kopie Empfang: Anzeige %s", an ? "übernimmt GPU-Bilder" : "ohne GPU-Weg");
+}
+
+bool EmpfangErlaubt() {
+  static const bool erlaubt = [] {
+    const char* aus = std::getenv("HONEYCORD_EMPFANG_GPU");
+    if (aus && std::strcmp(aus, "0") == 0) {
+      Protokoll("Null-Kopie Empfang: HONEYCORD_EMPFANG_GPU=0 — abgeschaltet");
+      return false;
+    }
+    return true;
+  }();
+  return erlaubt && Einrichten();
+}
+
+bool EmpfangAktiv() { return EmpfangErlaubt() && g_empfang_gemeldet.load(); }
+
+bool GeraetIstGemeinsam(const AVBufferRef* geraet) {
+  return geraet && g_va && g_va->geraet && geraet->data == g_va->geraet->data;
+}
+
+webrtc::scoped_refptr<webrtc::VideoFrameBuffer> AusDecoder(const AVFrame* hw, int breite, int hoehe) {
+  if (!g_va || !hw || breite < 2 || hoehe < 2) return nullptr;
+  // ★ Eine Kopie auf der GRAFIKKARTE in einen eigenen Vorrat: Der Vorrat des
+  // Decoders ist fest; hielte die Anzeige seine Oberflächen fest, liefe er leer.
+  VASurfaceID quelle = static_cast<VASurfaceID>(reinterpret_cast<uintptr_t>(hw->data[3]));
+  VARectangle r;
+  r.x = 0;
+  r.y = 0;
+  r.width = static_cast<uint16_t>(breite);
+  r.height = static_cast<uint16_t>(hoehe);
+  // Gerade Maße für NV12; ungerade Ränder (selten) gehen eine Zeile verloren.
+  const int zb = breite & ~1, zh = hoehe & ~1;
+  AVFrame* f = g_va->Vpp(quelle, r, zb, zh, false);
+  if (!f) return nullptr;
+  return webrtc::make_ref_counted<HcVaBild>(f, zb, zh, false);
+}
+
+bool Exportieren(const webrtc::VideoFrameBuffer& puffer, HcGpuBild* aus) {
+  if (!aus || !g_va || puffer.type() != webrtc::VideoFrameBuffer::Type::kNative) return false;
+  const auto* bild = dynamic_cast<const HcVaBild*>(&puffer);
+  if (!bild) return false;
+  VASurfaceID s = static_cast<VASurfaceID>(reinterpret_cast<uintptr_t>(bild->rahmen()->data[3]));
+  VADRMPRIMESurfaceDescriptor d;
+  std::memset(&d, 0, sizeof d);
+  const VAStatus st = g_va->fn.vaExportSurfaceHandle(
+      g_va->dpy, s, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+      VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &d);
+  if (st != VA_STATUS_SUCCESS) {
+    g_va->FehlerEinmal("Export", st);
+    return false;
+  }
+  bool ok = d.num_layers == 2;
+  for (uint32_t i = 0; ok && i < 2; ++i) ok = d.layers[i].num_planes == 1;
+  if (ok) {
+    aus->breite = bild->width();
+    aus->hoehe = bild->height();
+    for (int i = 0; i < 2; ++i) {
+      const uint32_t o = d.layers[i].object_index[0];
+      aus->ebene[i].fd = ::dup(d.objects[o].fd);
+      aus->ebene[i].drm_format = d.layers[i].drm_format;
+      aus->ebene[i].offset = d.layers[i].offset[0];
+      aus->ebene[i].pitch = d.layers[i].pitch[0];
+      aus->ebene[i].modifier = d.objects[o].drm_format_modifier;
+      if (aus->ebene[i].fd < 0) ok = false;
+    }
+    if (!ok) {
+      for (int i = 0; i < 2; ++i) if (aus->ebene[i].fd >= 0) ::close(aus->ebene[i].fd);
+    }
+  }
+  for (uint32_t k = 0; k < d.num_objects; ++k) ::close(d.objects[k].fd);
+  return ok;
+}
 
 void AufnahmeBeginnt() { g_aufnahmen++; }
 
