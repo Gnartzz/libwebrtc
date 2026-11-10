@@ -567,10 +567,14 @@ void HwH264Decoder::ZeitenMelden(int64_t jetzt_ms) {
   if (zeit_bilder_ > 0 || zeit_fehler_ > 0) {
     const double n = zeit_bilder_ > 0 ? zeit_bilder_ : 1;
     Protokoll("Decoder #%d %dx%d: %d Bilder/%lld s (davon %d auf der Grafikkarte) · "
-              "dekodieren %.2f ms · herunterladen %.2f ms · umformen %.2f ms · Fehler %d",
+              "dekodieren %.2f ms · %s %.2f ms · umformen %.2f ms · Fehler %d",
               nummer_, breite_, hoehe_, zeit_bilder_,
               static_cast<long long>((jetzt_ms - zeit_start_ms_) / 1000), gpu_bilder_,
-              zeit_dek_us_ / n / 1000.0, zeit_holen_us_ / n / 1000.0,
+              zeit_dek_us_ / n / 1000.0,
+              // Auf dem GPU-Weg ist es die Kopie auf der Grafikkarte (Wartezeit
+              // des Fadens, keine CPU-Arbeit), sonst das Zurückkopieren.
+              gpu_bilder_ == zeit_bilder_ ? "GPU-Kopie (Wartezeit)" : "herunterladen",
+              zeit_holen_us_ / n / 1000.0,
               zeit_umformen_us_ / n / 1000.0, zeit_fehler_);
   }
   zeit_dek_us_ = zeit_holen_us_ = zeit_umformen_us_ = 0;
