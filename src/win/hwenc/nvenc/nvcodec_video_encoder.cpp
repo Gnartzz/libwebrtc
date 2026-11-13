@@ -165,13 +165,20 @@ static bool NvEncEingangPufferGewuenscht() {
 }
 
 // ★ HoneyCord Messschalter (13.11.2026, Grafiklast okunoku): Datei
-// %LOCALAPPDATA%\HoneyCord\nvenc-aq.txt mit Inhalt `aus` -> NVENC ohne
-// Spatial-AQ (beide Wege: NV12 und ARGB-Zero-Copy). Gemessen auf der RTX 2070
+// %LOCALAPPDATA%\HoneyCord\nvenc-aq.txt mit Inhalt `aus`/`0` -> NVENC ohne
+// Spatial-AQ, `1`..`15` -> diese AQ-Staerke (beide Wege: NV12 und ARGB-Zero-Copy). Gemessen auf der RTX 2070
 // SUPER: Kamera 720p60 kostet ~20 % "3D" bei minimiertem Fenster in Flutter
-// UND v3 - Gegenprobe, ob AQ das verursacht. Ohne Datei unveraendert (AQ 8).
+// UND v3 - Gegenprobe, ob AQ das verursacht (13.11.: ja, AQ 8 = halbe Last).
+// Ohne Datei unveraendert (AQ 8).
 // Wird je Encoder-Start gelesen.
-static bool NvEncAqAusGewuenscht() {
-  return SchalterDateiSagt(L"nvenc-aq.txt", "aus");
+static int NvEncAqStaerke() {
+  if (SchalterDateiSagt(L"nvenc-aq.txt", "aus")) return 0;
+  for (int st = 1; st <= 15; ++st) {
+    char wort[4] = {0};
+    sprintf_s(wort, sizeof(wort), "%d", st);
+    if (SchalterDateiSagt(L"nvenc-aq.txt", wort)) return st;
+  }
+  return 8;  // keine/unbekannte Datei: bisherige Vorgabe
 }
 
 static void NvProbeLog(const char* fmt, ...) {
@@ -641,9 +648,9 @@ bool NvCodecVideoEncoderImpl::EnsureNativeEncoder(ID3D11Device* device) {
     // Kloetzchen als die Kamera ueber denselben Encoder.
     cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
     cfg.rcParams.disableBadapt = 1;
-    const bool aq_aus = NvEncAqAusGewuenscht();
-    cfg.rcParams.enableAQ = aq_aus ? 0 : 1;
-    cfg.rcParams.aqStrength = aq_aus ? 0 : 8;
+    const int aq = NvEncAqStaerke();
+    cfg.rcParams.enableAQ = aq > 0 ? 1 : 0;
+    cfg.rcParams.aqStrength = aq;
     cfg.encodeCodecConfig.h264Config.chromaFormatIDC = 1;
     cfg.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
     cfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
@@ -1939,10 +1946,10 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
     encode_config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
     // AQ strength is 1..15; 0 means disabled by spec. Mid-range (8) is the
     // OBS-style default — visibly better grain handling without sacrificing
-    // throughput on the encoder block. Messschalter nvenc-aq.txt = aus -> 0.
-    const bool aq_aus = NvEncAqAusGewuenscht();
-    encode_config.rcParams.enableAQ = aq_aus ? 0 : 1;
-    encode_config.rcParams.aqStrength = aq_aus ? 0 : 8;
+    // throughput on the encoder block. Messschalter nvenc-aq.txt: aus/0..15.
+    const int aq = NvEncAqStaerke();
+    encode_config.rcParams.enableAQ = aq > 0 ? 1 : 0;
+    encode_config.rcParams.aqStrength = aq;
 
     if (codec == CudaVideoCodec::H264) {
       // NV12 is YUV 4:2:0. NV_ENC_CONFIG_H264::chromaFormatIDC must be 1
