@@ -136,11 +136,11 @@ static bool HoneyCordOrdnerW(wchar_t (&dir)[MAX_PATH]) {
 // Zeilenende und UTF-8-BOM egal) -> NV12-Bilder gehen ueber NVENC-
 // Eingangspuffer statt ueber die D3D11-Textur. Alles andere oder keine
 // Datei -> bisheriger Texturweg. Wird je Encoder-Start (InitNvEnc) gelesen.
-static bool NvEncEingangPufferGewuenscht() {
+static bool SchalterDateiSagt(const wchar_t* name, const char* wort) {
   wchar_t dir[MAX_PATH] = {0};
   if (!HoneyCordOrdnerW(dir)) return false;
   wchar_t file[MAX_PATH] = {0};
-  swprintf_s(file, MAX_PATH, L"%s\\nvenc-eingang.txt", dir);
+  swprintf_s(file, MAX_PATH, L"%s\\%s", dir, name);
   FILE* f = nullptr;
   if (_wfopen_s(&f, file, L"rb") != 0 || !f) return false;
   char puffer[64] = {0};
@@ -156,7 +156,22 @@ static bool NvEncEingangPufferGewuenscht() {
   while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t' ||
                      p[len - 1] == '\r' || p[len - 1] == '\n'))
     --len;
-  return len == 6 && _strnicmp(p, "puffer", 6) == 0;
+  const size_t wlen = strlen(wort);
+  return len == wlen && _strnicmp(p, wort, wlen) == 0;
+}
+
+static bool NvEncEingangPufferGewuenscht() {
+  return SchalterDateiSagt(L"nvenc-eingang.txt", "puffer");
+}
+
+// ★ HoneyCord Messschalter (13.11.2026, Grafiklast okunoku): Datei
+// %LOCALAPPDATA%\HoneyCord\nvenc-aq.txt mit Inhalt `aus` -> NVENC ohne
+// Spatial-AQ (beide Wege: NV12 und ARGB-Zero-Copy). Gemessen auf der RTX 2070
+// SUPER: Kamera 720p60 kostet ~20 % "3D" bei minimiertem Fenster in Flutter
+// UND v3 - Gegenprobe, ob AQ das verursacht. Ohne Datei unveraendert (AQ 8).
+// Wird je Encoder-Start gelesen.
+static bool NvEncAqAusGewuenscht() {
+  return SchalterDateiSagt(L"nvenc-aq.txt", "aus");
 }
 
 static void NvProbeLog(const char* fmt, ...) {
@@ -626,8 +641,9 @@ bool NvCodecVideoEncoderImpl::EnsureNativeEncoder(ID3D11Device* device) {
     // Kloetzchen als die Kamera ueber denselben Encoder.
     cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
     cfg.rcParams.disableBadapt = 1;
-    cfg.rcParams.enableAQ = 1;
-    cfg.rcParams.aqStrength = 8;
+    const bool aq_aus = NvEncAqAusGewuenscht();
+    cfg.rcParams.enableAQ = aq_aus ? 0 : 1;
+    cfg.rcParams.aqStrength = aq_aus ? 0 : 8;
     cfg.encodeCodecConfig.h264Config.chromaFormatIDC = 1;
     cfg.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
     cfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
@@ -645,10 +661,11 @@ bool NvCodecVideoEncoderImpl::EnsureNativeEncoder(ID3D11Device* device) {
     native_naechster_versuch_ms_ = 0;
     const int offen = ++g_nvenc_offen;
     NvProbeLog("EnsureNativeEncoder: NVENC(ARGB) auf Frame-Device ok %ux%u "
-               "fps=%u avgBR=%u maxBR=%u aq=1/8",
+               "fps=%u avgBR=%u maxBR=%u aq=%d/%d",
                width_, height_, (unsigned)ip.frameRateNum,
                (unsigned)cfg.rcParams.averageBitRate,
-               (unsigned)cfg.rcParams.maxBitRate);
+               (unsigned)cfg.rcParams.maxBitRate,
+               (int)cfg.rcParams.enableAQ, (int)cfg.rcParams.aqStrength);
     NvProbeLog("NVENC offen kind=argb this=%p offen=%d", (void*)this, offen);
     return true;
   } catch (const NVENCException& e) {
@@ -1920,11 +1937,12 @@ std::unique_ptr<NvEncoder> NvCodecVideoEncoderImpl::CreateEncoder(
     // rejected — the encoder could never raise its bitrate in place and stayed
     // pinned near the low start bitrate. Pin it explicitly so it matches.
     encode_config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
-    encode_config.rcParams.enableAQ = 1;
     // AQ strength is 1..15; 0 means disabled by spec. Mid-range (8) is the
     // OBS-style default — visibly better grain handling without sacrificing
-    // throughput on the encoder block.
-    encode_config.rcParams.aqStrength = 8;
+    // throughput on the encoder block. Messschalter nvenc-aq.txt = aus -> 0.
+    const bool aq_aus = NvEncAqAusGewuenscht();
+    encode_config.rcParams.enableAQ = aq_aus ? 0 : 1;
+    encode_config.rcParams.aqStrength = aq_aus ? 0 : 8;
 
     if (codec == CudaVideoCodec::H264) {
       // NV12 is YUV 4:2:0. NV_ENC_CONFIG_H264::chromaFormatIDC must be 1
