@@ -131,12 +131,11 @@ static bool HoneyCordOrdnerW(wchar_t (&dir)[MAX_PATH]) {
   return true;
 }
 
-// ★ HoneyCord Messschalter (30.10.2026): Datei %LOCALAPPDATA%\HoneyCord\
-// nvenc-eingang.txt mit Inhalt `puffer` (Gross-/Kleinschreibung, Leerraum,
-// Zeilenende und UTF-8-BOM egal) -> NV12-Bilder gehen ueber NVENC-
-// Eingangspuffer statt ueber die D3D11-Textur. Alles andere oder keine
-// Datei -> bisheriger Texturweg. Wird je Encoder-Start (InitNvEnc) gelesen.
-static bool SchalterDateiSagt(const wchar_t* name, const char* wort) {
+// Schalterdateien in %LOCALAPPDATA%\HoneyCord: Inhalt ohne UTF-8-BOM und
+// ohne Leerraum am Rand nach `aus` (hoechstens 63 Zeichen). false, wenn die
+// Datei fehlt. Gross-/Kleinschreibung entscheidet der Aufrufer.
+static bool SchalterDateiLesen(const wchar_t* name, char (&aus)[64]) {
+  aus[0] = 0;
   wchar_t dir[MAX_PATH] = {0};
   if (!HoneyCordOrdnerW(dir)) return false;
   wchar_t file[MAX_PATH] = {0};
@@ -156,29 +155,36 @@ static bool SchalterDateiSagt(const wchar_t* name, const char* wort) {
   while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t' ||
                      p[len - 1] == '\r' || p[len - 1] == '\n'))
     --len;
-  const size_t wlen = strlen(wort);
-  return len == wlen && _strnicmp(p, wort, wlen) == 0;
+  memcpy(aus, p, len);
+  aus[len] = 0;
+  return true;
 }
 
+// ★ HoneyCord Messschalter (30.10.2026): Datei nvenc-eingang.txt mit Inhalt
+// `puffer` (Gross-/Kleinschreibung, Leerraum, Zeilenende und UTF-8-BOM egal)
+// -> NV12-Bilder gehen ueber NVENC-Eingangspuffer statt ueber die
+// D3D11-Textur. Alles andere oder keine Datei -> bisheriger Texturweg. Wird je
+// Encoder-Start (InitNvEnc) gelesen.
 static bool NvEncEingangPufferGewuenscht() {
-  return SchalterDateiSagt(L"nvenc-eingang.txt", "puffer");
+  char inhalt[64];
+  return SchalterDateiLesen(L"nvenc-eingang.txt", inhalt) && _stricmp(inhalt, "puffer") == 0;
 }
 
-// ★ HoneyCord Messschalter (13.11.2026, Grafiklast okunoku): Datei
-// %LOCALAPPDATA%\HoneyCord\nvenc-aq.txt mit Inhalt `aus`/`0` -> NVENC ohne
-// Spatial-AQ, `1`..`15` -> diese AQ-Staerke (beide Wege: NV12 und ARGB-Zero-Copy). Gemessen auf der RTX 2070
-// SUPER: Kamera 720p60 kostet ~20 % "3D" bei minimiertem Fenster in Flutter
-// UND v3 - Gegenprobe, ob AQ das verursacht (13.11.: ja, AQ 8 = halbe Last).
-// Ohne Datei unveraendert (AQ 8).
-// Wird je Encoder-Start gelesen.
+// ★ HoneyCord AQ-Schalter (13.11.2026, Grafiklast okunoku): Datei
+// nvenc-aq.txt — `aus` oder `0` -> NVENC ohne Spatial-AQ, `1`..`15` -> diese
+// Staerke; keine Datei oder etwas anderes -> 8 wie bisher. Gilt fuer beide
+// Wege (NV12 und ARGB-Zero-Copy), gelesen je Encoder-Start. Die Clients
+// schreiben `aus` (Einstellung „Feinere Bildqualitaet (AQ)“ aus) bzw.
+// loeschen die Datei. Gemessen auf der RTX 2070 SUPER, Kamera 720p60
+// minimiert: AQ 8 ~12 % „3D“, AQ 4 ~12 %, aus ~5 % — nur an/aus zaehlt.
 static int NvEncAqStaerke() {
-  if (SchalterDateiSagt(L"nvenc-aq.txt", "aus")) return 0;
-  for (int st = 1; st <= 15; ++st) {
-    char wort[4] = {0};
-    sprintf_s(wort, sizeof(wort), "%d", st);
-    if (SchalterDateiSagt(L"nvenc-aq.txt", wort)) return st;
-  }
-  return 8;  // keine/unbekannte Datei: bisherige Vorgabe
+  char inhalt[64];
+  if (!SchalterDateiLesen(L"nvenc-aq.txt", inhalt)) return 8;
+  if (_stricmp(inhalt, "aus") == 0) return 0;
+  char* ende = nullptr;
+  const long st = strtol(inhalt, &ende, 10);
+  if (ende != inhalt && *ende == 0 && st >= 0 && st <= 15) return (int)st;
+  return 8;
 }
 
 static void NvProbeLog(const char* fmt, ...) {
@@ -1243,6 +1249,7 @@ int32_t NvCodecVideoEncoderImpl::InitNvEnc() {
   NvProbeLog("NVENC Eingang: %s (Schalter nvenc-eingang.txt)%s",
              eingang_puffer_ ? "puffer" : "textur",
              (eingang_puffer_ && puffer_aus_) ? " - Puffer frueher gescheitert, Texturweg" : "");
+  NvProbeLog("NVENC AQ: %d (Schalter nvenc-aq.txt, 0 = aus)", NvEncAqStaerke());
   if (!EnsureNv12Encoder()) return WEBRTC_VIDEO_CODEC_ERROR;
   initialisiert_ = true;
   native_folge_ = 0;
