@@ -1,0 +1,335 @@
+diff --git a/modules/video_capture/linux/device_info_v4l2.cc b/modules/video_capture/linux/device_info_v4l2.cc
+index 289975b2e1..17168fb1a6 100644
+--- a/modules/video_capture/linux/device_info_v4l2.cc
++++ b/modules/video_capture/linux/device_info_v4l2.cc
+@@ -23,6 +23,7 @@
+ 
+ #include "common_video/libyuv/include/webrtc_libyuv.h"
+ #include "modules/video_capture/device_info_impl.h"
++#include "modules/video_capture/linux/honeycord_v4l2_formate.h"
+ #include "modules/video_capture/video_capture_defines.h"
+ #include "rtc_base/checks.h"
+ #include "rtc_base/logging.h"
+@@ -66,8 +67,11 @@ uint32_t DeviceInfoV4l2::NumberOfDevices() {
+     snprintf(device, sizeof(device), "/dev/video%d", n);
+     if ((fd = open(device, O_RDONLY)) != -1) {
+       // query device capabilities and make sure this is a video capture device
++      // HONEYCORD: Geraete ohne verwertbares Format (Infrarot-Sensor, nur
++      // GREY) nicht zaehlen — sonst steht die Kamera doppelt im Waehler.
+       if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0 ||
+-          !(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE)) {
++          !(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE) ||
++          !HcNutzbaresGeraet(fd)) {
+         close(fd);
+         continue;
+       }
+@@ -97,8 +101,11 @@ int32_t DeviceInfoV4l2::GetDeviceName(uint32_t deviceNumber,
+     snprintf(device, sizeof(device), "/dev/video%d", n);
+     if ((fd = open(device, O_RDONLY)) != -1) {
+       // query device capabilities and make sure this is a video capture device
++      // HONEYCORD: Geraete ohne verwertbares Format (Infrarot-Sensor, nur
++      // GREY) nicht zaehlen — sonst steht die Kamera doppelt im Waehler.
+       if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0 ||
+-          !(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE)) {
++          !(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE) ||
++          !HcNutzbaresGeraet(fd)) {
+         close(fd);
+         continue;
+       }
+@@ -176,7 +183,10 @@ int32_t DeviceInfoV4l2::CreateCapabilityMap(const char* deviceUniqueIdUTF8) {
+     struct v4l2_capability cap;
+     if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+       // skip devices without video capture capability
+-      if (!(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE)) {
++      // HONEYCORD: und ohne verwertbares Format (Infrarot-Sensor mit gleicher
++      // bus_info); dabei auch den Deskriptor schliessen (fehlte).
++      if (!(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE) || !HcNutzbaresGeraet(fd)) {
++        close(fd);
+         continue;
+       }
+ 
+diff --git a/modules/video_capture/linux/video_capture_v4l2.cc b/modules/video_capture/linux/video_capture_v4l2.cc
+index 1cb83f82d5..9d6e11a108 100644
+--- a/modules/video_capture/linux/video_capture_v4l2.cc
++++ b/modules/video_capture/linux/video_capture_v4l2.cc
+@@ -20,6 +20,7 @@
+ #include <cerrno>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <new>
+ 
+@@ -53,6 +54,10 @@
+ #define V4L2_PIX_FMT_RGBA32 v4l2_fourcc('A', 'B', '2', '4')
+ #endif
+ 
++// HONEYCORD: nach den Ersatz-Defines oben, damit ABGR32/ARGB32/RGBA32 auch mit
++// alten Kernel-Headern als verwertbar zaehlen (Pruefbefund 7).
++#include "modules/video_capture/linux/honeycord_v4l2_formate.h"
++
+ namespace webrtc {
+ namespace videocapturemodule {
+ VideoCaptureModuleV4L2::VideoCaptureModuleV4L2(Clock* clock)
+@@ -84,7 +89,10 @@ int32_t VideoCaptureModuleV4L2::Init(const char* deviceUniqueIdUTF8) {
+       // query device capabilities
+       struct v4l2_capability cap;
+       if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+-        if (cap.bus_info[0] != 0) {
++        // HONEYCORD: der Infrarot-Sensor traegt dieselbe bus_info — nur ein
++        // Geraet mit verwertbarem Format darf passen (sonst oeffnete WebRTC
++        // bei Kameras mit IR-Knoten zuerst den Sensor und fand kein Format).
++        if (cap.bus_info[0] != 0 && HcNutzbaresGeraet(fd)) {
+           if (strncmp((const char*)cap.bus_info,
+                       (const char*)deviceUniqueIdUTF8,
+                       strlen((const char*)deviceUniqueIdUTF8)) ==
+@@ -139,6 +147,12 @@ int32_t VideoCaptureModuleV4L2::StartCapture(
+   configured_capability_ = capability;
+ 
+   MutexLock lock(&capture_lock_);
++  // HONEYCORD: zweiter Durchlauf nach einem gescheiterten unkomprimierten
++  // Versuch — derselbe Ablauf unter derselben Sperre, nur ohne Rohformat
++  // (ein erneuter Aufruf von StartCapture haette capture_lock_ doppelt
++  // genommen).
++  bool hcNurKomprimiert = false;
++hcNochmal:
+   // first open /dev/video device
+   char device[20];
+   snprintf(device, sizeof(device), "/dev/video%d", _deviceId);
+@@ -177,7 +191,11 @@ int32_t VideoCaptureModuleV4L2::StartCapture(
+   fmt.index = 0;
+   fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+   RTC_LOG(LS_INFO) << "Video Capture enumerats supported image formats:";
++  uint32_t hcVorhanden[32];
++  int hcAnzahl = 0;
+   while (ioctl(_deviceFd, VIDIOC_ENUM_FMT, &fmt) == 0) {
++    if (hcAnzahl < 32)
++      hcVorhanden[hcAnzahl++] = fmt.pixelformat;
+     RTC_LOG(LS_INFO) << "  { pixelformat = " << GetFourccName(fmt.pixelformat)
+                      << ", description = '" << fmt.description << "' }";
+     // Match the preferred order.
+@@ -196,13 +214,63 @@ int32_t VideoCaptureModuleV4L2::StartCapture(
+     RTC_LOG(LS_INFO) << "We prefer format " << GetFourccName(fmts[fmtsIdx]);
+   }
+ 
++  // HONEYCORD (15.11.2026): Ueber VGA bevorzugte WebRTC MJPEG auch dann, wenn
++  // die Kamera Groesse UND Bildrate unkomprimiert liefert — jedes Bild wurde
++  // auf der CPU entpackt (gemessen Brio 720p30: 7,4 % eines Kerns nur fuer den
++  // Erfassungs-Faden, mit NV12 unter 1 %). Jetzt: unkomprimiert, wenn es reicht
++  // (Reihenfolge nach Umwandlungsaufwand nach I420), sonst MJPEG wie bisher
++  // (z. B. 720p60 gibt es bei der Brio nur komprimiert). Scheitert der
++  // unkomprimierte Weg (anderes Format/Zeilenabstand, Rate darunter, Strom
++  // startet nicht — USB-Bandbreite an Hub/Dock), wiederholt hcMitMjpeg() den
++  // Start mit MJPEG. Gegenprobe: HONEYCORD_KAMERA_MJPEG=1 = altes Verhalten.
++  uint32_t hcFormat = fmts[fmtsIdx];
++  if (isHd && (hcFormat == V4L2_PIX_FMT_MJPEG || hcFormat == V4L2_PIX_FMT_JPEG) &&
++      !hcNurKomprimiert && getenv("HONEYCORD_KAMERA_MJPEG") == nullptr) {
++    const uint32_t hcRohFormate[] = {V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_YUV420,
++                                     V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_UYVY};
++    for (uint32_t f : hcRohFormate) {
++      bool da = false;
++      for (int i = 0; i < hcAnzahl; i++)
++        da = da || hcVorhanden[i] == f;
++      if (da && HcRateMoeglich(_deviceFd, f, capability.width,
++                               capability.height, capability.maxFPS)) {
++        hcFormat = f;
++        break;
++      }
++    }
++  }
++  fprintf(stderr, "[kamera] /dev/video%d %dx%d@%d: %s%s\n", _deviceId,
++          capability.width, capability.height, capability.maxFPS,
++          GetFourccName(hcFormat).c_str(),
++          hcFormat == fmts[fmtsIdx] ? "" : " (unkomprimiert statt MJPEG)");
++  const bool hcRoh = hcFormat != fmts[fmtsIdx];
++  // Rueckfall (Pruefbefund 1): aufraeumen; der Aufrufer springt danach an
++  // hcNochmal. `puffer`: Puffer sind angelegt (dann freigeben, sonst bliebe
++  // das Geraet belegt).
++  auto hcAufraeumen = [&](const char* grund, bool puffer) {
++    fprintf(stderr, "[kamera] unkomprimiert gescheitert (%s) — zurueck zu MJPEG\n", grund);
++    if (puffer) {
++      DeAllocateVideoBuffers();  // munmap, delete[], STREAMOFF
++      struct v4l2_requestbuffers rb;
++      memset(&rb, 0, sizeof(rb));
++      rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++      rb.memory = V4L2_MEMORY_MMAP;
++      rb.count = 0;
++      ioctl(_deviceFd, VIDIOC_REQBUFS, &rb);
++      _pool = nullptr;
++      _buffersAllocatedByDevice = -1;
++    }
++    close(_deviceFd);
++    _deviceFd = -1;
++  };
++
+   struct v4l2_format video_fmt;
+   memset(&video_fmt, 0, sizeof(struct v4l2_format));
+   video_fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+   video_fmt.fmt.pix.sizeimage = 0;
+   video_fmt.fmt.pix.width = capability.width;
+   video_fmt.fmt.pix.height = capability.height;
+-  video_fmt.fmt.pix.pixelformat = fmts[fmtsIdx];
++  video_fmt.fmt.pix.pixelformat = hcFormat;
+ 
+   if (video_fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV)
+     configured_capability_.videoType = VideoType::kYUY2;
+@@ -240,6 +308,26 @@ int32_t VideoCaptureModuleV4L2::StartCapture(
+     return -1;
+   }
+ 
++  // HONEYCORD (Pruefbefund 2): Der Treiber darf Format und Zeilenabstand
++  // anpassen; IncomingFrame rechnet mit dichten Ebenen. Unkomprimiert nur,
++  // wenn genau das Verlangte zurueckkommt.
++  if (hcRoh) {
++    const uint32_t bpl = video_fmt.fmt.pix.bytesperline;
++    const uint32_t dicht =
++        (hcFormat == V4L2_PIX_FMT_YUYV || hcFormat == V4L2_PIX_FMT_UYVY)
++            ? video_fmt.fmt.pix.width * 2
++            : video_fmt.fmt.pix.width;
++    if (video_fmt.fmt.pix.pixelformat != hcFormat ||
++        static_cast<int>(video_fmt.fmt.pix.width) != capability.width ||
++        static_cast<int>(video_fmt.fmt.pix.height) != capability.height ||
++        (bpl != 0 && bpl != dicht))
++    {
++      hcAufraeumen("Format/Zeilenabstand", false);
++      hcNurKomprimiert = true;
++      goto hcNochmal;
++    }
++  }
++
+   // initialize current width and height
+   configured_capability_.width = video_fmt.fmt.pix.width;
+   configured_capability_.height = video_fmt.fmt.pix.height;
+@@ -278,6 +366,25 @@ int32_t VideoCaptureModuleV4L2::StartCapture(
+     }
+   }
+ 
++  // HONEYCORD (Pruefbefund 3): S_PARM nimmt das naechstgelegene Intervall —
++  // unkomprimiert nur, wenn die eingestellte Rate den Wunsch erreicht.
++  if (hcRoh && driver_framerate_support) {
++    struct v4l2_streamparm ist;
++    memset(&ist, 0, sizeof(ist));
++    ist.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    if (ioctl(_deviceFd, VIDIOC_G_PARM, &ist) == 0) {
++      const auto& t = ist.parm.capture.timeperframe;
++      if (t.numerator > 0 && static_cast<uint64_t>(t.denominator) * 100 <
++                                 static_cast<uint64_t>(capability.maxFPS) *
++                                     t.numerator * 99)
++      {
++        hcAufraeumen("Bildrate darunter", false);
++        hcNurKomprimiert = true;
++        goto hcNochmal;
++      }
++    }
++  }
++
+   if (!AllocateVideoBuffers()) {
+     RTC_LOG(LS_INFO) << "failed to allocate video capture buffers";
+     return -1;
+@@ -288,6 +395,13 @@ int32_t VideoCaptureModuleV4L2::StartCapture(
+   type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+   if (ioctl(_deviceFd, VIDIOC_STREAMON, &type) == -1) {
+     RTC_LOG(LS_INFO) << "Failed to turn on stream";
++    // HONEYCORD (Pruefbefund 1): unkomprimiert reicht die USB-Bandbreite
++    // nicht (ENOSPC an Hub/Dock/zweiter Kamera) — mit MJPEG neu.
++    if (hcRoh) {
++      hcAufraeumen("Strom startet nicht", true);
++      hcNurKomprimiert = true;
++      goto hcNochmal;
++    }
+     return -1;
+   }
+ 
+diff --git a/modules/video_capture/linux/honeycord_v4l2_formate.h b/modules/video_capture/linux/honeycord_v4l2_formate.h
+new file mode 100644
+index 0000000000..a1eae9ed03
+--- /dev/null
++++ b/modules/video_capture/linux/honeycord_v4l2_formate.h
+@@ -0,0 +1,87 @@
++// HoneyCord (15.11.2026): Hilfen zur Kamerawahl unter Linux (V4L2).
++//
++// GEMESSEN am UM890 (Logitech Brio, 720p): WebRTC oeffnete die Kamera ueber
++// VGA immer als MJPEG und entpackte jedes Bild auf der CPU — der Erfassungs-
++// Faden kostete bei 30 Bildern/s 7,4 %, bei 60 Bildern/s 16,1 % eines Kerns,
++// obwohl die Brio 720p30 auch unkomprimiert (NV12, YUYV) liefert. Ausserdem
++// zeigte der Waehler die Brio doppelt: ihr Infrarot-Sensor ist ein eigenes
++// /dev/video mit GLEICHER bus_info, kann aber nur Graustufen (GREY).
++#ifndef MODULES_VIDEO_CAPTURE_LINUX_HONEYCORD_V4L2_FORMATE_H_
++#define MODULES_VIDEO_CAPTURE_LINUX_HONEYCORD_V4L2_FORMATE_H_
++
++#include <linux/videodev2.h>
++#include <sys/ioctl.h>
++
++#include <cstdint>
++#include <cstring>
++
++namespace webrtc {
++namespace videocapturemodule {
++
++// Formate, die WebRTC unter Linux verarbeiten kann (wie in StartCapture).
++inline bool HcFormatVerwertbar(uint32_t f) {
++  switch (f) {
++    case V4L2_PIX_FMT_MJPEG: case V4L2_PIX_FMT_JPEG:
++    case V4L2_PIX_FMT_YUV420: case V4L2_PIX_FMT_YVU420:
++    case V4L2_PIX_FMT_YUYV: case V4L2_PIX_FMT_UYVY: case V4L2_PIX_FMT_NV12:
++    case V4L2_PIX_FMT_BGR24: case V4L2_PIX_FMT_RGB24: case V4L2_PIX_FMT_RGB565:
++    case V4L2_PIX_FMT_BGR32: case V4L2_PIX_FMT_RGB32:
++#ifdef V4L2_PIX_FMT_ABGR32
++    case V4L2_PIX_FMT_ABGR32:
++#endif
++#ifdef V4L2_PIX_FMT_ARGB32
++    case V4L2_PIX_FMT_ARGB32:
++#endif
++#ifdef V4L2_PIX_FMT_RGBA32
++    case V4L2_PIX_FMT_RGBA32:
++#endif
++      return true;
++    default:
++      return false;
++  }
++}
++
++// Liefert das Geraet mindestens ein verwertbares Format? Ein Infrarot-Sensor
++// (nur GREY) liefert keines und gehoert weder in die Liste noch geoeffnet.
++inline bool HcNutzbaresGeraet(int fd) {
++  struct v4l2_fmtdesc fmt;
++  memset(&fmt, 0, sizeof(fmt));
++  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++  for (fmt.index = 0; ioctl(fd, VIDIOC_ENUM_FMT, &fmt) == 0; fmt.index++) {
++    if (HcFormatVerwertbar(fmt.pixelformat))
++      return true;
++  }
++  return false;
++}
++
++// Liefert das Geraet `fourcc` in genau w x h mit mindestens `fps` Bildern/s?
++// 1 % Spielraum: 1001/30000 (29,97/s, Capture-Karten) zaehlt als 30.
++inline bool HcRateMoeglich(int fd, uint32_t fourcc, int w, int h, int fps) {
++  // Ohne bekannte Wunschrate (0) gilt keine Rohrate als ausreichend (Pruefbefund 4).
++  if (w <= 0 || h <= 0 || fps < 1)
++    return false;
++  struct v4l2_frmivalenum iv;
++  memset(&iv, 0, sizeof(iv));
++  iv.pixel_format = fourcc;
++  iv.width = static_cast<uint32_t>(w);
++  iv.height = static_cast<uint32_t>(h);
++  for (iv.index = 0; ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &iv) == 0; iv.index++) {
++    const struct v4l2_fract* k = nullptr;  // kuerzester Abstand = hoechste Rate
++    if (iv.type == V4L2_FRMIVAL_TYPE_DISCRETE)
++      k = &iv.discrete;
++    else
++      k = &iv.stepwise.min;
++    if (k->numerator > 0 &&
++        static_cast<uint64_t>(k->denominator) * 100 >=
++            static_cast<uint64_t>(fps) * k->numerator * 99)
++      return true;
++    if (iv.type != V4L2_FRMIVAL_TYPE_DISCRETE)
++      break;  // stufenlos/schrittweise: ein Eintrag beschreibt alles
++  }
++  return false;
++}
++
++}  // namespace videocapturemodule
++}  // namespace webrtc
++
++#endif  // MODULES_VIDEO_CAPTURE_LINUX_HONEYCORD_V4L2_FORMATE_H_
