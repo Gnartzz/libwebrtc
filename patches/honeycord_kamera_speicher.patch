@@ -1,0 +1,205 @@
+diff --git a/modules/video_capture/hc_kamera_puffer.h b/modules/video_capture/hc_kamera_puffer.h
+new file mode 100644
+index 0000000..1573288
+--- /dev/null
++++ b/modules/video_capture/hc_kamera_puffer.h
+@@ -0,0 +1,149 @@
++/*
++ *  HoneyCord, 21.11.2026 (Stellar-Blade-Absturz, Diagnose-Buendel 123/124).
++ *
++ *  Kamerabilder ohne RTC_CHECK bei Speichermangel. Gemessen: Beim Start
++ *  eines Spiels war die Windows-Zusagegrenze erschoepft (0x800705AF), malloc
++ *  in AlignedMalloc lieferte nullptr, RTC_CHECK beendete den ganzen Client aus
++ *  dem DirectShow-Aufnahmefaden (I420Buffer::Create je Kamerabild).
++ *
++ *  KameraPuffer: I420-Puffer mit eigenem Speicher. Fehlt er, gibt Anlegen()
++ *  nullptr zurueck (kein RTC_CHECK, kein Ausnahmewurf) und der Aufrufer
++ *  laesst das Bild aus.
++ *  KameraVorrat: bis zu acht Puffer gleicher Masse werden wiederverwendet,
++ *  sobald nur noch der Vorrat sie haelt (wie common_video/
++ *  video_frame_buffer_pool.cc). Im laufenden Betrieb wird dann gar nicht mehr
++ *  angefordert.
++ */
++#ifndef MODULES_VIDEO_CAPTURE_HC_KAMERA_PUFFER_H_
++#define MODULES_VIDEO_CAPTURE_HC_KAMERA_PUFFER_H_
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <limits>
++#include <new>
++#include <vector>
++
++#include "api/scoped_refptr.h"
++#include "api/video/video_frame_buffer.h"
++#include "rtc_base/ref_counted_object.h"
++#include "rtc_base/synchronization/mutex.h"
++
++namespace webrtc {
++namespace hc {
++
++class KameraPuffer : public I420BufferInterface {
++ public:
++  using Zeiger = scoped_refptr<RefCountedObject<KameraPuffer>>;
++
++  // nullptr, wenn die Masse nicht taugen oder der Speicher fehlt.
++  static Zeiger Anlegen(int width, int height, int stride_y, int stride_uv) {
++    if (width <= 0 || height <= 0 || stride_y < width ||
++        stride_uv < (width + 1) / 2) {
++      return nullptr;
++    }
++    const int64_t uv_zeilen = (int64_t{height} + 1) / 2;
++    const int64_t groesse =
++        int64_t{stride_y} * height + int64_t{2} * stride_uv * uv_zeilen;
++    if (groesse > std::numeric_limits<int32_t>::max()) {
++      return nullptr;
++    }
++    void* roh = std::malloc(static_cast<size_t>(groesse) + kAusrichtung - 1);
++    if (!roh) {
++      return nullptr;
++    }
++    RefCountedObject<KameraPuffer>* p = new (std::nothrow)
++        RefCountedObject<KameraPuffer>(roh, width, height, stride_y,
++                                       stride_uv);
++    if (!p) {
++      std::free(roh);
++      return nullptr;
++    }
++    return Zeiger(p);
++  }
++
++  int width() const override { return width_; }
++  int height() const override { return height_; }
++  const uint8_t* DataY() const override { return y_; }
++  const uint8_t* DataU() const override { return u_; }
++  const uint8_t* DataV() const override { return v_; }
++  int StrideY() const override { return stride_y_; }
++  int StrideU() const override { return stride_uv_; }
++  int StrideV() const override { return stride_uv_; }
++  uint8_t* MutableDataY() { return y_; }
++  uint8_t* MutableDataU() { return u_; }
++  uint8_t* MutableDataV() { return v_; }
++
++ protected:
++  KameraPuffer(void* roh, int width, int height, int stride_y, int stride_uv)
++      : roh_(roh),
++        width_(width),
++        height_(height),
++        stride_y_(stride_y),
++        stride_uv_(stride_uv) {
++    const uintptr_t a = (reinterpret_cast<uintptr_t>(roh) + kAusrichtung - 1) &
++                        ~static_cast<uintptr_t>(kAusrichtung - 1);
++    y_ = reinterpret_cast<uint8_t*>(a);
++    u_ = y_ + static_cast<size_t>(stride_y) * height;
++    v_ = u_ + static_cast<size_t>(stride_uv) * ((height + 1) / 2);
++  }
++  ~KameraPuffer() override { std::free(roh_); }
++
++ private:
++  static constexpr size_t kAusrichtung = 64;  // wie I420Buffer
++  void* const roh_;
++  const int width_;
++  const int height_;
++  const int stride_y_;
++  const int stride_uv_;
++  uint8_t* y_ = nullptr;
++  uint8_t* u_ = nullptr;
++  uint8_t* v_ = nullptr;
++};
++
++class KameraVorrat {
++ public:
++  KameraVorrat() { vorrat_.reserve(kMax); }
++
++  // Freier Puffer dieser Masse oder ein neuer; nullptr = kein Speicher.
++  KameraPuffer::Zeiger Holen(int width,
++                             int height,
++                             int stride_y,
++                             int stride_uv) {
++    MutexLock lock(&mutex_);
++    // Andere Masse (Aufloesungswechsel): aus dem Vorrat nehmen, wer sie noch
++    // haelt, gibt sie selbst frei.
++    vorrat_.erase(std::remove_if(vorrat_.begin(), vorrat_.end(),
++                                 [&](const KameraPuffer::Zeiger& b) {
++                                   return b->width() != width ||
++                                          b->height() != height ||
++                                          b->StrideY() != stride_y ||
++                                          b->StrideU() != stride_uv;
++                                 }),
++                  vorrat_.end());
++    for (const KameraPuffer::Zeiger& b : vorrat_) {
++      // Nur noch der Vorrat haelt ihn: niemand liest mehr daraus (HasOneRef
++      // liest mit acquire, die Freigabe zaehlt mit acq_rel herunter).
++      if (b->HasOneRef()) {
++        return b;
++      }
++    }
++    KameraPuffer::Zeiger neu =
++        KameraPuffer::Anlegen(width, height, stride_y, stride_uv);
++    if (neu && vorrat_.size() < kMax) {
++      vorrat_.push_back(neu);  // Kapazitaet steht seit dem Konstruktor
++    }
++    return neu;
++  }
++
++ private:
++  static constexpr size_t kMax = 8;
++  Mutex mutex_;
++  std::vector<KameraPuffer::Zeiger> vorrat_;
++};
++
++}  // namespace hc
++}  // namespace webrtc
++
++#endif  // MODULES_VIDEO_CAPTURE_HC_KAMERA_PUFFER_H_
+diff --git a/modules/video_capture/video_capture_impl.cc b/modules/video_capture/video_capture_impl.cc
+index e76af2e..ff06e57 100644
+--- a/modules/video_capture/video_capture_impl.cc
++++ b/modules/video_capture/video_capture_impl.cc
+@@ -199,8 +199,19 @@ int32_t VideoCaptureImpl::IncomingFrame(uint8_t* videoFrame,
+   // Setting absolute height (in case it was negative).
+   // In Windows, the image starts bottom left, instead of top left.
+   // Setting a negative source height, inverts the image (within LibYuv).
+-  scoped_refptr<I420Buffer> buffer = I420Buffer::Create(
+-      target_width, target_height, stride_y, stride_uv, stride_uv);
++  // HoneyCord: Puffer aus dem Vorrat statt I420Buffer::Create je Bild;
++  // nullptr = kein Speicher frei, dieses Bild auslassen statt RTC_CHECK
++  // (siehe hc_kamera_puffer.h).
++  hc::KameraPuffer::Zeiger buffer =
++      hc_vorrat_.Holen(target_width, target_height, stride_y, stride_uv);
++  if (!buffer) {
++    if (hc_verworfen_++ % 100 == 0) {
++      RTC_LOG(LS_WARNING) << "HoneyCord: Kamerabild verworfen, kein Speicher "
++                             "frei (bisher "
++                          << hc_verworfen_ << ")";
++    }
++    return -1;
++  }
+ 
+   libyuv::RotationMode rotation_mode = libyuv::kRotate0;
+   if (apply_rotation_) {
+diff --git a/modules/video_capture/video_capture_impl.h b/modules/video_capture/video_capture_impl.h
+index 96a3243..05a97e9 100644
+--- a/modules/video_capture/video_capture_impl.h
++++ b/modules/video_capture/video_capture_impl.h
+@@ -19,6 +19,7 @@
+ #include "api/video/video_frame.h"
+ #include "api/video/video_rotation.h"
+ #include "api/video/video_sink_interface.h"
++#include "modules/video_capture/hc_kamera_puffer.h"
+ #include "modules/video_capture/raw_video_sink_interface.h"
+ #include "modules/video_capture/video_capture.h"
+ #include "modules/video_capture/video_capture_config.h"
+@@ -129,6 +130,11 @@ class RTC_EXPORT VideoCaptureImpl : public VideoCaptureModule {
+   // Indicate whether rotation should be applied before delivered externally.
+   bool apply_rotation_ RTC_GUARDED_BY(api_lock_);
+ 
++  // HoneyCord (21.11.2026): wiederverwendete Kamerapuffer ohne RTC_CHECK bei
++  // Speichermangel, siehe hc_kamera_puffer.h.
++  hc::KameraVorrat hc_vorrat_;
++  int64_t hc_verworfen_ RTC_GUARDED_BY(api_lock_) = 0;
++
+   Clock* const clock_;
+ };
+ }  // namespace videocapturemodule

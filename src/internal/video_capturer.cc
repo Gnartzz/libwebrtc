@@ -16,6 +16,7 @@
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame_buffer.h"
 #include "api/video/video_rotation.h"
+#include "third_party/libyuv/include/libyuv/scale.h"
 
 namespace webrtc {
 namespace internal {
@@ -55,9 +56,33 @@ void VideoCapturer::OnFrame(const VideoFrame& frame) {
   if (out_height != frame.height() || out_width != frame.width()) {
     // Video adapter has requested a down-scale. Allocate a new buffer and
     // return scaled version.
-    webrtc::scoped_refptr<I420Buffer> scaled_buffer =
-        I420Buffer::Create(out_width, out_height);
-    scaled_buffer->ScaleFrom(*frame.video_frame_buffer()->ToI420());
+    // HoneyCord (21.11.2026): Zielpuffer aus dem Vorrat statt
+    // I420Buffer::Create je Bild -- dort beendet RTC_CHECK bei erschoepfter
+    // Windows-Zusagegrenze den Client (Stellar-Blade-Absturz, Kamerafaden).
+    // Ohne Speicher wird das Bild ausgelassen. Skaliert wie
+    // I420Buffer::ScaleFrom (libyuv::I420Scale, kFilterBox).
+    webrtc::hc::KameraPuffer::Zeiger scaled_buffer = skalier_vorrat_.Holen(
+        out_width, out_height, out_width, (out_width + 1) / 2);
+    if (!scaled_buffer) {
+      return;
+    }
+    webrtc::scoped_refptr<const webrtc::I420BufferInterface> quelle =
+        frame.video_frame_buffer()->ToI420();
+    if (!quelle) {
+      return;
+    }
+    if (libyuv::I420Scale(quelle->DataY(), quelle->StrideY(), quelle->DataU(),
+                          quelle->StrideU(), quelle->DataV(),
+                          quelle->StrideV(), quelle->width(), quelle->height(),
+                          scaled_buffer->MutableDataY(),
+                          scaled_buffer->StrideY(),
+                          scaled_buffer->MutableDataU(),
+                          scaled_buffer->StrideU(),
+                          scaled_buffer->MutableDataV(),
+                          scaled_buffer->StrideV(), out_width, out_height,
+                          libyuv::kFilterBox) != 0) {
+      return;
+    }
     broadcaster_.OnFrame(VideoFrame::Builder()
                              .set_video_frame_buffer(scaled_buffer)
                              .set_rotation(kVideoRotation_0)
