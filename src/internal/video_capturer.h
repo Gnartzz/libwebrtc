@@ -18,6 +18,7 @@
 #include "api/video/video_source_interface.h"
 #include "media/base/video_adapter.h"
 #include "media/base/video_broadcaster.h"
+#include "modules/video_capture/hc_kamera_puffer.h"
 #include "modules/video_capture/video_capture.h"
 #include "modules/video_capture/video_capture_factory.h"
 #include "pc/video_track_source.h"
@@ -61,6 +62,9 @@ class VideoCapturer : public webrtc::VideoSourceInterface<VideoFrame> {
 
   webrtc::VideoBroadcaster broadcaster_;
   webrtc::VideoAdapter video_adapter_;
+  // HoneyCord (21.11.2026): Zielpuffer fuer das Verkleinern, siehe
+  // modules/video_capture/hc_kamera_puffer.h.
+  webrtc::hc::KameraVorrat skalier_vorrat_;
 };
 }  // namespace internal
 }  // namespace webrtc
