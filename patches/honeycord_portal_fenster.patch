@@ -1,0 +1,85 @@
+--- a/modules/desktop_capture/linux/wayland/screencast_portal.cc
++++ b/modules/desktop_capture/linux/wayland/screencast_portal.cc
+@@ -28,6 +28,13 @@
+ #include "rtc_base/checks.h"
+ #include "rtc_base/logging.h"
+ 
++// HoneyCord (22.11.2026, Fenster unter Wayland): Zeilen nach hwenc.log. Die
++// Funktion liegt im Wrapper (src/linux/hwenc/hw_gemeinsam.cc) in derselben
++// libwebrtc.so; schwach gebunden, damit der Baum auch ohne Wrapper linkt.
++namespace libwebrtc {
++void Protokoll(const char* format, ...) __attribute__((weak, format(printf, 1, 2)));
++}  // namespace libwebrtc
++
+ namespace webrtc {
+ namespace {
+ 
+@@ -218,10 +225,42 @@
+   Scoped<char> variant_string;
+ 
+   g_variant_builder_init(&builder, G_VARIANT_TYPE_VARDICT);
+-  // We want to record monitor content.
+-  g_variant_builder_add(
+-      &builder, "{sv}", "types",
+-      g_variant_new_uint32(static_cast<uint32_t>(capture_source_type_)));
++  // HoneyCord (22.11.2026, Fenster unter Wayland): nur Quelltypen erfragen,
++  // die der Desktop anbietet (Eigenschaft AvailableSourceTypes, 1 Bildschirm,
++  // 2 Fenster, 4 virtuell). xdg-desktop-portal lehnt SelectSources mit einem
++  // nicht angebotenen Typ ab („Unsupported device type“) — ein Desktop ohne
++  // Fenster-Aufnahme bekaeme bei „Bildschirm oder Fenster“ sonst gar nichts.
++  // Ohne lesbare Eigenschaft bleibt es beim Bildschirm (alter Weg).
++  uint32_t types = static_cast<uint32_t>(capture_source_type_);
++  {
++    const uint32_t gewuenscht = types;
++    uint32_t angeboten = 0;
++    bool bekannt = false;
++    Scoped<GVariant> available(
++        g_dbus_proxy_get_cached_property(proxy_, "AvailableSourceTypes"));
++    if (available.get() &&
++        g_variant_is_of_type(available.get(), G_VARIANT_TYPE_UINT32)) {
++      g_variant_get(available.get(), "u", &angeboten);
++      bekannt = true;
++    }
++    if (bekannt && angeboten) {
++      types &= angeboten;
++      if (!types)
++        types = static_cast<uint32_t>(CaptureSourceType::kScreen);
++    } else if (types & static_cast<uint32_t>(CaptureSourceType::kWindow)) {
++      types = static_cast<uint32_t>(CaptureSourceType::kScreen);
++    }
++    RTC_LOG(LS_INFO) << "ScreenCast types: gewuenscht=" << gewuenscht
++                     << " angeboten=" << (bekannt ? (int)angeboten : -1)
++                     << " gesendet=" << types;
++    if (libwebrtc::Protokoll)
++      libwebrtc::Protokoll(
++          "Portal: Quelltypen gewuenscht=%u angeboten=%d gesendet=%u "
++          "(1 Bildschirm, 2 Fenster, 4 virtuell)",
++          gewuenscht, bekannt ? (int)angeboten : -1, types);
++  }
++  g_variant_builder_add(&builder, "{sv}", "types",
++                        g_variant_new_uint32(types));
+   // We don't want to allow selection of multiple sources.
+   g_variant_builder_add(&builder, "{sv}", "multiple",
+                         g_variant_new_boolean(false));
+@@ -390,6 +429,21 @@
+         that->capture_source_type_ =
+             static_cast<ScreenCastPortal::CaptureSourceType>(type);
+       }
++      // HoneyCord: was der Nutzer im Dialog gewaehlt hat (Beleg im hwenc.log).
++      if (libwebrtc::Protokoll) {
++        int32_t pos_x = 0, pos_y = 0, w = 0, h = 0;
++        g_variant_lookup(options.get(), "position", "(ii)", &pos_x, &pos_y);
++        g_variant_lookup(options.get(), "size", "(ii)", &w, &h);
++        libwebrtc::Protokoll(
++            "Portal: gewaehlt Strom %u, Quelltyp %u (%s), %dx%d", stream_id,
++            static_cast<uint32_t>(that->capture_source_type_),
++            static_cast<uint32_t>(that->capture_source_type_) == 2
++                ? "Fenster"
++                : (static_cast<uint32_t>(that->capture_source_type_) == 1
++                       ? "Bildschirm"
++                       : "anderes"),
++            w, h);
++      }
+ 
+       that->pw_stream_node_id_ = stream_id;
+ 

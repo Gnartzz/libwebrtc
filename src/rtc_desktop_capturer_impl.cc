@@ -27,6 +27,10 @@
 #endif
 #if defined(WEBRTC_LINUX) && defined(USE_LINUX_HWENC)
 #include "src/linux/hwenc/ffmpeg/hw_nullkopie.h"
+#include "src/linux/hwenc/hw_gemeinsam.h"
+#endif
+#if defined(WEBRTC_LINUX)
+#include <cstdlib>
 #endif
 
 namespace libwebrtc {
@@ -73,12 +77,41 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
 #endif
   thread_->BlockingCall([this, type, showCursor] {
     if (type == kScreen) {
+      std::unique_ptr<webrtc::DesktopCapturer> roh;
+#if defined(WEBRTC_LINUX) && defined(WEBRTC_USE_PIPEWIRE)
+      // honeycord (22.11.2026, Fenster unter Wayland): Die Sammelquelle
+      // „Bildschirm“ der Medienliste fragt das Portal nach Bildschirm ODER
+      // Fenster (CaptureType::kAnyScreenContent, wie Chromium/Firefox fuer
+      // getDisplayMedia). Vorher kam nur CreateScreenCapturer = kScreen, der
+      // Dialog bot nur Bildschirme an. Ein Fenster ueber kWindow ginge nicht:
+      // Start() ruft fuer kWindow FocusOnSelectedSource(), das
+      // BaseCapturerPipeWire nicht kennt (Vorgabe DesktopCapturer: false) —
+      // die Aufnahme scheiterte sofort mit CS_FAILED. Welche Typen der Desktop
+      // wirklich anbietet, prueft screencast_portal.cc (AvailableSourceTypes,
+      // patches/honeycord_portal_fenster.patch). Rueckweg fuer die Diagnose:
+      // HONEYCORD_PORTAL_NUR_BILDSCHIRM=1.
+      const char* nur = getenv("HONEYCORD_PORTAL_NUR_BILDSCHIRM");
+      if (!(nur && nur[0] == '1')) {
+        roh = webrtc::DesktopCapturer::CreateGenericCapturer(options_);
+      }
+#if defined(USE_LINUX_HWENC)
+      if (webrtc::DesktopCapturer::IsRunningUnderWayland()) {
+        libwebrtc::Protokoll(
+            "Freigabe: Portal fragt nach %s",
+            roh ? "Bildschirm oder Fenster"
+                : (nur && nur[0] == '1'
+                       ? "Bildschirm (HONEYCORD_PORTAL_NUR_BILDSCHIRM=1)"
+                       : "Bildschirm"));
+      }
+#endif
+#endif
+      if (!roh) roh = webrtc::DesktopCapturer::CreateScreenCapturer(options_);
       if (showCursor) {
         capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
-            webrtc::DesktopCapturer::CreateScreenCapturer(options_), options_);
+            std::move(roh), options_);
       } else {
         capturer_ = webrtc::DesktopAndCursorComposer::CreateWithoutMouseCursorMonitor(
-                webrtc::DesktopCapturer::CreateScreenCapturer(options_));
+                std::move(roh));
       }
     } else {
       capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
