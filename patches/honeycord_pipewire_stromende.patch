@@ -29,7 +29,21 @@
  
    // PipeWire types
    std::unique_ptr<PipeWireInitializer> pw_initializer_;
-@@ -269,6 +284,20 @@
+@@ -158,6 +173,13 @@
+ 
+   spa_hook spa_core_listener_;
+   spa_hook spa_stream_listener_;
++  // HoneyCord (22.11.2026): Registry, um das Verschwinden des Quellknotens zu
++  // bemerken (gemessen sway/xdpw: Ausgabe abgezogen -> Strom nur PAUSED, die
++  // Portal-Sitzung bleibt offen, der Knoten der Quelle wird entfernt).
++  pw_registry* pw_registry_ = nullptr;
++  spa_hook spa_registry_listener_;
++  pw_registry_events pw_registry_events_ = {};
++  static void OnRegistryGlobalRemove(void* data, uint32_t id);
+ 
+   // A number used to verify all previous methods and the resulting
+   // events have been handled.
+@@ -269,6 +291,20 @@
  
    RTC_LOG(LS_INFO) << "PipeWire stream state: "
                     << pw_stream_state_as_string(state);
@@ -50,7 +64,25 @@
  
    switch (state) {
      case PW_STREAM_STATE_ERROR:
-@@ -478,6 +507,8 @@
+@@ -287,6 +323,17 @@
+ }
+ 
+ // static
++void SharedScreenCastStreamPrivate::OnRegistryGlobalRemove(void* data,
++                                                           uint32_t id) {
++  SharedScreenCastStreamPrivate* that =
++      static_cast<SharedScreenCastStreamPrivate*>(data);
++  if (!that || id != that->pw_stream_node_id_) return;
++  that->honeycord_beendet_ = true;
++  if (libwebrtc::Protokoll)
++    libwebrtc::Protokoll("PipeWire: Quellknoten %u entfernt — Aufnahme endet", id);
++}
++
++// static
+ void SharedScreenCastStreamPrivate::OnStreamParamChanged(
+     void* data,
+     uint32_t id,
+@@ -478,6 +525,8 @@
    height_ = height;
    callback_ = callback;
    is_cursor_embedded_ = is_cursor_embedded;
@@ -59,7 +91,35 @@
    if (!InitializePipeWire()) {
      RTC_LOG(LS_ERROR) << "Unable to open PipeWire library";
      return false;
-@@ -1173,6 +1204,10 @@
+@@ -534,6 +583,14 @@
+ 
+     pw_core_add_listener(pw_core_, &spa_core_listener_, &pw_core_events_, this);
+ 
++    pw_registry_events_.version = PW_VERSION_REGISTRY_EVENTS;
++    pw_registry_events_.global_remove = &OnRegistryGlobalRemove;
++    pw_registry_ = pw_core_get_registry(pw_core_, PW_VERSION_REGISTRY, 0);
++    if (pw_registry_) {
++      pw_registry_add_listener(pw_registry_, &spa_registry_listener_,
++                               &pw_registry_events_, this);
++    }
++
+     // Add an event that can be later invoked by pw_loop_signal_event()
+     renegotiate_ = pw_loop_add_event(pw_thread_loop_get_loop(pw_main_loop_),
+                                      OnRenegotiateFormat, this);
+@@ -676,6 +733,12 @@
+     }
+   }
+ 
++  if (pw_registry_) {
++    spa_hook_remove(&spa_registry_listener_);
++    pw_proxy_destroy(reinterpret_cast<pw_proxy*>(pw_registry_));
++    pw_registry_ = nullptr;
++  }
++
+   if (pw_core_) {
+     pw_core_disconnect(pw_core_);
+     pw_core_ = nullptr;
+@@ -1173,6 +1236,10 @@
    return private_->CaptureFrame();
  }
  
