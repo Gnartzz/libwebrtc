@@ -1,0 +1,101 @@
+--- a/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
++++ b/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc
+@@ -48,6 +48,13 @@
+ #include "modules/desktop_capture/desktop_region.h"
+ #include "modules/desktop_capture/linux/wayland/egl_dmabuf.h"
+ #include "modules/desktop_capture/linux/wayland/honeycord_dmabuf.h"
++
++#include <atomic>
++
++// HoneyCord (22.11.2026): Zeilen nach hwenc.log (Wrapper, schwach gebunden).
++namespace libwebrtc {
++void Protokoll(const char* format, ...) __attribute__((weak, format(printf, 1, 2)));
++}  // namespace libwebrtc
+ #include "modules/desktop_capture/linux/wayland/screencast_stream_utils.h"
+ #include "modules/desktop_capture/mouse_cursor.h"
+ #include "modules/desktop_capture/screen_capture_frame_queue.h"
+@@ -147,6 +154,14 @@
+   // HoneyCord (Null-Kopie): Neuverhandlungen wegen eines Modifiers, den die
+   // Grafikkarte nicht uebernimmt -- hoechstens eine je Strom.
+   int honeycord_neuverhandelt_ = 0;
++  // HoneyCord (22.11.2026): Der Strom lief schon und ist danach getrennt bzw.
++  // fehlerhaft (Quelle weg, z. B. Ausgabe abgezogen) — ohne dass das Portal
++  // die Sitzung schliesst. BaseCapturerPipeWire meldet dann ERROR_PERMANENT,
++  // statt das letzte Bild endlos zu wiederholen.
++ public:
++  std::atomic<bool> honeycord_lief_{false};
++  std::atomic<bool> honeycord_beendet_{false};
++ private:
+ 
+   // PipeWire types
+   std::unique_ptr<PipeWireInitializer> pw_initializer_;
+@@ -269,6 +284,20 @@
+ 
+   RTC_LOG(LS_INFO) << "PipeWire stream state: "
+                    << pw_stream_state_as_string(state);
++  if (state == PW_STREAM_STATE_PAUSED || state == PW_STREAM_STATE_STREAMING) {
++    that->honeycord_lief_ = true;
++  } else if ((state == PW_STREAM_STATE_UNCONNECTED ||
++              state == PW_STREAM_STATE_ERROR) &&
++             that->honeycord_lief_.load()) {
++    that->honeycord_beendet_ = true;
++  }
++  if (libwebrtc::Protokoll)
++    libwebrtc::Protokoll("PipeWire-Strom: %s -> %s%s%s%s",
++                         pw_stream_state_as_string(old_state),
++                         pw_stream_state_as_string(state),
++                         error_message ? " (" : "",
++                         error_message ? error_message : "",
++                         error_message ? ")" : "");
+ 
+   switch (state) {
+     case PW_STREAM_STATE_ERROR:
+@@ -478,6 +507,8 @@
+   height_ = height;
+   callback_ = callback;
+   is_cursor_embedded_ = is_cursor_embedded;
++  honeycord_lief_ = false;
++  honeycord_beendet_ = false;
+   if (!InitializePipeWire()) {
+     RTC_LOG(LS_ERROR) << "Unable to open PipeWire library";
+     return false;
+@@ -1173,6 +1204,10 @@
+   return private_->CaptureFrame();
+ }
+ 
++bool SharedScreenCastStream::HoneycordStromBeendet() const {
++  return private_->honeycord_beendet_.load();
++}
++
+ std::unique_ptr<MouseCursor> SharedScreenCastStream::CaptureCursor() {
+   return private_->CaptureCursor();
+ }
+--- a/modules/desktop_capture/linux/wayland/shared_screencast_stream.h
++++ b/modules/desktop_capture/linux/wayland/shared_screencast_stream.h
+@@ -74,6 +74,10 @@
+   // from PipeWire buffer.
+   std::unique_ptr<SharedDesktopFrame> CaptureFrame();
+ 
++  // HoneyCord (22.11.2026): Der PipeWire-Strom lief und ist getrennt bzw.
++  // fehlerhaft (die Quelle ist weg), ohne dass das Portal die Sitzung schloss.
++  bool HoneycordStromBeendet() const;
++
+   // Returns the most recent mouse cursor image. Will return an nullptr cursor
+   // in case we didn't manage to get a cursor from PipeWire buffer. NOTE: the
+   // cursor image might not be updated on every cursor location change, but
+--- a/modules/desktop_capture/linux/wayland/base_capturer_pipewire.cc
++++ b/modules/desktop_capture/linux/wayland/base_capturer_pipewire.cc
+@@ -162,6 +162,13 @@
+ 
+ void BaseCapturerPipeWire::CaptureFrame() {
+   TRACE_EVENT0("webrtc", "BaseCapturerPipeWire::CaptureFrame");
++  // HoneyCord (22.11.2026): Endet nur der PipeWire-Strom (Quelle weg, das
++  // Portal schliesst die Sitzung nicht — gemessen sway/xdpw beim Abziehen der
++  // Ausgabe), endgueltig melden statt das letzte Bild zu wiederholen.
++  if (!capturer_failed_ && options_.screencast_stream() &&
++      options_.screencast_stream()->HoneycordStromBeendet()) {
++    capturer_failed_ = true;
++  }
+   if (capturer_failed_) {
+     // This could be recoverable if the source list is re-summoned; but for our
+     // purposes this is fine, since it requires intervention to resolve and

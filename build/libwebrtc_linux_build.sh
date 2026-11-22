@@ -107,6 +107,14 @@ cd src
 git apply "libwebrtc/patches/custom_audio_source_m144.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
 git apply "libwebrtc/patches/add_libwebrtc_build_target.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
 git apply "libwebrtc/patches/fix_desktop_capture_compile.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
+# HoneyCord-Baum-Patches (Linux), in dieser Reihenfolge — sie bauen aufeinander auf:
+#   Null-Kopie der Freigabe (hwenc.14), V4L2-Kamera unkomprimiert (hwenc.17),
+#   Bildschirm ODER Fenster im Portal (hwenc.18), Ende nur des PipeWire-Stroms
+#   erkennen (hwenc.18). Bis hwenc.17 wurden sie auf der Baumaschine von Hand
+#   eingespielt; seit hwenc.18 gehoeren sie zum Bauweg.
+for p in honeycord_pipewire_nullkopie honeycord_v4l2_kamera honeycord_portal_fenster honeycord_pipewire_stromende; do
+  git apply "libwebrtc/patches/$p.patch" -v --whitespace=nowarn
+done
 cd ..
 
 mkdir -p "$ARTIFACTS_DIR/lib"

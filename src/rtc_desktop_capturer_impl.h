@@ -98,6 +98,9 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   // eines freigegebenen erben und das alte Ergebnis bekommen.
   webrtc::scoped_refptr<webrtc::RefCountInterface> letztes_nativ_;
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> letztes_aus_;
+  int64_t letztes_gesendet_ms_ = 0;   // honeycord: letztes weitergegebenes Bild
+  int64_t zaehler_seit_ms_ = 0;
+  int neu_ = 0, wiederholt_ = 0;
   webrtc::scoped_refptr<webrtc::I420Buffer> scaled_buffer_;
 };
 

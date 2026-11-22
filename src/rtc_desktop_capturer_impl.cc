@@ -275,7 +275,18 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
   // NICHT gefuellt und werden nicht angefasst.
   if (frame->honeycord_nativ()) {
     if (frame->honeycord_nativ() == letztes_nativ_ && letztes_aus_) {
-      OnFrame(webrtc::VideoFrame(letztes_aus_, 0, webrtc::TimeMillis(),
+      // honeycord (22.11.2026): Kein neues PipeWire-Bild seit dem letzten
+      // Abholen. Abgefragt wird mit doppelter Bildrate (s. Start), vorher ging
+      // jedes Mal derselbe Puffer erneut hinaus — gemessen am Encoder 120
+      // statt 60 Bilder je Sekunde, wenn kein Bildraten-Deckel griff, und mit
+      // Deckel entschied der Zufall, ob das neue oder das wiederholte Bild
+      // durchkam. Jetzt nur noch als Lebenszeichen bei ruhigem Bild (fuer
+      // Schluesselbilder neuer Zuschauer), hoechstens alle 200 ms.
+      const int64_t jetzt = webrtc::TimeMillis();
+      if (jetzt - letztes_gesendet_ms_ < 200) return;
+      letztes_gesendet_ms_ = jetzt;
+      ++wiederholt_;
+      OnFrame(webrtc::VideoFrame(letztes_aus_, 0, jetzt,
                                  webrtc::kVideoRotation_0));
       return;
     }
@@ -304,7 +315,18 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
     }
     letztes_nativ_ = frame->honeycord_nativ();
     letztes_aus_ = gpu;
-    OnFrame(webrtc::VideoFrame(gpu, 0, webrtc::TimeMillis(),
+    letztes_gesendet_ms_ = webrtc::TimeMillis();
+    ++neu_;
+    if (letztes_gesendet_ms_ - zaehler_seit_ms_ >= 30000) {
+      if (zaehler_seit_ms_ > 0)
+        libwebrtc::Protokoll(
+            "Aufnehmer (30 s): %d neue Bilder, %d Lebenszeichen weitergegeben",
+            neu_, wiederholt_);
+      zaehler_seit_ms_ = letztes_gesendet_ms_;
+      neu_ = 0;
+      wiederholt_ = 0;
+    }
+    OnFrame(webrtc::VideoFrame(gpu, 0, letztes_gesendet_ms_,
                                webrtc::kVideoRotation_0));
     return;
   }
