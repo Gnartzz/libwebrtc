@@ -3,11 +3,15 @@
 #include <fcntl.h>
 #include "src/linux/hwenc/ffmpeg/ratenregeln.h"
 #include "src/linux/hwenc/ffmpeg/hw_nullkopie.h"
+#include "src/linux/hwenc/ffmpeg/va_treiber.h"
 #include "src/linux/hwenc/hw_gemeinsam.h"
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <cstring>
 #include <cstdarg>
@@ -105,7 +109,9 @@ bool WegGeht(const char* encoder, enum AVHWDeviceType typ, const char* name) {
     return false;
   }
   AVBufferRef* geraet = nullptr;
-  const int r = api.av_hwdevice_ctx_create(&geraet, typ, nullptr, nullptr, 0);
+  const int r = typ == AV_HWDEVICE_TYPE_VAAPI
+                    ? vatreiber::GeraetErzeugen(&geraet, "Encoder-Probe")
+                    : api.av_hwdevice_ctx_create(&geraet, typ, nullptr, nullptr, 0);
   if (r < 0 || !geraet) {
     RTC_LOG(LS_INFO) << "[hwenc] " << name << "-Gerät nicht zu öffnen ("
                      << ffmpeg::FehlerText(r) << ")";
@@ -175,15 +181,55 @@ struct Spaeter {
 };
 std::mutex g_spaeter_sperre;
 std::vector<Spaeter>* g_spaeter = new std::vector<Spaeter>();  // nie zerstört
+// Prüfbefund N4: Kommt nach dem letzten Abgeben kein Encoder mehr (Gespräch
+// vorbei), räumt ein kurzlebiger Zeitgeber-Faden die fälligen Reste weg und
+// endet, sobald nichts mehr wartet. Am Prozessende gibt er nichts mehr frei
+// (`g_prozess_endet`, gesetzt aus atexit unter der Umbau-Sperre) — kein
+// Treiberaufruf, während Bibliotheken abgebaut werden.
+bool g_zeitgeber_laeuft = false;   // unter g_spaeter_sperre
+bool g_prozess_endet = false;      // unter VaUmbauSperre()
+
+void SpaeterAufraeumen();
+
+void ZeitgeberStarten() {
+  static std::once_flag einmal;
+  std::call_once(einmal, [] {
+    std::atexit([] {
+      std::lock_guard<std::recursive_mutex> umbau(VaUmbauSperre());
+      g_prozess_endet = true;
+    });
+  });
+  {
+    std::lock_guard<std::mutex> halt(g_spaeter_sperre);
+    if (g_zeitgeber_laeuft) return;
+    g_zeitgeber_laeuft = true;
+  }
+  std::thread([] {
+    while (true) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kSpaeterMs + 100));
+      SpaeterAufraeumen();
+      std::lock_guard<std::mutex> halt(g_spaeter_sperre);
+      if (g_spaeter->empty()) {
+        g_zeitgeber_laeuft = false;
+        return;
+      }
+    }
+  }).detach();
+}
 
 void SpaeterFreigeben(AVBufferRef** ref) {
   if (!ref || !*ref) return;
-  std::lock_guard<std::mutex> halt(g_spaeter_sperre);
-  g_spaeter->push_back({*ref, webrtc::TimeMillis() + kSpaeterMs});
-  *ref = nullptr;
+  {
+    std::lock_guard<std::mutex> halt(g_spaeter_sperre);
+    g_spaeter->push_back({*ref, webrtc::TimeMillis() + kSpaeterMs});
+    *ref = nullptr;
+  }
+  ZeitgeberStarten();
 }
 
-// Fällige Freigaben ausführen (außerhalb der Sperre).
+// Fällige Freigaben ausführen. Prüfbefund M5: das Freigeben (vaDestroy… /
+// vaTerminate) ist ein Abbau wie jeder andere — unter der Umbau-Sperre und
+// danach vermerkt, damit ein gleichzeitiges Anlegen die Ruhezeit abwartet.
 void SpaeterAufraeumen() {
   std::vector<AVBufferRef*> faellig;
   {
@@ -201,7 +247,10 @@ void SpaeterAufraeumen() {
   }
   if (faellig.empty()) return;
   const auto& api = ffmpeg::Zugriff();
+  std::lock_guard<std::recursive_mutex> umbau(VaUmbauSperre());
+  if (g_prozess_endet) return;   // am Prozessende liegen lassen
   for (AVBufferRef* r : faellig) api.av_buffer_unref(&r);
+  VaAbbauVermerken();
 }
 }  // namespace
 
@@ -233,13 +282,15 @@ bool KameraInSoftware() {
       treiber = VaTreiber(g);
       ffmpeg::Zugriff().av_buffer_unref(&g);
     }
-    const std::string knoten = SysfsZeile("/sys/class/drm/renderD128/device/vendor");
+    const std::string va_knoten = vatreiber::VaKnoten();
+    const std::string knoten =
+        va_knoten.empty() ? "?" : SysfsZeile("/sys/class/drm/" + va_knoten + "/device/vendor");
     const bool amd = treiber.find("AMD") != std::string::npos ||
                      treiber.find("radeonsi") != std::string::npos ||
                      (treiber == "?" && knoten == "0x1002");
-    Protokoll("Kamera: %s (VA-Treiber %s, renderD128 %s)",
+    Protokoll("Kamera: %s (VA-Treiber %s, %s %s)",
               amd ? "Software (HC_KAMERA_SW=1, AMD-Übergang)" : "VA-API (HC_KAMERA_SW nur auf AMD)",
-              treiber.c_str(), knoten.c_str());
+              treiber.c_str(), va_knoten.empty() ? "kein Knoten" : va_knoten.c_str(), knoten.c_str());
     return amd;
   }();
   return sw;
@@ -391,8 +442,7 @@ int32_t HwH264Encoder::CodecOeffnen() {
         geraet_uebernommen_ = false;
         geraet_neu_ = true;
         gewartet_ms += VaRuheAbwarten();
-        r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI,
-                                       nullptr, nullptr, 0);
+        r = vatreiber::GeraetErzeugen(&hw_device_, "Encoder");
       }
     }
     if (r < 0 || !hw_device_) {
@@ -607,6 +657,7 @@ int32_t HwH264Encoder::CodecOeffnen() {
   // eines.
   frame_index_ = 0;
   bilder_seit_oeffnen_ = 0;
+  versuche_seit_oeffnen_ = 0;
   stempel_.clear();
   oeffnen_scheiterte_ = false;
   misslungene_versuche_ = 0;
@@ -919,7 +970,11 @@ int32_t HwH264Encoder::Encode(
   }
   const int64_t t2 = webrtc::TimeMicros();
   const int64_t pts = frame_index_++;
-  ++bilder_seit_oeffnen_;
+  // Prüfbefund M6: `bilder_seit_oeffnen_` zählt erst NACH einem gelungenen
+  // send_frame (unten) — scheitert das erste Bild vorher (Bildpuffer,
+  // Hochladen, send_frame), hat der Encoder kein Bild, und das Leeren beim
+  // Schließen darf kein send_frame(NULL) schicken (SIGSEGV in FFmpeg 7.1.5).
+  ++versuche_seit_oeffnen_;
   sw_frame_->pts = pts;
   sw_frame_->pict_type = keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
   if (keyframe) keyframe_angefordert_ = true;
@@ -969,6 +1024,18 @@ int32_t HwH264Encoder::Encode(
   }
   const int64_t t3 = webrtc::TimeMicros();
 
+  // Testschalter (Prüffall M6, test/neuaufsetzen_test.cc --erstes-bild-fehler):
+  // HC_TEST_ERSTES_BILD_FEHLER=1 lässt das erste Bild nach jedem Öffnen an
+  // dieser Stelle scheitern, wie ein Fehler aus send_frame.
+  static const bool test_erstes_bild_fehler = [] {
+    const char* e = std::getenv("HC_TEST_ERSTES_BILD_FEHLER");
+    return e && std::strcmp(e, "1") == 0;
+  }();
+  if (test_erstes_bild_fehler && versuche_seit_oeffnen_ == 1) {
+    RTC_LOG(LS_ERROR) << "[hwenc] send_frame: Testfehler (HC_TEST_ERSTES_BILD_FEHLER)";
+    stempel_.erase(pts);
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
   r = api.avcodec_send_frame(ctx_, hinein);
   if (r == AVERROR(EAGAIN)) {
     // ★ EAGAIN heißt „nimm erst die Ausgabe ab und schick DASSELBE Bild
@@ -983,6 +1050,7 @@ int32_t HwH264Encoder::Encode(
     stempel_.erase(pts);
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
+  ++bilder_seit_oeffnen_;   // erst jetzt hat der Encoder ein Bild (M6)
 
   PaketeAbholen();
 
@@ -1033,8 +1101,11 @@ void HwH264Encoder::PaketAbliefern() {
     if (packet_->size > 0 && packet_->data) {
       encoded_image_.SetEncodedData(webrtc::EncodedImageBuffer::Create(
           packet_->data, static_cast<size_t>(packet_->size)));
-      encoded_image_._encodedWidth = width_;
-      encoded_image_._encodedHeight = height_;
+      // Prüfbefund N3: die Maße des Kontexts, der das Paket erzeugt hat — beim
+      // Größenwechsel leert `CodecOeffnen` den ALTEN Kontext, während
+      // width_/height_ schon die neue Größe tragen.
+      encoded_image_._encodedWidth = ctx_ ? ctx_->width : width_;
+      encoded_image_._encodedHeight = ctx_ ? ctx_->height : height_;
       // Die Zeitangaben des Bildes, das DIESES Paket erzeugt hat.
       const auto es = stempel_.find(packet_->pts);
       const Stempel st = (es != stempel_.end()) ? es->second : Stempel();

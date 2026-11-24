@@ -281,6 +281,9 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   // hwenc.19: Bilder, die seit dem letzten Öffnen in den Encoder gingen
   // (0 = nichts zu leeren; s. `EncoderLeeren`).
   int64_t bilder_seit_oeffnen_ = 0;
+  // Bilder, die seit dem Öffnen in `Encode` ankamen (auch gescheiterte) —
+  // nur für den Testschalter HC_TEST_ERSTES_BILD_FEHLER.
+  int64_t versuche_seit_oeffnen_ = 0;
   int misslungene_versuche_ = 0;
   int64_t wiederanlauf_zaehler_ = 0;
   // Einmalige Warnung, wenn ein angefordertes Keyframe nicht als solches

@@ -18,7 +18,7 @@ namespace libwebrtc {
 // 512 KB). Fadensicher.
 void Protokoll(const char* format, ...) __attribute__((format(printf, 1, 2)));
 
-// Wahr, wenn sich /dev/dri/renderD128 oder renderD129 öffnen lässt.
+// Wahr, wenn sich irgendein /dev/dri/renderD* öffnen lässt.
 bool RenderKnotenDa();
 
 // Eine Zeile aus sysfs/proc, ohne Zeilenende; „?" wenn nicht lesbar.

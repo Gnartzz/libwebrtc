@@ -33,6 +33,11 @@
 //                  (hwenc.19-Übergang: Encode liefert FALLBACK_SOFTWARE).
 //   --erwarte-software  bestanden, wenn JEDER Encoder beim ersten Bild auf
 //                  Software zurückfällt und keine VA-Sitzung öffnet.
+//   --erstes-bild-fehler  Prüffall M6: das erste Bild nach jedem Öffnen
+//                  scheitert (HC_TEST_ERSTES_BILD_FEHLER=1); bestanden, wenn
+//                  genau diese Bilder scheitern und das Schließen danach (ohne
+//                  ein Bild im Encoder) nicht abstürzt. Mit --weg release
+//                  --alle 1 folgt auf JEDES gescheiterte Bild ein Release.
 //
 // Rückgabe 0 = bestanden: jedes Bild angenommen, nach jedem Neuaufsetzen zuerst
 // ein Schlüsselbild, kein Hänger (> 5 s ohne Ausgabe). „ohne Paket" zählt
@@ -63,6 +68,7 @@
 #include "modules/video_coding/include/video_error_codes.h"
 #include "src/linux/hwenc/ffmpeg/hw_h264_encoder.h"
 #include "src/linux/hwenc/ffmpeg/hw_nullkopie.h"
+#include "src/linux/hwenc/ffmpeg/va_treiber.h"
 
 namespace {
 
@@ -86,6 +92,7 @@ struct Optionen {
   int bilder = 0;
   bool bildschirm = false;
   bool erwarte_software = false;
+  bool erstes_fehler = false;
 };
 
 std::atomic<bool> g_halt{false};
@@ -292,11 +299,13 @@ int main(int argc, char** argv) {
     else if (a == "--bilder") o.bilder = std::atoi(Wert());
     else if (a == "--bildschirm") o.bildschirm = true;
     else if (a == "--erwarte-software") o.erwarte_software = true;
+    else if (a == "--erstes-bild-fehler") o.erstes_fehler = true;
     else {
       std::printf("FEHL: unbekannt %s\n", a.c_str());
       return 2;
     }
   }
+  if (o.erstes_fehler) setenv("HC_TEST_ERSTES_BILD_FEHLER", "1", 1);
   const webrtc::Environment env = webrtc::CreateEnvironment();
   (void)env;
   if (!libwebrtc::HwH264Encoder::IstVerfuegbar()) {
@@ -304,6 +313,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::printf("Encoder: %s\n", libwebrtc::HwH264Encoder::BackendName().c_str());
+  std::printf("VA-Treiber: %s\n", libwebrtc::vatreiber::Lage().c_str());
   if (o.geteilt) {
     std::printf("Gemeinsames VA-Gerät (Null-Kopie): %s\n",
                 libwebrtc::nullkopie::Einrichten() ? "an" : "AUS");
@@ -376,6 +386,11 @@ int main(int argc, char** argv) {
       continue;
     }
     if (e.software_bei >= 0) ok = false;
+    if (o.erstes_fehler) {
+      // Jedes Öffnen (das erste + jedes Neuaufsetzen) kostet genau ein Bild.
+      if (e.fehler != e.neu + 1 || e.neu_fehler) ok = false;
+      continue;
+    }
     if (e.fehler || e.neu_fehler || e.ohne_schluessel) ok = false;
   }
   if (gl_bilder) std::printf("GL-Last: %d Bilder gezeichnet\n", gl);

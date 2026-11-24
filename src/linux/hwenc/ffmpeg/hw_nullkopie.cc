@@ -30,6 +30,7 @@ extern "C" {
 #include "rtc_base/logging.h"
 #include "rtc_base/time_utils.h"
 #include "src/linux/hwenc/ffmpeg/ffmpeg_lader.h"
+#include "src/linux/hwenc/ffmpeg/va_treiber.h"
 #include "src/linux/hwenc/ffmpeg/hw_h264_encoder.h"
 #include "src/linux/hwenc/hw_gemeinsam.h"
 
@@ -581,7 +582,7 @@ bool EinrichtenIntern() {
   int r = 0;
   va->geraet = VaDauerGeraetRef();
   if (!va->geraet)
-    r = api.av_hwdevice_ctx_create(&va->geraet, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0);
+    r = vatreiber::GeraetErzeugen(&va->geraet, "Null-Kopie");
   if (r < 0 || !va->geraet) {
     Protokoll("Null-Kopie: VA-Gerät nicht zu öffnen (%s) — alter Weg",
               ffmpeg::FehlerText(r).c_str());

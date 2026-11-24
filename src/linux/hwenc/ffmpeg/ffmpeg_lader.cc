@@ -10,6 +10,7 @@
 
 #include "rtc_base/logging.h"
 #include "src/linux/hwenc/hw_gemeinsam.h"
+#include "src/linux/hwenc/ffmpeg/va_treiber.h"
 
 namespace libwebrtc {
 namespace ffmpeg {
@@ -60,57 +61,6 @@ std::string EigenerOrdner() {
   return s == std::string::npos ? "" : pfad.substr(0, s + 1);
 }
 
-// ── Mitgelieferter VA-Treiber für AMD (hwenc.19, 24.11.2026) ────────────────
-//
-// ★★ URSACHE der VCN-Hänger, GEMESSEN auf dem UM890 (Radeon 780M, VCN 4.0.2,
-// Firmware 0x09118037, Mesa 26.2.7 / 26.3.1 / main): Mesa legt den 128 KB
-// großen Sitzungsspeicher des VCN-Encoders (radeon_vcn_enc.c, `enc->si`) aus
-// seinem Wiederverwendungs-Vorrat an, OHNE ihn zu löschen. Trägt er alten
-// Inhalt — eine geschlossene Sitzung oder irgendetwas, das im selben Prozess
-// freigegeben wurde, z. B. Texturdaten von Qt/Flutter über OpenGL —, greift
-// die VCN-Firmware beim ERSTEN Bild der neuen Sitzung daneben (Seitenfehler an
-// 0x0 + Versatz bzw. an „Adressen" aus Bilddaten), der Ring läuft in den
-// Timeout, Mesa bricht den Prozess ab, und fremde VCN-Nutzer (Sunshine)
-// stürzen mit. Belegt mit einem eigenen Mesa-Bau: nur diesen Puffer löschen
-// → 360 Öffnungen ohne Befund statt Absturz nach 10–26; nur das DPB löschen
-// hilft nicht.
-//
-// Von außen ist das nicht zu umgehen (der Vorrat gehört Mesa und wird mit
-// OpenGL geteilt). Deshalb liefern die Pakete einen radeonsi-VA-Treiber mit
-// genau dieser Korrektur mit (infra/webrtc-patches bzw. patches/
-// honeycord_mesa_vcn_sitzungsspeicher.patch): `hc-va/radeonsi_drv_video.so`
-// neben dieser Bibliothek. Auf AMD-Grafik steht sein Ordner VOR den
-// Systempfaden; lässt er sich nicht laden, nimmt libva den Systemtreiber.
-// Andere Hersteller berührt das nicht (nur der Treibername radeonsi liegt
-// dort). HC_VA_TREIBER=0 schaltet es ab.
-std::string g_va_treiber_lage = "System";
-
-void VaTreiberWaehlen(const std::string& ordner) {
-  const char* aus = std::getenv("HC_VA_TREIBER");
-  if (aus && std::strcmp(aus, "0") == 0) {
-    g_va_treiber_lage = "System (HC_VA_TREIBER=0)";
-    return;
-  }
-  const std::string eigen = ordner + "hc-va";
-  if (ordner.empty() || ::access((eigen + "/radeonsi_drv_video.so").c_str(), R_OK) != 0) return;
-  bool amd = false;
-  for (const char* knoten : {"renderD128", "renderD129"}) {
-    if (SysfsZeile(std::string("/sys/class/drm/") + knoten + "/device/vendor") == "0x1002") amd = true;
-  }
-  if (!amd) return;
-  // Unser Ordner zuerst; danach, was schon gesetzt war (Flatpak setzt die
-  // Variable), sonst die üblichen Systemorte — mit gesetzter Variable sucht
-  // libva seinen eingebauten Ort nicht mehr.
-  const char* bisher = std::getenv("LIBVA_DRIVERS_PATH");
-  std::string pfad = eigen + ":";
-  pfad += (bisher && *bisher)
-              ? bisher
-              : "/usr/lib/dri:/usr/lib64/dri:/usr/lib/x86_64-linux-gnu/dri:"
-                "/usr/lib/x86_64-linux-gnu/GL/default/lib/dri:/usr/lib/x86_64-linux-gnu/GL/lib/dri";
-  ::setenv("LIBVA_DRIVERS_PATH", pfad.c_str(), 1);
-  g_va_treiber_lage = "mitgeliefert (" + eigen + ")";
-}
-
 void LadenEinmal() {
   // RTLD_LOCAL: Die Symbole sollen NICHT in den globalen Namensraum — sonst
   // könnte eine zweite FFmpeg-Fassung, die irgendein Plugin lädt, unsere
@@ -127,9 +77,9 @@ void LadenEinmal() {
   // Sonamen + DEEPBIND halten es von einem System-FFmpeg im Prozess getrennt.
   // Fehlt es, wie bisher das System-FFmpeg (libavcodec.so.61).
   const std::string ordner = EigenerOrdner();
-  // Vor jedem vaInitialize (FFmpeg, Null-Kopie, Decoder kommen alle hier durch).
-  VaTreiberWaehlen(ordner);
-  Protokoll("VA-Treiberwahl: %s", g_va_treiber_lage.c_str());
+  // hwenc.19: Die VA-Treiberwahl fällt schon beim Laden der Bibliothek
+  // (va_treiber.cc); hier nur ins Protokoll.
+  Protokoll("VA-Treiberwahl: %s", vatreiber::Lage().c_str());
   void* avutil = nullptr;
   void* avcodec = nullptr;
   bool mitgeliefert = false;

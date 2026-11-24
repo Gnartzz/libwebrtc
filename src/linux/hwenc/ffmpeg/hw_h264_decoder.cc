@@ -17,6 +17,7 @@
 #include "rtc_base/logging.h"
 #include "rtc_base/time_utils.h"
 #include "src/linux/hwenc/ffmpeg/hw_nullkopie.h"
+#include "src/linux/hwenc/ffmpeg/va_treiber.h"
 #include "src/linux/hwenc/hw_gemeinsam.h"
 
 namespace libwebrtc {
@@ -97,8 +98,7 @@ bool Pruefen() {
     return false;
   }
   AVBufferRef* geraet = nullptr;
-  const int r = api.av_hwdevice_ctx_create(&geraet, AV_HWDEVICE_TYPE_VAAPI,
-                                           nullptr, nullptr, 0);
+  const int r = vatreiber::GeraetErzeugen(&geraet, "Decoder-Probe");
   if (r < 0 || !geraet) {
     Protokoll("Decoder: VA-API-Gerät nicht zu öffnen (%s) — Software wie bisher",
               ffmpeg::FehlerText(r).c_str());
@@ -191,7 +191,7 @@ bool HwH264Decoder::Configure(const Settings& settings) {
     VaRuheAbwarten();
     if (nullkopie::EmpfangErlaubt()) hw_device_ = nullkopie::GeraetRef();
     if (!hw_device_)
-      r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0);
+      r = vatreiber::GeraetErzeugen(&hw_device_, "Decoder");
   }
   if (r < 0 || !hw_device_) {
     Protokoll("Decoder #%d: VA-API-Gerät: %s — Rückfall auf Software", nummer_,

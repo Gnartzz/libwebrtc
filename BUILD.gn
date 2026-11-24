@@ -220,7 +220,9 @@ rtc_shared_library("libwebrtc") {
   if (is_linux && libwebrtc_hwenc) {
     sources += [
       "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
+      "src/linux/hwenc/ffmpeg/va_treiber.cc",
       "src/linux/hwenc/ffmpeg/ffmpeg_lader.h",
+      "src/linux/hwenc/ffmpeg/va_treiber.h",
       "src/linux/hwenc/ffmpeg/hw_h264_decoder.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_decoder.h",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
@@ -331,6 +333,7 @@ if (is_linux && libwebrtc_hwenc) {
     testonly = true
     sources = [
       "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
+      "src/linux/hwenc/ffmpeg/va_treiber.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_decoder.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
       "src/linux/hwenc/ffmpeg/hw_nullkopie.cc",
@@ -374,6 +377,7 @@ if (is_linux && libwebrtc_hwenc) {
     testonly = true
     sources = [
       "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
+      "src/linux/hwenc/ffmpeg/va_treiber.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
       "src/linux/hwenc/ffmpeg/hw_nullkopie.cc",
       "src/linux/hwenc/hw_gemeinsam.cc",
@@ -412,6 +416,7 @@ if (is_linux && libwebrtc_hwenc) {
     testonly = true
     sources = [
       "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
+      "src/linux/hwenc/ffmpeg/va_treiber.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
       "src/linux/hwenc/ffmpeg/hw_nullkopie.cc",
       "src/linux/hwenc/hw_gemeinsam.cc",
@@ -449,6 +454,7 @@ if (is_linux && libwebrtc_hwenc) {
     testonly = true
     sources = [
       "src/linux/hwenc/ffmpeg/ffmpeg_lader.cc",
+      "src/linux/hwenc/ffmpeg/va_treiber.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_decoder.cc",
       "src/linux/hwenc/ffmpeg/hw_h264_encoder.cc",
       "src/linux/hwenc/ffmpeg/hw_nullkopie.cc",

@@ -2,6 +2,7 @@
 
 #include "src/linux/hwenc/ffmpeg/ffmpeg_lader.h"
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -17,6 +18,8 @@
 #include <cstdint>
 #include <string>
 #include <thread>
+#include <algorithm>
+#include <vector>
 
 // Aus hw_h264_encoder.cc ausgelagert (07.11.2026), damit Encoder und Decoder
 // dieselbe Protokolldatei und dieselben Systemangaben benutzen. Inhalt
@@ -133,12 +136,31 @@ void Protokoll(const char* format, ...) {
 }
 
 
+namespace {
+// Prüfbefund N2: alle renderD<n> eines Ordners, nach n sortiert (nicht nur 128/129).
+std::vector<std::string> RenderKnotenIn(const char* ordner) {
+  std::vector<std::pair<int, std::string>> v;
+  if (DIR* d = ::opendir(ordner)) {
+    while (dirent* e = ::readdir(d)) {
+      if (std::strncmp(e->d_name, "renderD", 7) != 0) continue;
+      v.emplace_back(std::atoi(e->d_name + 7), e->d_name);
+    }
+    ::closedir(d);
+  }
+  std::sort(v.begin(), v.end());
+  std::vector<std::string> namen;
+  for (auto& p : v) namen.push_back(p.second);
+  return namen;
+}
+}  // namespace
+
 bool RenderKnotenDa() {
   // ★ Ohne Render-Knoten keine VA-API. Das kommt öfter vor, als man denkt: in
   // Containern ohne `--device /dev/dri`, auf Servern ohne GPU und in Flatpaks
   // ohne `--device=dri`.
-  for (const char* pfad : {"/dev/dri/renderD128", "/dev/dri/renderD129"}) {
-    int fd = ::open(pfad, O_RDWR | O_CLOEXEC);
+  for (const std::string& name : RenderKnotenIn("/dev/dri")) {
+    const std::string pfad = "/dev/dri/" + name;
+    int fd = ::open(pfad.c_str(), O_RDWR | O_CLOEXEC);
     if (fd >= 0) {
       ::close(fd);
       return true;
@@ -163,8 +185,8 @@ std::string SysfsZeile(const std::string& pfad) {
 
 std::string GpuBeschreibung() {
   std::string text;
-  for (const char* knoten : {"renderD128", "renderD129"}) {
-    const std::string basis = std::string("/sys/class/drm/") + knoten + "/device/";
+  for (const std::string& knoten : RenderKnotenIn("/sys/class/drm")) {
+    const std::string basis = "/sys/class/drm/" + knoten + "/device/";
     const std::string hersteller = SysfsZeile(basis + "vendor");
     if (hersteller == "?") continue;
     char ziel[256] = {0};
@@ -176,7 +198,7 @@ std::string GpuBeschreibung() {
       if (pos != std::string::npos) treiber = treiber.substr(pos + 1);
     }
     if (!text.empty()) text += ", ";
-    text += std::string(knoten) + "=" + hersteller + ":" + SysfsZeile(basis + "device") +
+    text += knoten + "=" + hersteller + ":" + SysfsZeile(basis + "device") +
             " (" + treiber + ")";
   }
   return text.empty() ? "keine Angabe" : text;
