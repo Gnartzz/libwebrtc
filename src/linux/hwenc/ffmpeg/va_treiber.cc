@@ -459,7 +459,11 @@ std::string GeladeneTreiber(const Wahl& w) {
       if (std::find(gemappt.begin(), gemappt.end(), echt) == gemappt.end()) continue;
       if (std::find(erklaert.begin(), erklaert.end(), echt) != erklaert.end()) continue;
       erklaert.push_back(echt);
-      treffer.push_back(p == echt ? p : p + " (→ " + echt + ")");
+      // Eine libgallium ist zugleich die OpenGL-Bibliothek des Prozesses — in
+      // maps nicht von „als VA-Treiber geladen" zu trennen; die Anzeige sagt es.
+      const std::string ziel = echt;
+      const bool gl = ziel.find("/libgallium") != std::string::npos;
+      treffer.push_back(p == ziel ? p : p + " (→ " + ziel + (gl ? ", auch OpenGL" : "") + ")");
     }
   }
   for (const auto& g : gemappt) {
@@ -473,12 +477,12 @@ std::string GeladeneTreiber(const Wahl& w) {
 
 // Nach jedem gelungenen Gerät: beim ersten (und nach einem Rückfall) melden,
 // welcher Treiber geladen ist.
-void Gelungen() {
+void Gelungen(AVBufferRef* geraet) {
   std::lock_guard<std::mutex> halt(g_sperre);
   Wahl& w = W();
   if (!w.erstes_geraet) return;
   w.erstes_geraet = false;
-  w.geladen = GeladeneTreiber(w);
+  w.geladen = GeladeneTreiber(w) + "; Anzeige: " + VaTreiber(geraet);
   const bool eigener = !w.eigen.empty() && w.geladen.find(w.eigen + "/") != std::string::npos;
   Protokoll("VA-Treiber geladen: %s%s", w.geladen.c_str(),
             w.vorgeschaltet && !eigener
@@ -523,7 +527,7 @@ int GeraetErzeugen(AVBufferRef** ziel, const char* wer) {
               ok ? "geöffnet" : ffmpeg::FehlerText(r).c_str());
   }
   if (!ok) return r < 0 ? r : AVERROR_UNKNOWN;
-  Gelungen();
+  Gelungen(*ziel);
   return 0;
 }
 

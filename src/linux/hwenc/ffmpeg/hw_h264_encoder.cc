@@ -189,7 +189,7 @@ std::vector<Spaeter>* g_spaeter = new std::vector<Spaeter>();  // nie zerstört
 bool g_zeitgeber_laeuft = false;   // unter g_spaeter_sperre
 bool g_prozess_endet = false;      // unter VaUmbauSperre()
 
-void SpaeterAufraeumen();
+void SpaeterAufraeumen(bool vom_zeitgeber = false);
 
 void ZeitgeberStarten() {
   static std::once_flag einmal;
@@ -207,7 +207,7 @@ void ZeitgeberStarten() {
   std::thread([] {
     while (true) {
       std::this_thread::sleep_for(std::chrono::milliseconds(kSpaeterMs + 100));
-      SpaeterAufraeumen();
+      SpaeterAufraeumen(true);
       std::lock_guard<std::mutex> halt(g_spaeter_sperre);
       if (g_spaeter->empty()) {
         g_zeitgeber_laeuft = false;
@@ -230,7 +230,7 @@ void SpaeterFreigeben(AVBufferRef** ref) {
 // Fällige Freigaben ausführen. Prüfbefund M5: das Freigeben (vaDestroy… /
 // vaTerminate) ist ein Abbau wie jeder andere — unter der Umbau-Sperre und
 // danach vermerkt, damit ein gleichzeitiges Anlegen die Ruhezeit abwartet.
-void SpaeterAufraeumen() {
+void SpaeterAufraeumen(bool vom_zeitgeber) {
   std::vector<AVBufferRef*> faellig;
   {
     std::lock_guard<std::mutex> halt(g_spaeter_sperre);
@@ -251,6 +251,9 @@ void SpaeterAufraeumen() {
   if (g_prozess_endet) return;   // am Prozessende liegen lassen
   for (AVBufferRef* r : faellig) api.av_buffer_unref(&r);
   VaAbbauVermerken();
+  if (vom_zeitgeber)
+    Protokoll("Zeitgeber: %zu abgegebene(s) Gerät/Bildvorrat freigegeben (kein Encoder mehr)",
+              faellig.size());
 }
 }  // namespace
 

@@ -33,6 +33,8 @@
 //                  (hwenc.19-Übergang: Encode liefert FALLBACK_SOFTWARE).
 //   --erwarte-software  bestanden, wenn JEDER Encoder beim ersten Bild auf
 //                  Software zurückfällt und keine VA-Sitzung öffnet.
+//   --nachlauf N   N s nach dem letzten Release weiterleben (Prüfbefund N4:
+//                  der Zeitgeber gibt die verzögerten Reste frei, hwenc.log).
 //   --erstes-bild-fehler  Prüffall M6: das erste Bild nach jedem Öffnen
 //                  scheitert (HC_TEST_ERSTES_BILD_FEHLER=1); bestanden, wenn
 //                  genau diese Bilder scheitern und das Schließen danach (ohne
@@ -93,6 +95,7 @@ struct Optionen {
   bool bildschirm = false;
   bool erwarte_software = false;
   bool erstes_fehler = false;
+  int nachlauf = 0;
 };
 
 std::atomic<bool> g_halt{false};
@@ -300,6 +303,7 @@ int main(int argc, char** argv) {
     else if (a == "--bildschirm") o.bildschirm = true;
     else if (a == "--erwarte-software") o.erwarte_software = true;
     else if (a == "--erstes-bild-fehler") o.erstes_fehler = true;
+    else if (a == "--nachlauf") o.nachlauf = std::atoi(Wert());
     else {
       std::printf("FEHL: unbekannt %s\n", a.c_str());
       return 2;
@@ -394,6 +398,8 @@ int main(int argc, char** argv) {
     if (e.fehler || e.neu_fehler || e.ohne_schluessel) ok = false;
   }
   if (gl_bilder) std::printf("GL-Last: %d Bilder gezeichnet\n", gl);
+  // Prüfbefund N4: nach dem letzten Release weiterleben — räumt der Zeitgeber auf?
+  if (o.nachlauf > 0) sleep(static_cast<unsigned>(o.nachlauf));
   std::printf("%s\n", ok ? "BESTANDEN" : "DURCHGEFALLEN");
   return ok ? 0 : 1;
 }
