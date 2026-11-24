@@ -104,11 +104,31 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   // hwenc.11: Ausgabefenster leeren (nach jedem Öffnen — die alten Bytes
   // gehören zu einem anderen Ziel).
   void AusgabeFensterLeeren();
-  void CodecSchliessen();
+  // ★★ hwenc.19 (23.11.2026): Schließen in zwei Stufen. GEMESSEN auf dem
+  // UM890 (Radeon 780M/VCN4, Mesa 26.2.7): Neuaufsetzen mit Abbau und
+  // Neuanlage des VA-Geräts, während im selben Prozess ein zweiter VA-Nutzer
+  // arbeitet und VCN von einem fremden Prozess belegt ist → Ring-Timeout,
+  // Mesa bricht ab („context is lost"), ein fremder VCN-Nutzer (Sunshine)
+  // stürzt mit. Mesa schickt beim Encoder-Abbau den Sitzungsabschluss nur
+  // asynchron ab und gibt Puffer samt GPU-Adressen sofort frei
+  // (radeon_enc_destroy, amdgpu_bo_destroy).
+  //   kNurEncoder — beim Neuaufsetzen: Encoder bis EOF leeren und schließen;
+  //                 VA-Gerät und (bei gleicher Größe) Bildvorrat BLEIBEN.
+  //   kAlles      — Release, Zerstören und jeder Fehler beim Öffnen (dann
+  //                 baut der Wiederanlauf alles frisch auf).
+  enum class Schliessen { kNurEncoder, kAlles };
+  void CodecSchliessen(Schliessen art = Schliessen::kAlles);
+  // Den Encoder vor dem Freigeben leeren: send_frame(NULL), dann Pakete bis
+  // EOF (FFmpeg wartet dabei auf jeden ausstehenden Auftrag). Scheitert es,
+  // wird trotzdem geschlossen. Innerhalb von `Encode` gehen die Pakete an den
+  // Rückruf, sonst (InitEncode, Release, Zerstören) werden sie verworfen.
+  void EncoderLeeren();
   // Holt jedes fertige Paket ab und reicht es an den Rückruf weiter. Die
   // Zeitangaben kommen aus `stempel_`, NICHT vom gerade übergebenen Bild —
   // siehe dort.
   void PaketeAbholen();
+  // Ein abgeholtes Paket (`packet_`) an den Rückruf geben.
+  void PaketAbliefern();
 
   // Was ein ausgehendes Paket an Zeitangaben braucht. Wird beim Hineingeben
   // unter der `pts` abgelegt und beim Herauskommen wieder herausgesucht.
@@ -253,12 +273,27 @@ class HwH264Encoder : public webrtc::VideoEncoder {
   // gelegentlich erneut versuchen (der Grund kann vorübergehend sein:
   // Gerät belegt, Suspend, VT-Wechsel).
   bool oeffnen_scheiterte_ = false;
+  // hwenc.19: nach einem gescheiterten Öffnen nicht mehr das Dauergerät.
+  bool dauer_meiden_ = false;
+  // hwenc.19-Übergang (AMD): InitEncode hat nicht geöffnet, das erste Bild
+  // entscheidet zwischen VA-API (Bildschirm) und Software (Kamera).
+  bool quelle_offen_ = false;
+  // hwenc.19: Bilder, die seit dem letzten Öffnen in den Encoder gingen
+  // (0 = nichts zu leeren; s. `EncoderLeeren`).
+  int64_t bilder_seit_oeffnen_ = 0;
   int misslungene_versuche_ = 0;
   int64_t wiederanlauf_zaehler_ = 0;
   // Einmalige Warnung, wenn ein angefordertes Keyframe nicht als solches
   // zurückkam — die billigste Messung für „greift pict_type wirklich?".
   bool keyframe_angefordert_ = false;
   bool keyframe_warnung_ = false;
+
+  // hwenc.19: wahr, solange `Encode` läuft (Pakete beim Leeren abliefern).
+  bool im_encode_ = false;
+  // hwenc.19: fürs hwenc.log — beim letzten Öffnen Gerät/Bildvorrat neu?
+  bool geraet_neu_ = false;
+  bool geraet_uebernommen_ = false;
+  bool vorrat_neu_ = false;
 
   AVCodecContext* ctx_ = nullptr;
   AVBufferRef* hw_device_ = nullptr;

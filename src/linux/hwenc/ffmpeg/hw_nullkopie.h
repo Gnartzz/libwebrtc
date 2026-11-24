@@ -85,6 +85,17 @@ bool Exportieren(const webrtc::VideoFrameBuffer& puffer, HcGpuBild* aus);
 // Zählt ein Bild, das ohne Umweg in den Encoder ging (für die 30-s-Zeile).
 void EncoderDirektGezaehlt();
 
+// ★ hwenc.19 (Kamera-Übergang auf AMD): Kennung der Bildschirmfreigabe.
+// WEDER V3 NOCH Flutter-Linux melden die Freigabe als kScreensharing
+// (gemessen 24.11.: alle „offen:"-Zeilen der Freigabe-Läufe 2560x1440/
+// 1920x1072 ohne Bildschirm-Kennung) — also markiert der Bildschirm-Aufnehmer
+// des Wrappers (rtc_desktop_capturer_impl.cc) seine Bilder mit dieser
+// VideoFrame-Kennung; VideoCapturer und VideoStreamEncoder reichen `id()`
+// beim Zuschneiden/Skalieren weiter.
+constexpr uint16_t kBildschirmBildId = 0x4843;   // „HC"
+// GPU-Bild des Bildschirm-Aufnehmers (Null-Kopie)?
+bool IstAufnahmeBild(const webrtc::VideoFrameBuffer& puffer);
+
 // Eine Bildschirmaufnahme beginnt / endet. Endet die letzte, gibt der Wandler
 // seine Bildvorräte und VPP-Kontexte frei.
 void AufnahmeBeginnt();

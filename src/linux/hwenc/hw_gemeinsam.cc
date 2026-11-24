@@ -10,15 +10,83 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <mutex>
+#include <chrono>
+#include <cstdint>
 #include <string>
+#include <thread>
 
 // Aus hw_h264_encoder.cc ausgelagert (07.11.2026), damit Encoder und Decoder
 // dieselbe Protokolldatei und dieselben Systemangaben benutzen. Inhalt
 // unverändert bis auf die Sperre in `Protokoll` (zwei Fäden schreiben jetzt).
 
 namespace libwebrtc {
+
+// ── Umbau-Sperre (hwenc.19), s. Kopf ───────────────────────────────────────
+namespace {
+// Monotone Millisekunden (ohne WebRTC-Abhängigkeit in dieser Datei).
+int64_t UhrMs() {
+  timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return static_cast<int64_t>(t.tv_sec) * 1000 + t.tv_nsec / 1000000;
+}
+int64_t g_letzter_abbau_ms = 0;   // nur unter VaUmbauSperre()
+}  // namespace
+
+std::recursive_mutex& VaUmbauSperre() {
+  static std::recursive_mutex* sperre = new std::recursive_mutex();   // nie zerstört
+  return *sperre;
+}
+
+void VaAbbauVermerken() { g_letzter_abbau_ms = UhrMs(); }
+
+namespace {
+std::mutex g_dauer_sperre;
+AVBufferRef* g_dauer = nullptr;   // nie freigegeben (lebt bis zum Prozessende)
+}  // namespace
+
+void VaDauerGeraetSetzen(AVBufferRef* geraet) {
+  if (!geraet) return;
+  // ★★ GEMESSEN 24.11.2026 (Prüfprogramm, Release-Weg, ohne GL und ohne
+  // fremde VCN-Last): ZWEI Encoder auf EINER VA-Anzeige — damit auf einem
+  // gemeinsamen Kernel-Kontext, Mesa legt bei nur einer VCN-Instanz keinen
+  // eigenen an (si_video.c si_vcn_need_context) — hängen VCN beim ersten
+  // Bild einer neuen Sitzung (F2: Absturz nach 16 Öffnungen); mit je eigenem
+  // Gerät 360 Öffnungen ohne Befund (F4). Deshalb ist das Dauergerät AUS
+  // (jeder Encoder wie bis hwenc.18 mit eigenem Gerät, das er über das
+  // Neuaufsetzen behält). HC_VA_DAUERGERAET=1 schaltet es für Messungen ein.
+  static const bool aus = [] {
+    const char* e = std::getenv("HC_VA_DAUERGERAET");
+    return !(e && std::strcmp(e, "1") == 0);
+  }();
+  if (aus) {
+    ffmpeg::Zugriff().av_buffer_unref(&geraet);
+    return;
+  }
+  std::lock_guard<std::mutex> halt(g_dauer_sperre);
+  if (g_dauer) {
+    ffmpeg::Zugriff().av_buffer_unref(&geraet);
+    return;
+  }
+  g_dauer = geraet;
+}
+
+AVBufferRef* VaDauerGeraetRef() {
+  std::lock_guard<std::mutex> halt(g_dauer_sperre);
+  return g_dauer ? ffmpeg::Zugriff().av_buffer_ref(g_dauer) : nullptr;
+}
+
+int VaRuheAbwarten() {
+  if (g_letzter_abbau_ms == 0) return 0;
+  const int64_t rest = g_letzter_abbau_ms + kVaRuheMs - UhrMs();
+  if (rest <= 0) return 0;
+  // Gedeckelt: nie länger als die Ruhezeit selbst.
+  const int64_t warte = rest > kVaRuheMs ? kVaRuheMs : rest;
+  std::this_thread::sleep_for(std::chrono::milliseconds(warte));
+  return static_cast<int>(warte);
+}
 // ★★ EIGENE PROTOKOLLDATEI `hwenc.log` (21.09.2026): `RTC_LOG` aus diesem
 // Encoder erreicht das Protokoll des Clients NICHT — gemessen an Tims
 // Bündeln, null Treffer für „[hwenc]". Damit war die Frage „was gibt WebRTC

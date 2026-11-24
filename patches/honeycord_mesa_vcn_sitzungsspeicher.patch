@@ -1,0 +1,37 @@
+diff --git a/src/gallium/drivers/radeonsi/mm/radeon_vcn_enc.c b/src/gallium/drivers/radeonsi/mm/radeon_vcn_enc.c
+index 0cad8e5b..3104cc79 100644
+--- a/src/gallium/drivers/radeonsi/mm/radeon_vcn_enc.c
++++ b/src/gallium/drivers/radeonsi/mm/radeon_vcn_enc.c
+@@ -1701,8 +1701,15 @@ static void radeon_enc_begin_frame(struct pipe_video_codec *encoder,
+    enc->need_feedback = false;
+ 
+    if (!enc->si) {
++      /* The session info buffer must start zeroed: the buffer comes from the
++       * winsys reuse pool / slabs and may carry stale data (a closed session,
++       * or anything else freed in this process, e.g. GL texture data). With
++       * stale content the VCN firmware faults on the first OP_ENCODE of the
++       * new session (page fault at 0x0 + offset, ring timeout).
++       */
+       enc->si = si_vid_create_buffer(enc->screen, PIPE_USAGE_DEFAULT,
+-                                     PIPE_RESOURCE_FLAG_UNMAPPABLE, 128 * 1024);
++                                     PIPE_RESOURCE_FLAG_UNMAPPABLE | SI_RESOURCE_FLAG_CLEAR,
++                                     128 * 1024);
+       if (!enc->si) {
+          RADEON_ENC_ERR("Can't create session buffer.\n");
+          goto error;
+diff --git a/src/gallium/targets/va/va.sym.in b/src/gallium/targets/va/va.sym.in
+index cb54dc95..f5bf88e4 100644
+--- a/src/gallium/targets/va/va.sym.in
++++ b/src/gallium/targets/va/va.sym.in
+@@ -2,11 +2,6 @@
+ 	global:
+ 		__vaDriverInit_*_*;
+ 
+-		# Workaround for an LLVM warning with -simplifycfg-sink-common
+-		# due to LLVM being initialized multiple times.
+-		@radeon_drm_winsys_create@
+-		@amdgpu_winsys_create@
+-		@ac_init_shared_llvm_once@
+ 	local:
+ 		*;
+ };

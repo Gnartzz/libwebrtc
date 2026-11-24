@@ -286,8 +286,12 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
       if (jetzt - letztes_gesendet_ms_ < 200) return;
       letztes_gesendet_ms_ = jetzt;
       ++wiederholt_;
-      OnFrame(webrtc::VideoFrame(letztes_aus_, 0, jetzt,
-                                 webrtc::kVideoRotation_0));
+      OnFrame(webrtc::VideoFrame::Builder()
+                  .set_video_frame_buffer(letztes_aus_)
+                  .set_timestamp_ms(jetzt)
+                  .set_rotation(webrtc::kVideoRotation_0)
+                  .set_id(libwebrtc::nullkopie::kBildschirmBildId)
+                  .build());
       return;
     }
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> gpu(
@@ -326,8 +330,12 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
       neu_ = 0;
       wiederholt_ = 0;
     }
-    OnFrame(webrtc::VideoFrame(gpu, 0, letztes_gesendet_ms_,
-                               webrtc::kVideoRotation_0));
+    OnFrame(webrtc::VideoFrame::Builder()
+                .set_video_frame_buffer(gpu)
+                .set_timestamp_ms(letztes_gesendet_ms_)
+                .set_rotation(webrtc::kVideoRotation_0)
+                .set_id(libwebrtc::nullkopie::kBildschirmBildId)
+                .build());
     return;
   }
 #endif
@@ -392,8 +400,18 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
       out_buffer = scaled_buffer_;
     }
 
+#if defined(WEBRTC_LINUX) && defined(USE_LINUX_HWENC)
+    // hwenc.19: als Bildschirmbild kennzeichnen (Kamera-Übergang auf AMD).
+    OnFrame(webrtc::VideoFrame::Builder()
+                .set_video_frame_buffer(out_buffer)
+                .set_timestamp_ms(webrtc::TimeMillis())
+                .set_rotation(webrtc::kVideoRotation_0)
+                .set_id(libwebrtc::nullkopie::kBildschirmBildId)
+                .build());
+#else
     OnFrame(webrtc::VideoFrame(out_buffer, 0, webrtc::TimeMillis(),
                                webrtc::kVideoRotation_0));
+#endif
   }
 #ifdef WEBRTC_WIN
   __except (filterException(GetExceptionCode(), GetExceptionInformation())) {

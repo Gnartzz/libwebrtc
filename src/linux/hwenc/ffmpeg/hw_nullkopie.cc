@@ -576,7 +576,12 @@ bool EinrichtenIntern() {
     return false;
   }
   const auto& api = ffmpeg::Zugriff();
-  int r = api.av_hwdevice_ctx_create(&va->geraet, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0);
+  // hwenc.19: dasselbe Dauergerät wie die Encoder (s. hw_gemeinsam.h) — kein
+  // zweites VA-Gerät im laufenden Prozess. Fehlt es, wie bisher ein eigenes.
+  int r = 0;
+  va->geraet = VaDauerGeraetRef();
+  if (!va->geraet)
+    r = api.av_hwdevice_ctx_create(&va->geraet, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0);
   if (r < 0 || !va->geraet) {
     Protokoll("Null-Kopie: VA-Gerät nicht zu öffnen (%s) — alter Weg",
               ffmpeg::FehlerText(r).c_str());
@@ -638,6 +643,12 @@ const AVFrame* AlsVaRahmen(const webrtc::VideoFrameBuffer& puffer, const AVBuffe
 }
 
 void EncoderDirektGezaehlt() { z_direkt++; }
+
+bool IstAufnahmeBild(const webrtc::VideoFrameBuffer& puffer) {
+  if (puffer.type() != webrtc::VideoFrameBuffer::Type::kNative) return false;
+  const auto* bild = dynamic_cast<const HcVaBild*>(&puffer);
+  return bild && bild->aus_aufnahme();
+}
 
 // ── Empfang ohne Umweg (10.11.2026) ─────────────────────────────────────────
 //

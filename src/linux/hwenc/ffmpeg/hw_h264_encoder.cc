@@ -7,6 +7,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <mutex>
+#include <vector>
 #include <cstring>
 #include <cstdarg>
 #include <cstdio>
@@ -109,7 +111,14 @@ bool WegGeht(const char* encoder, enum AVHWDeviceType typ, const char* name) {
                      << ffmpeg::FehlerText(r) << ")";
     return false;
   }
-  api.av_buffer_unref(&geraet);
+  // hwenc.19: Das VA-API-Gerät der Probe bleibt als Dauergerät des Prozesses
+  // (s. `VaDauerGeraetSetzen`) — die Probe läuft beim Start, bevor Oberfläche
+  // und Medien die Grafikkarte nutzen.
+  if (typ == AV_HWDEVICE_TYPE_VAAPI) {
+    VaDauerGeraetSetzen(geraet);
+  } else {
+    api.av_buffer_unref(&geraet);
+  }
   return true;
 }
 
@@ -136,6 +145,105 @@ int GemerkterWeg() {
   return weg;
 }
 
+}  // namespace
+
+// ── Verzögerte Freigabe (hwenc.19, 23.11.2026) ──────────────────────────────
+//
+// ★★ GEMESSEN auf dem UM890 (Radeon 780M/VCN4, Mesa 26.2.7 im Flatpak und
+// 26.3.1, Prüfprogramm test/neuaufsetzen_test.cc): Mesa schickt beim Abbau
+// eines VA-Encoders den Sitzungsabschluss nur ASYNCHRON an VCN
+// (radeon_enc_destroy: flush(PIPE_FLUSH_ASYNC)) und gibt Puffer samt
+// GPU-Adressbereich sofort frei (amdgpu_bo_destroy: UNMAP + va_range_free).
+// Werden in diesem Moment Oberflächen abgebaut und neue angelegt und per CPU
+// mit Bilddaten gefüllt — Größenwechsel, neues VA-Gerät, oder ein zweiter
+// VA-Nutzer im selben Prozess —, kommt bei belegtem VCN (fremder
+// HEVC-Encode wie Sunshine) ein Ring-Timeout bzw. Seitenfehler an
+// Adressen, die wie Bilddaten aussehen; Mesa bricht ab („context is
+// lost"), der fremde VCN-Nutzer stürzt mit.
+//
+// Deshalb wird ein Bildvorrat oder VA-Gerät, das ein Encoder abgibt, nicht
+// sofort freigegeben, sondern frühestens nach `kSpaeterMs` — beim nächsten
+// Öffnen oder Kodieren irgendeines Encoders. Kein eigener Faden: Am
+// Prozessende bleibt Übriges einfach liegen (kein Treiberaufruf beim
+// Beenden). Kommt kein Encoder mehr, bleiben höchstens ein Vorrat und ein
+// Gerät belegt, bis zum nächsten Kamera- oder Bildschirmstart.
+namespace {
+constexpr int64_t kSpaeterMs = 1000;
+struct Spaeter {
+  AVBufferRef* ref;
+  int64_t ab_ms;
+};
+std::mutex g_spaeter_sperre;
+std::vector<Spaeter>* g_spaeter = new std::vector<Spaeter>();  // nie zerstört
+
+void SpaeterFreigeben(AVBufferRef** ref) {
+  if (!ref || !*ref) return;
+  std::lock_guard<std::mutex> halt(g_spaeter_sperre);
+  g_spaeter->push_back({*ref, webrtc::TimeMillis() + kSpaeterMs});
+  *ref = nullptr;
+}
+
+// Fällige Freigaben ausführen (außerhalb der Sperre).
+void SpaeterAufraeumen() {
+  std::vector<AVBufferRef*> faellig;
+  {
+    std::lock_guard<std::mutex> halt(g_spaeter_sperre);
+    if (g_spaeter->empty()) return;
+    const int64_t jetzt = webrtc::TimeMillis();
+    for (auto it = g_spaeter->begin(); it != g_spaeter->end();) {
+      if (it->ab_ms <= jetzt) {
+        faellig.push_back(it->ref);
+        it = g_spaeter->erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (faellig.empty()) return;
+  const auto& api = ffmpeg::Zugriff();
+  for (AVBufferRef* r : faellig) api.av_buffer_unref(&r);
+}
+}  // namespace
+
+// ── Übergang: Kamera auf AMD in Software (hwenc.19, Tims Entscheid 24.11.2026) ──
+//
+// ★★ GEMESSEN (UM890, Radeon 780M/VCN4, V3 Linux mit echter BRIO, HEVC-Encode
+// eines fremden Prozesses daneben — wie Sunshine): Das Öffnen einer neuen
+// VA-API-Encoder-Sitzung für die KAMERA bringt VCN in rund einem Viertel bis
+// der Hälfte der Läufe zum Hängen (Ring-Timeout, Mesa bricht ab, der fremde
+// VCN-Nutzer stürzt mit) — mit Mesa 26.2.7 wie 26.3.1, mit und ohne die
+// übrigen hwenc.19-Absicherungen. Die Ursache steht inzwischen fest (Mesa
+// löscht den VCN-Sitzungsspeicher nicht, s. ffmpeg_lader.cc) und wird mit dem
+// mitgelieferten VA-Treiber behoben; die Kamera kodiert auf VA-API. Der
+// Software-Weg (OpenH264 über den Rückfall des SimulcastEncoderAdapter, der
+// Bildschirm bleibt VA-API) bleibt nur als Notschalter: HC_KAMERA_SW=1.
+namespace {
+bool KameraInSoftware() {
+  static const bool sw = [] {
+    // ★ Vorgabe: Kamera auf VA-API. Der Software-Übergang bleibt nur
+    // als Notschalter: HC_KAMERA_SW=1.
+    const char* e = std::getenv("HC_KAMERA_SW");
+    if (!(e && std::strcmp(e, "1") == 0)) {
+      Protokoll("Kamera: VA-API");
+      return false;
+    }
+    // Hersteller: zuerst der VA-Treiber des Prozessgeräts, sonst der Render-Knoten.
+    std::string treiber = "?";
+    if (AVBufferRef* g = VaDauerGeraetRef()) {
+      treiber = VaTreiber(g);
+      ffmpeg::Zugriff().av_buffer_unref(&g);
+    }
+    const std::string knoten = SysfsZeile("/sys/class/drm/renderD128/device/vendor");
+    const bool amd = treiber.find("AMD") != std::string::npos ||
+                     treiber.find("radeonsi") != std::string::npos ||
+                     (treiber == "?" && knoten == "0x1002");
+    Protokoll("Kamera: %s (VA-Treiber %s, renderD128 %s)",
+              amd ? "Software (HC_KAMERA_SW=1, AMD-Übergang)" : "VA-API (HC_KAMERA_SW nur auf AMD)",
+              treiber.c_str(), knoten.c_str());
+    return amd;
+  }();
+  return sw;
+}
 }  // namespace
 
 bool HwH264Encoder::IstVerfuegbar() { return GemerkterWeg() >= 0; }
@@ -178,7 +286,6 @@ int HwH264Encoder::InitEncode(
     return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
   }
   if (!IstVerfuegbar()) return WEBRTC_VIDEO_CODEC_ERROR;
-
   std::lock_guard<std::mutex> sperre(mutex_);
   width_ = codec_settings->width;
   height_ = codec_settings->height;
@@ -220,17 +327,44 @@ int HwH264Encoder::InitEncode(
   anlauf_bis_ms_ = webrtc::TimeMillis() + kAnlaufMs;
   rampe_bis_ms_ = webrtc::TimeMillis() + ratenregeln::kRampeMs;
 
+  // hwenc.19-Übergang (AMD): Ob Kamera oder Bildschirm, zeigt erst das erste
+  // Bild (der Inhaltsmodus sagt es nicht, s. `nullkopie::kBildschirmBildId`).
+  // Geöffnet wird trotzdem JETZT, wie bisher — gemessen 24.11.: Öffnen erst
+  // beim ersten Bild machte neue VA-Sitzungen im Prüfprogramm anfälliger
+  // (Release/Instanz 4/4 und 1/1 Hänger statt 1/3 bzw. 0/1). Für die Kamera
+  // ist das Öffnen ohne Bild harmlos: Mesa legt Sitzungsspeicher und
+  // VCN-Initialisierung erst beim ersten kodierten Bild an (radeon_vcn_enc.c
+  // begin_frame), und der Abbau ohne Sitzung schickt VCN nichts.
+  quelle_offen_ = weg_ == Backend::kVaapi && KameraInSoftware();
   return CodecOeffnen();
 }
 
 int32_t HwH264Encoder::CodecOeffnen() {
   const auto& api = ffmpeg::Zugriff();
-  CodecSchliessen();
+  SpaeterAufraeumen();
+  // hwenc.19: prozessweit nur ein Umbau zur Zeit (s. `VaUmbauSperre`).
+  std::lock_guard<std::recursive_mutex> umbau(VaUmbauSperre());
+  int gewartet_ms = 0;
+  // hwenc.19: Reihenfolge beim Neuaufsetzen —
+  //   1. alten Encoder leeren (er lebt noch),
+  //   2. VA-Gerät und Bildvorrat bereitstellen: behalten, oder NEU ANLEGEN,
+  //      SOLANGE DER ALTE ENCODER NOCH LEBT (neue Oberflächen können so nicht
+  //      auf eben freigegebenem Speicher des alten Encoders landen),
+  //   3. alten Encoder schließen (nur Kontext, Bilder, Paket),
+  //   4. Abgelöstes (alter Vorrat, altes Gerät) verzögert freigeben.
+  // Jeder Fehlschlag unten ruft `CodecSchliessen()` = alles (verzögert).
+  if (ctx_) EncoderLeeren();
+  geraet_neu_ = false;
+  geraet_uebernommen_ = false;
+  vorrat_neu_ = false;
 
   const bool nvenc = weg_ == Backend::kNvenc;
   const AVCodec* codec =
       api.avcodec_find_encoder_by_name(nvenc ? "h264_nvenc" : "h264_vaapi");
-  if (!codec) return WEBRTC_VIDEO_CODEC_ERROR;
+  if (!codec) {
+    CodecSchliessen();   // der alte ist schon geleert — nicht offen lassen
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
 
   int r = 0;
   if (!nvenc) {
@@ -240,10 +374,27 @@ int32_t HwH264Encoder::CodecOeffnen() {
     // ★ Null-Kopie (08.11.2026): dasselbe VA-Gerät wie der Wandler am
     // Bildschirm-Aufnehmer — nur dann darf eine Oberfläche von dort ohne
     // Umweg hier hinein. Ist die Null-Kopie aus, wie bisher ein eigenes.
-    hw_device_ = nullkopie::GeraetRef();
-    if (!hw_device_)
-      r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI,
-                                     nullptr, nullptr, 0);
+    // hwenc.19: Ein behaltenes eigenes Gerät weicht dem gemeinsamen, sobald
+    // die Null-Kopie steht (wie bisher beim nächsten Öffnen) — sonst nähme
+    // der Encoder GPU-Bilder des Aufnehmers nicht mehr direkt.
+    if (hw_device_ && nullkopie::Aktiv() && !nullkopie::GeraetIstGemeinsam(hw_device_)) {
+      SpaeterFreigeben(&hw_frames_);
+      SpaeterFreigeben(&hw_device_);
+    }
+    if (!hw_device_) {
+      geraet_uebernommen_ = true;
+      hw_device_ = nullkopie::GeraetRef();
+      // hwenc.19: sonst das Dauergerät des Prozesses — außer es ist auf ihm
+      // schon einmal gescheitert (dann ein eigenes, frisches).
+      if (!hw_device_ && !dauer_meiden_) hw_device_ = VaDauerGeraetRef();
+      if (!hw_device_) {
+        geraet_uebernommen_ = false;
+        geraet_neu_ = true;
+        gewartet_ms += VaRuheAbwarten();
+        r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI,
+                                       nullptr, nullptr, 0);
+      }
+    }
     if (r < 0 || !hw_device_) {
       RTC_LOG(LS_ERROR) << "[hwenc] VA-API-Gerät: " << ffmpeg::FehlerText(r);
       CodecSchliessen();
@@ -265,25 +416,44 @@ int32_t HwH264Encoder::CodecOeffnen() {
     // Bildspeicher der Hardware — der Encoder nimmt nur Bilder an, die aus
     // seinem eigenen Vorrat stammen; deshalb muss der Vorrat vor dem Öffnen
     // stehen.
-    hw_frames_ = api.av_hwframe_ctx_alloc(hw_device_);
+    // hwenc.19: Ein Vorrat derselben Größe auf demselben Gerät bleibt über
+    // das Neuaufsetzen erhalten (keine Oberflächen abbauen und neu anlegen,
+    // während VCN den Abbau des alten Encoders noch abarbeiten kann).
+    if (hw_frames_) {
+      const auto* alt = reinterpret_cast<const AVHWFramesContext*>(hw_frames_->data);
+      if (alt->width != width_ || alt->height != height_ || !alt->device_ref ||
+          alt->device_ref->data != hw_device_->data) {
+        SpaeterFreigeben(&hw_frames_);
+      }
+    }
     if (!hw_frames_) {
-      CodecSchliessen();
-      return WEBRTC_VIDEO_CODEC_MEMORY;
+      vorrat_neu_ = true;
+      gewartet_ms += VaRuheAbwarten();
+      hw_frames_ = api.av_hwframe_ctx_alloc(hw_device_);
+      if (!hw_frames_) {
+        CodecSchliessen();
+        return WEBRTC_VIDEO_CODEC_MEMORY;
+      }
+      auto* rahmen = reinterpret_cast<AVHWFramesContext*>(hw_frames_->data);
+      rahmen->format = AV_PIX_FMT_VAAPI;
+      rahmen->sw_format = AV_PIX_FMT_NV12;
+      rahmen->width = width_;
+      rahmen->height = height_;
+      // 8 Bilder: genug, dass Hochladen und Kodieren einander nicht ausbremsen,
+      // klein genug, dass bei großen Auflösungen kein Videospeicher brachliegt.
+      rahmen->initial_pool_size = 8;
+      r = api.av_hwframe_ctx_init(hw_frames_);
+      if (r < 0) {
+        RTC_LOG(LS_ERROR) << "[hwenc] Bildspeicher: " << ffmpeg::FehlerText(r);
+        CodecSchliessen();
+        return WEBRTC_VIDEO_CODEC_ERROR;
+      }
     }
-    auto* rahmen = reinterpret_cast<AVHWFramesContext*>(hw_frames_->data);
-    rahmen->format = AV_PIX_FMT_VAAPI;
-    rahmen->sw_format = AV_PIX_FMT_NV12;
-    rahmen->width = width_;
-    rahmen->height = height_;
-    // 8 Bilder: genug, dass Hochladen und Kodieren einander nicht ausbremsen,
-    // klein genug, dass bei großen Auflösungen kein Videospeicher brachliegt.
-    rahmen->initial_pool_size = 8;
-    r = api.av_hwframe_ctx_init(hw_frames_);
-    if (r < 0) {
-      RTC_LOG(LS_ERROR) << "[hwenc] Bildspeicher: " << ffmpeg::FehlerText(r);
-      CodecSchliessen();
-      return WEBRTC_VIDEO_CODEC_ERROR;
-    }
+  }
+  // 3. Erst jetzt den alten Encoder schließen (schon geleert).
+  CodecSchliessen(Schliessen::kNurEncoder);
+  if (gewartet_ms > 0) {
+    Protokoll("Umbau: %d ms gewartet (eben baute ein anderer VA-Nutzer ab)", gewartet_ms);
   }
 
   ctx_ = api.avcodec_alloc_context3(codec);
@@ -436,6 +606,7 @@ int32_t HwH264Encoder::CodecOeffnen() {
   // aus `Encode` heraus nicht mehr — und genau dann braucht der Empfänger
   // eines.
   frame_index_ = 0;
+  bilder_seit_oeffnen_ = 0;
   stempel_.clear();
   oeffnen_scheiterte_ = false;
   misslungene_versuche_ = 0;
@@ -456,32 +627,83 @@ int32_t HwH264Encoder::CodecOeffnen() {
                    << " @" << framerate_ << ", " << (target_bitrate_bps_ / 1000)
                    << " kbit/s, Profil " << profil_
                    << (bildschirm_ ? ", Bildschirm" : "");
-  Protokoll("offen: %s %ux%u @%u  ziel %u kbit/s  spitze %lld  puffer %d kbit  %s  Profil %d%s",
+  Protokoll("offen: %s %ux%u @%u  ziel %u kbit/s  spitze %lld  puffer %d kbit  %s  Profil %d%s%s",
             nvenc ? "NVENC" : "VA-API", width_, height_, framerate_,
             target_bitrate_bps_ / 1000,
             static_cast<long long>(ctx_->rc_max_rate / 1000), ctx_->rc_buffer_size / 1000,
             nvenc ? "nvenc-rc" : "CBR", profil_,
-            bildschirm_ ? "  Bildschirm" : "");
+            bildschirm_ ? "  Bildschirm" : "",
+            nvenc ? ""
+            : geraet_neu_         ? "  (eigenes Gerät neu)"
+            : geraet_uebernommen_ ? "  (Gerät des Prozesses, Vorrat neu)"
+            : vorrat_neu_         ? "  (Gerät behalten, Vorrat neu)"
+                                  : "  (Gerät und Vorrat behalten)");
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-void HwH264Encoder::CodecSchliessen() {
+void HwH264Encoder::CodecSchliessen(Schliessen art) {
   if (!ffmpeg::Laden()) return;
   const auto& api = ffmpeg::Zugriff();
+  // hwenc.19: Abbau unter der prozessweiten Umbau-Sperre und vermerkt
+  // (rekursiv — `CodecOeffnen` hält sie schon).
+  std::lock_guard<std::recursive_mutex> umbau(VaUmbauSperre());
+  // hwenc.19: erst leeren — kein Auftrag des Encoders darf noch offen sein,
+  // wenn er (und mit ihm seine Puffer) freigegeben wird.
+  if (ctx_) EncoderLeeren();
   if (packet_) api.av_packet_free(&packet_);
   if (sw_frame_) api.av_frame_free(&sw_frame_);
   if (hw_frame_) api.av_frame_free(&hw_frame_);
   // Der Kontext hält eine eigene Referenz auf hw_frames_; free_context gibt
-  // sie zurück, unsere eigene lösen wir danach.
-  if (ctx_) api.avcodec_free_context(&ctx_);
-  if (hw_frames_) api.av_buffer_unref(&hw_frames_);
-  if (hw_device_) api.av_buffer_unref(&hw_device_);
+  // sie zurück, unsere eigene lösen wir danach (nur bei `kAlles`).
+  if (ctx_) {
+    api.avcodec_free_context(&ctx_);
+    if (weg_ != Backend::kNvenc) VaAbbauVermerken();
+  }
   packet_ = nullptr;
   sw_frame_ = nullptr;
   hw_frame_ = nullptr;
   ctx_ = nullptr;
-  hw_frames_ = nullptr;
-  hw_device_ = nullptr;
+  if (art == Schliessen::kNurEncoder) return;
+  // Verzögert, s. `SpaeterFreigeben` (auch bei Release und Zerstören).
+  SpaeterFreigeben(&hw_frames_);
+  SpaeterFreigeben(&hw_device_);
+}
+
+void HwH264Encoder::EncoderLeeren() {
+  const auto& api = ffmpeg::Zugriff();
+  // Ohne Paket war das Öffnen nicht bis zum Ende gekommen — nichts zu leeren.
+  if (!ctx_ || !packet_) return;
+  // ★ Seit dem Öffnen kein Bild hineingegeben → nichts zu leeren. GEMESSEN
+  // 24.11.2026: send_frame(NULL) auf einem h264_vaapi-Encoder ohne ein
+  // einziges Bild stürzt in FFmpeg 7.1.5 ab (SIGSEGV in libavcodec, Stapel
+  // EncoderLeeren → avcodec_send_frame). Kommt vor bei Release/Neuöffnen vor
+  // dem ersten Bild und beim Kamera-Übergang (geöffnet, nie kodiert).
+  if (bilder_seit_oeffnen_ == 0) return;
+  int r = api.avcodec_send_frame(ctx_, nullptr);
+  if (r < 0 && r != AVERROR_EOF) {
+    Protokoll("Leeren vor dem Schliessen: send_frame(NULL) %s — schliesse trotzdem",
+              ffmpeg::FehlerText(r).c_str());
+    return;
+  }
+  // Bei async_depth 1 kommt hier höchstens ein Paket; die Grenze schützt nur
+  // vor einem Treiber, der nie EOF meldet.
+  int pakete = 0;
+  for (int i = 0; i < 64; ++i) {
+    r = api.avcodec_receive_packet(ctx_, packet_);
+    if (r == AVERROR_EOF) break;
+    if (r < 0) {
+      Protokoll("Leeren vor dem Schliessen: receive_packet %s — schliesse trotzdem",
+                ffmpeg::FehlerText(r).c_str());
+      break;
+    }
+    ++pakete;
+    if (im_encode_ && callback_) PaketAbliefern();
+    api.av_packet_unref(packet_);
+  }
+  if (pakete > 0) {
+    Protokoll("Leeren vor dem Schliessen: %d Paket(e) %s", pakete,
+              im_encode_ && callback_ ? "abgeliefert" : "verworfen");
+  }
 }
 
 int32_t HwH264Encoder::Release() {
@@ -504,6 +726,32 @@ int32_t HwH264Encoder::Encode(
     const std::vector<webrtc::VideoFrameType>* frame_types) {
   std::lock_guard<std::mutex> sperre(mutex_);
   if (!callback_) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+  // hwenc.19: Pakete, die beim Neuaufsetzen aus dem Leeren kommen, gehören
+  // zum laufenden Strom und gehen an den Rückruf (s. `EncoderLeeren`).
+  struct ImEncode {
+    bool& m;
+    explicit ImEncode(bool& b) : m(b) { m = true; }
+    ~ImEncode() { m = false; }
+  } im_encode(im_encode_);
+  SpaeterAufraeumen();
+
+  // hwenc.19-Übergang (AMD): beim ersten Bild nach InitEncode entscheiden.
+  // Bildschirm (Kennung des Aufnehmers oder sein GPU-Bild) → VA-API wie
+  // bisher; alles andere (Kamera) → den noch unbenutzten Encoder schließen
+  // (VCN hat von ihm nie einen Auftrag gesehen) und FALLBACK_SOFTWARE: die
+  // Hülle des SimulcastEncoderAdapter schaltet mit diesem Bild auf OpenH264.
+  if (quelle_offen_) {
+    quelle_offen_ = false;
+    const bool schirm = frame.id() == nullkopie::kBildschirmBildId ||
+                        nullkopie::IstAufnahmeBild(*frame.video_frame_buffer());
+    Protokoll("Quelle %dx%d (Bild %dx%d, Kennung %u): %s", width_, height_,
+              frame.width(), frame.height(), static_cast<unsigned>(frame.id()),
+              schirm ? "Bildschirm → VA-API" : "Kamera → Software (AMD-Übergang)");
+    if (!schirm) {
+      CodecSchliessen();
+      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+    }
+  }
 
   // ★ NICHT ENDGÜLTIG AUFGEBEN (Prüfbefund 19.09.2026). Ein gescheitertes
   // Öffnen kann vorübergehend sein — Gerät belegt, Bildspeicher erschöpft,
@@ -546,6 +794,9 @@ int32_t HwH264Encoder::Encode(
     if (++wiederanlauf_zaehler_ % 30 != 0) return WEBRTC_VIDEO_CODEC_ERROR;
     width_ = eingang->width();
     height_ = eingang->height();
+    // hwenc.19: nach einem Fehlschlag nicht wieder auf das Dauergerät (es
+    // könnte nach einem GPU-Reset unbrauchbar sein), sondern ein frisches.
+    dauer_meiden_ = true;
     if (CodecOeffnen() != WEBRTC_VIDEO_CODEC_OK) {
       oeffnen_scheiterte_ = true;
       ++misslungene_versuche_;
@@ -668,6 +919,7 @@ int32_t HwH264Encoder::Encode(
   }
   const int64_t t2 = webrtc::TimeMicros();
   const int64_t pts = frame_index_++;
+  ++bilder_seit_oeffnen_;
   sw_frame_->pts = pts;
   sw_frame_->pict_type = keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
   if (keyframe) keyframe_angefordert_ = true;
@@ -771,6 +1023,13 @@ void HwH264Encoder::PaketeAbholen() {
       RTC_LOG(LS_ERROR) << "[hwenc] receive_packet: " << ffmpeg::FehlerText(r);
       return;
     }
+    PaketAbliefern();
+    api.av_packet_unref(packet_);
+  }
+}
+
+void HwH264Encoder::PaketAbliefern() {
+  {
     if (packet_->size > 0 && packet_->data) {
       encoded_image_.SetEncodedData(webrtc::EncodedImageBuffer::Create(
           packet_->data, static_cast<size_t>(packet_->size)));
@@ -821,7 +1080,6 @@ void HwH264Encoder::PaketeAbholen() {
       aus_bytes_jetzt_ += static_cast<uint64_t>(packet_->size);
       ++aus_bilder_jetzt_;
     }
-    api.av_packet_unref(packet_);
   }
 }
 

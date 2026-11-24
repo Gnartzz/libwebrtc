@@ -149,7 +149,14 @@ HwH264Decoder::~HwH264Decoder() { Schliessen(); }
 void HwH264Decoder::Schliessen() {
   if (!ffmpeg::Laden()) return;
   const auto& api = ffmpeg::Zugriff();
-  if (ctx_) api.avcodec_free_context(&ctx_);  // gibt auch hw_device_ctx frei
+  // hwenc.19: Abbau unter der prozessweiten Umbau-Sperre vermerken (s.
+  // `VaUmbauSperre` in hw_gemeinsam.h) — ein Encoder, der gleich danach
+  // einen Bildvorrat anlegt, wartet die Ruhezeit ab.
+  std::lock_guard<std::recursive_mutex> umbau(VaUmbauSperre());
+  if (ctx_) {
+    api.avcodec_free_context(&ctx_);  // gibt auch hw_device_ctx frei
+    if (hw_device_) VaAbbauVermerken();
+  }
   if (hw_device_) api.av_buffer_unref(&hw_device_);
   if (packet_) api.av_packet_free(&packet_);
   if (hw_frame_) api.av_frame_free(&hw_frame_);
@@ -178,9 +185,14 @@ bool HwH264Decoder::Configure(const Settings& settings) {
   // Encoder — nur dann kann die Grafikkarte das Bild für die Anzeige
   // weiterreichen, ohne dass es den Speicher verlässt.
   int r = 0;
-  if (nullkopie::EmpfangErlaubt()) hw_device_ = nullkopie::GeraetRef();
-  if (!hw_device_)
-    r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0);
+  {
+    // hwenc.19: Gerät erst nach der Ruhezeit eines eben erfolgten Abbaus.
+    std::lock_guard<std::recursive_mutex> umbau(VaUmbauSperre());
+    VaRuheAbwarten();
+    if (nullkopie::EmpfangErlaubt()) hw_device_ = nullkopie::GeraetRef();
+    if (!hw_device_)
+      r = api.av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0);
+  }
   if (r < 0 || !hw_device_) {
     Protokoll("Decoder #%d: VA-API-Gerät: %s — Rückfall auf Software", nummer_,
               ffmpeg::FehlerText(r).c_str());
